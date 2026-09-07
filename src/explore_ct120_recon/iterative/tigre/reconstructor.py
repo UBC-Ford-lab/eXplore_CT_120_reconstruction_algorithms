@@ -346,10 +346,24 @@ class TIGREReconstructor:
             angles: Projection angles in radians (FDK convention), shape (N_angles,)
             geometry: dict with R_s, R_d, da, db, vol_shape, vol_origin, dx, dz
             algorithm: TIGRE algorithm name ('ossart', 'sart', 'sirt', 'mlem').
-                mlem is Maximum-Likelihood Expectation-Maximization: solves for
-                the ML image under a Poisson noise model via the multiplicative
-                update x_{k+1} = x_k * Atb(p / Ax_k) / Atb(1), instead of the
-                least-squares gradient step SIRT/SART/OSSART use. Always
+                mlem is Expectation-Maximization, the multiplicative update
+                x_{k+1} = x_k * Atb(p / Ax_k) / Atb(1), instead of the
+                least-squares gradient step SIRT/SART/OSSART use.
+
+                That update is the ML step for an EMISSION-Poisson model
+                (counts ~ Poisson(Ax)), and TIGRE — being a CBCT toolbox
+                whose Ax returns line integrals — applies it to TRANSMISSION
+                line integrals p = -ln(T). The two are not the same
+                likelihood, so this is not the ML estimator for our
+                measurement: near its fixed point the EM update behaves like
+                weighted least squares with weight ~1/p_i, whereas quantum
+                noise on a transmission ray gives var(p_i) ~ 1/N_i and so the
+                ML weight ~N_i = I_0 * exp(-p_i) (which is what pwls supplies
+                to the least-squares algorithms). Both down-weight dense rays,
+                but 1/p diverges as p -> 0 while exp(-p) is bounded, so this
+                update over-weights near-air rays relative to the physics. It
+                remains a legitimate nonnegative solver — it is the estimator
+                that is mislabelled by the name, not the arithmetic. Always
                 full-batch (no ordered subsets — TIGRE's MLEM forces
                 blocksize=N_angles internally); ignores lmbda/lmbda_red
                 entirely (no relaxation parameter in the EM update); enforces
@@ -435,9 +449,10 @@ class TIGREReconstructor:
                 overrides any passed-in W with its own Atb(ones) sensitivity
                 map, so a PWLS W array would be silently discarded rather
                 than applied — raises ValueError instead of failing silently.
-                MLEM's Poisson likelihood already models per-ray photon
-                statistics natively, so PWLS reweighting is redundant for it
-                anyway.
+                Note this is a mechanical incompatibility, not a redundancy:
+                MLEM carries its OWN implicit ray weighting (~1/p, see
+                algorithm above), and that weighting is the emission one, not
+                the transmission photon weighting pwls computes here.
             checkpoint_dir: str or None. If set and crossval=True, save a
                 cropped copy of the reconstructed volume at every crossval
                 eval checkpoint (every eval_every iterations), in the same
@@ -474,9 +489,10 @@ class TIGREReconstructor:
                 "pwls=True is not compatible with algorithm='mlem': MLEM's "
                 "constructor unconditionally overrides any custom W weight "
                 "array with its own Atb(ones) sensitivity map, so the PWLS "
-                "weight would be silently ignored rather than applied. "
-                "MLEM already models per-ray photon statistics natively "
-                "through its Poisson likelihood, so PWLS is redundant here."
+                "weight would be silently ignored rather than applied. MLEM "
+                "is not a substitute for it either — its own implicit ray "
+                "weighting is the emission one (~1/p), not the transmission "
+                "photon weighting (~exp(-p)) that pwls supplies."
             )
 
         self.projections = projections

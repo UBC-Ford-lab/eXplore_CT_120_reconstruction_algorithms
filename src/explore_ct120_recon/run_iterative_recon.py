@@ -74,9 +74,12 @@ Examples:
         help='Reconstruction algorithm. '
              'ASTRA: SIRT3D_CUDA, CGLS3D_CUDA, SART3D_CUDA, FDK_CUDA (default: SIRT3D_CUDA). '
              'TIGRE: ossart, sart, sirt, mlem (default: ossart). '
-             'mlem is Maximum-Likelihood Expectation-Maximization under a Poisson '
-             'noise model (full-batch, no ordered subsets; ignores --lmbda/--lmbda-red; '
-             'incompatible with --pwls).'
+             'mlem is Expectation-Maximization with the multiplicative update '
+             'x <- x * Atb(p/Ax) / Atb(1). That is the EMISSION-Poisson ML step, '
+             'applied here to transmission line integrals: its implicit ray weight '
+             'is ~1/p, not the ~exp(-p) photon weighting of transmission CT (see '
+             '--pwls). Full-batch, no ordered subsets; ignores --lmbda/--lmbda-red; '
+             'incompatible with --pwls.'
     )
     parser.add_argument(
         '--iterations',
@@ -358,6 +361,12 @@ def main():
         if args.algorithm == 'mlem':
             print("MLEM: full-batch (no ordered subsets), no relaxation "
                   "parameter — --blocksize/--lmbda/--lmbda-red are ignored")
+            print("      NOTE: this is the EMISSION-Poisson EM update applied "
+                  "to transmission line integrals. Its implicit per-ray weight "
+                  "is ~1/p; the photon weighting for this measurement is "
+                  "~exp(-p) (--pwls, on the least-squares algorithms). Treat "
+                  "it as a third weighting scheme, not as 'the statistical "
+                  "one'.")
         else:
             print(f"Blocksize: {args.blocksize}")
             print(f"Lambda: {args.lmbda}, Lambda reduction: {args.lmbda_red}")
