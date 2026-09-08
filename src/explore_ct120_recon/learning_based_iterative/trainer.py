@@ -545,7 +545,8 @@ class LearnedReconstructor:
             exclude = None
             if self.withhold_eval and self.crossval and scene.n_angles > 1:
                 exclude = resolve_holdout_index(self.holdout_index,
-                                                scene.n_angles)
+                                                scene.n_angles,
+                                                self.view_groups)
             o, d, _ = sample_random_rays(scene, int(n_probe), generator=gen,
                                          device=device, exclude_angle=exclude,
                                          subpixel=self.subpixel_rays)
@@ -787,7 +788,8 @@ class LearnedReconstructor:
         # Withheld from training only when withhold_eval.
         holdout = None
         if self.crossval and scene.n_angles > 1:
-            holdout = resolve_holdout_index(self.holdout_index, scene.n_angles)
+            holdout = resolve_holdout_index(self.holdout_index, scene.n_angles,
+                                            self.view_groups)
             n_b, n_a = scene.detector_shape
             ds = self.diag_downsample
             # Only the detector window whose rays stay inside the domain —

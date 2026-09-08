@@ -1156,14 +1156,11 @@ class GaussianReconstructor(LearnedReconstructor):
         return np.flatnonzero(np.asarray(g) == int(group))
 
     def _resolve_holdout(self, n_views: int) -> int:
-        """The held-out view: the middle of the FIRST group, not of the file
-        list — with two gated phases the list's middle is the first view of
-        phase 1, the terminal angle of the short scan, the worst possible
-        validation view."""
-        sel = self._group_views(0)
-        if self.holdout_index is None and sel is not None:
-            return int(sel[len(sel) // 2])
-        return resolve_holdout_index(self.holdout_index, n_views)
+        """The held-out view: the middle of the FIRST acquisition group (see
+        ``resolve_holdout_index``), the same view the driver measures the
+        noise ceiling at."""
+        return resolve_holdout_index(self.holdout_index, n_views,
+                                     getattr(self, 'view_groups', None))
 
     def _roi_box_mm(self, margin_mm):
         """(lo, hi) of the export ROI + margin in mm, or None without a ROI."""

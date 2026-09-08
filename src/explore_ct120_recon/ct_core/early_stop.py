@@ -168,7 +168,7 @@ def resolve_min_iter(total_iterations, min_iter=None, *,
 # Scoring a held-out projection
 # ---------------------------------------------------------------------------
 
-def resolve_holdout_index(index, n_angles: int) -> int:
+def resolve_holdout_index(index, n_angles: int, view_groups=None) -> int:
     """`None` -> the middle angle. An int is bounds-checked.
 
     The middle is the default because it is the angle furthest (in either
@@ -176,8 +176,19 @@ def resolve_holdout_index(index, n_angles: int) -> int:
     in the training set and the interpolation it tests is the easiest one the
     geometry offers. A held-out END angle would be an extrapolation and would
     read as a harder problem than the reconstruction actually faces.
+
+    With ``view_groups`` (one acquisition group per view, as a gated scan
+    loaded with several phases has) the default is the middle of the FIRST
+    group, not of the file list: with two phases the list's middle is the
+    first view of phase 1, the terminal angle of the short scan, the worst
+    possible validation view.
     """
     if index is None:
+        if view_groups is not None:
+            g = np.asarray(view_groups)
+            if g.shape[0] == int(n_angles) and len(np.unique(g)) > 1:
+                sel = np.flatnonzero(g == g[0])
+                return int(sel[len(sel) // 2])
         return int(n_angles) // 2
     idx = int(index)
     if not 0 <= idx < int(n_angles):

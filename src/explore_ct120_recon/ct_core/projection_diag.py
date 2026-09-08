@@ -231,7 +231,20 @@ def measure_noise_ceiling(ctx, eval_index: int, phase: str = "00",
         return None
     p0_raw = np.asarray(ctx.projections[eval_index], dtype=np.float32)
 
-    pair_raw, other_tag = _other_phase_frame(ctx, eval_index, phase)
+    # With several phases loaded at once, `eval_index` runs over the
+    # concatenated list: the frame's own phase is its group's label and its
+    # view number is its rank within that group. A single-phase load keeps
+    # the caller's `phase` and the plain index.
+    groups = getattr(ctx, 'view_groups', None)
+    view_in_phase = int(eval_index)
+    if groups is not None and len(groups) == n:
+        groups = np.asarray(groups)
+        g = int(groups[eval_index])
+        labels = tuple(getattr(ctx, 'group_labels', ()) or ())
+        if g < len(labels):
+            phase = str(labels[g]).strip('-')
+        view_in_phase = int(np.count_nonzero(groups[:eval_index] == g))
+    pair_raw, other_tag = _other_phase_frame(ctx, view_in_phase, phase)
     if pair_raw is not None and pair_raw.shape == p0_raw.shape:
         source = f"other phase (acq-{other_tag}, same angle)"
         conservative = False

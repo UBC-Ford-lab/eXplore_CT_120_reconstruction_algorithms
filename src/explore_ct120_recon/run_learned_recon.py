@@ -52,6 +52,7 @@ from .ct_core.early_stop import DEFAULT_MIN_LR_FRACTION
 from .ct_core.hu_calibration import resolve_anchors
 from .ct_core.errors import ConfigError, cli_main
 from .ct_core.preflight import MachineRequest, auto_rays_per_batch
+from .ct_core.early_stop import resolve_holdout_index
 from .ct_core.projection_diag import measure_noise_ceiling
 from .ct_core.utils import query_gpu_memory
 from .ct_core.early_stop import STOP_METRICS
@@ -854,10 +855,14 @@ def main(argv=None):
     # Other acquisition phase when the scan has one, else the neighbouring
     # projection. The trainer streams diag/ssim|psnr|mse against this ceiling
     # at every eval checkpoint via diag_fn.
-    eval_idx = (args.holdout_index if args.holdout_index is not None
-                else int(ctx.projections.shape[0]) // 2)
-    logger.set_noise_ceiling(measure_noise_ceiling(
-        ctx, eval_idx, phase=args.phase))
+    # The same view the trainer withholds (the middle of the first
+    # acquisition group when several phases are loaded), scored against its
+    # own phase's counterpart: `measure_noise_ceiling` reads both off the
+    # context, so the raw --phase string never reaches the file lookup.
+    eval_idx = resolve_holdout_index(args.holdout_index,
+                                     int(ctx.projections.shape[0]),
+                                     ctx.view_groups)
+    logger.set_noise_ceiling(measure_noise_ceiling(ctx, eval_idx))
 
     # `shared` is the LOOP's configuration — data, objective, schedule, the
     # stopping rules, the logging hooks — and every representation gets all of
