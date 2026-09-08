@@ -17,7 +17,7 @@ grid, from those measurements.*
 |---|---|---|
 | Analytic (`fdk/`) | FDK with ramp / Shepp-Logan / cosine / Hamming windows, Parker weighting | PyTorch |
 | Classical iterative (`iterative/`) | ASTRA: SIRT, CGLS, SART. TIGRE: OS-SART, SART, SIRT, MLEM, +TV | CUDA + ASTRA or TIGRE |
-| Learning-based (`learning_based_iterative/`) | Differentiable projector + gradient descent; voxel grid by default, other representations pluggable | CUDA |
+| Learning-based (`learning_based_iterative/`) | Differentiable projector + gradient descent. `--algorithm voxel` (dense grid, the default) or `--algorithm gaussian` (anisotropic 3-D Gaussian splatting through an X-ray rasteriser, with a counts-weighted least-squares loss); other representations pluggable | CUDA (+ the rasteriser for `gaussian`) |
 
 All three share the same loading, preprocessing, geometry calibration, HU
 calibration and output format, so their volumes are directly comparable.
@@ -36,6 +36,9 @@ Optional backends and logging:
 pip install astra-toolbox                                            # ASTRA
 pip install "git+https://github.com/CERN/TIGRE.git#subdirectory=Python"   # TIGRE (not on PyPI)
 pip install wandb                                                    # experiment logging
+# --algorithm gaussian: the X-ray Gaussian rasteriser (research licence, not on PyPI)
+git clone --recursive https://github.com/Ruyi-Zha/r2_gaussian
+pip install --no-build-isolation ./r2_gaussian/r2_gaussian/submodules/xray-gaussian-rasterization-voxelization
 ```
 
 Python 3.10+ and PyTorch 2.0+. The import name is `explore_ct120_recon`.
@@ -49,6 +52,7 @@ ct120-fdk data/scans/Scan_1988
 ct120-iterative data/scans/Scan_1988 --backend astra --algorithm SIRT3D_CUDA --iterations 100
 ct120-iterative data/scans/Scan_1988 --backend tigre --algorithm ossart --tv-lambda 10
 ct120-learned data/scans/Scan_1988 --downsample 3
+ct120-learned data/scans/Scan_1988 --algorithm gaussian
 ct120-volume-report VOLUME.vff
 ct120-projection-report data/scans/Scan_1988 --volume a.vff --volume b.vff
 ct120-geometry-calibration data/scans/Scan_1988
@@ -100,9 +104,18 @@ held-out projection for early stopping. Main flags: `--loss` (`mse`,
 A new representation only has to answer three hooks in a
 `LearnedReconstructor` subclass: `build_model`, `build_domain`,
 `export_volume`. Register it with a `LearnedAlgorithm` descriptor and it
-becomes an `--algorithm` choice; `voxel/` is the 100-line example. A
+becomes an `--algorithm` choice; `voxel/` is the 100-line example and
+`gaussian/` the full-size one (its own per-view training loop, seeding from
+an FDK of the scan, a measured noise model, shape constraints). A descriptor
+may also re-default the shared flags for its representation
+(`driver_defaults`: binning, iteration cap, stopping metric — `gaussian` runs
+at `--downsample 3` with an SSIM stopper unless told otherwise). A
 representation in another package works the same way via
-`--algorithm-module my_package.algorithms`.
+`--algorithm-module my_package.algorithms`, and may subclass
+`GaussianReconstructor` through its seams (`_render_train`, `_render_eval`,
+`_param_groups`, `_regularise`, `_state` / `_restore_state`,
+`_checkpoint_payload`) to change what is rasterised without touching the
+loop.
 
 ## Report tools
 

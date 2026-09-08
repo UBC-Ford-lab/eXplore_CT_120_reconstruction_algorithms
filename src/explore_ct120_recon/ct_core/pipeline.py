@@ -156,7 +156,7 @@ def add_common_args(parser):
         type=int,
         default=1,
         help='Downsample projections by this factor before reconstruction '
-             '(default: 1). Reduces GPU memory usage. Factor 2 halves each '
+             '(default: %(default)s). Reduces GPU memory usage. Factor 2 halves each '
              'detector dimension (detector pixel size and central-pixel '
              'indices are converted consistently).'
     )
@@ -312,8 +312,8 @@ def add_common_args(parser):
         help='Withhold the evaluation projection (the central angle, the '
              'same one every diagnostic uses) from the reconstruction, '
              'turning the diag/* metrics into true held-out validation. '
-             'Default: off — the projection is reconstructed from AND '
-             'evaluated against (diagnostic, not validation).'
+             'Default: %(default)s; when off the projection is reconstructed '
+             'from AND evaluated against (diagnostic, not validation).'
     )
 
     # Experiment logging (local PNG plots + optional Weights & Biases)

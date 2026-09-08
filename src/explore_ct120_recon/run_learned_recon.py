@@ -324,6 +324,28 @@ def _parse_loss_options(pairs):
     return out
 
 
+def _apply_driver_defaults(parser, algorithm) -> None:
+    """Let the representation re-default the SHARED flags it has opinions on.
+
+    ``LearnedAlgorithm.driver_defaults`` maps parser dests to values. Applied
+    with ``set_defaults`` before parsing, so the user's own flag still wins
+    and ``%(default)s`` in ``--help`` shows the value this algorithm runs
+    with. A key the parser does not know is refused: a typo there would
+    otherwise be a production recipe that silently never applied.
+    """
+    defaults = dict(getattr(algorithm, 'driver_defaults', None) or {})
+    if not defaults:
+        return
+    known = {a.dest for a in parser._actions}
+    unknown = sorted(set(defaults) - known)
+    if unknown:
+        raise ConfigError(
+            f"--algorithm {algorithm.name} declares driver_defaults for "
+            f"{unknown}, which no flag of this driver sets. Known dests are "
+            f"the parser's; check LearnedAlgorithm.driver_defaults.")
+    parser.set_defaults(**defaults)
+
+
 def parse_args(argv=None):
     """The parsed namespace AND the algorithm it was built for.
 
@@ -426,7 +448,7 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
                              '--loss-option ssim_weight=0.5. Options that do '
                              'not apply to the selected term are ignored.')
     parser.add_argument('--iterations', type=int, default=20000,
-                        help='Optimizer steps (default: 20000). On Scan_1510 '
+                        help='Optimizer steps (default: %(default)s). On Scan_1510 '
                              'the holdout optimum sat near 16k; crossval stops '
                              'earlier when the holdout MSE plateaus.')
     parser.add_argument('--rays-per-batch', default='auto', metavar='N|auto',
@@ -513,8 +535,8 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
     parser.add_argument('--holdout-index', type=int, default=None, metavar='N',
                         help='Projection index to hold out (default: middle)')
     parser.add_argument('--eval-every', type=int, default=250, metavar='K',
-                        help='Evaluate holdout MSE every K iterations '
-                             '(default: 250)')
+                        help='Evaluate the held-out metric every K iterations '
+                             '(default: %(default)s)')
     parser.add_argument('--patience', type=int, default=None, metavar='P',
                         help='Stop after P holdout evals without improvement. '
                              'Default: 4 with --lr-plateau on (reaching the LR '
@@ -616,7 +638,7 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
         help='Which held-out metric decides the peak. They do not peak '
              'together: mse is the objective and turns over last, ssim is '
              'structural and turns over earliest, psnr sits between. Default: '
-             'ssim.'
+             '%(default)s.'
     )
     parser.add_argument(
         '--l-curve',
@@ -650,6 +672,7 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
              "logged and plotted."
     )
 
+    _apply_driver_defaults(parser, algorithm)
     args = parser.parse_args(argv)
     # What was actually imported, not what was asked for: the env var
     # contributes too, and a run should record the modules its representation
@@ -689,6 +712,10 @@ def main(argv=None):
         output_path = ctx.default_output_path(
             f'_recon_{algorithm.name}_{args.iterations}it')
     print(f"\nOutput path: {output_path}")
+    # The resolved path is a fact of the run from here on; an algorithm's
+    # `options(args)` may place its own sidecars (a cloud checkpoint) next
+    # to the volume, so it sees the same answer the export will use.
+    args.output = output_path
 
     # Quadrature samples per ray — needed before the trainer exists, both to
     # size the ray batch and to estimate VRAM. Mirrors the trainer's auto rule.

@@ -59,7 +59,7 @@ numbers. Never put a filesystem path in there.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..ct_core.preflight import Footprint, MachineRequest  # noqa: F401 (re-exported)
@@ -120,6 +120,20 @@ class LearnedAlgorithm:
     #: different architectures under one ``--algorithm``, and muNeRF tunes
     #: them to 1e-3 and 5e-4 respectively.
     default_lr: float | Callable[[Any], float] | None = None
+    #: Defaults for the SHARED flags (``dest`` -> value) that this
+    #: representation wants when the user does not say otherwise: binning,
+    #: iteration cap, evaluation cadence, stopping metric, plateau schedule.
+    #: The driver applies them with ``parser.set_defaults`` before parsing, so
+    #: an explicit flag always wins and ``--help`` prints the value the run
+    #: will actually use. Same reason ``default_lr`` exists, generalised: a
+    #: shared default is not representation-neutral. A cloud of primitives is
+    #: judged on held-out SSIM and reduced chi-square, its held-out curve is
+    #: still rising when the voxel grid's has turned, and it trains at one
+    #: third of the detector's resolution because its cost is per view, not
+    #: per ray — none of which the grid's defaults know. Keys must be dests
+    #: the driver's parser declares; an unknown one is a ConfigError at
+    #: startup, never a silently ignored setting.
+    driver_defaults: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.footprint is None:

@@ -21,7 +21,9 @@ Algorithms live in their own subfolder, and each is only the three answers
 integration domain is, and how a volume comes out:
 
 * ``voxel``          — dense voxel grid (SIRT's representation).
-                       Future siblings: nerf/, hashgrid/, gaussian_splatting/.
+* ``gaussian``       — anisotropic 3-D Gaussian splatting through the
+                       X-ray radiative rasteriser (optional native extension;
+                       importing never needs it, reconstructing does).
 
 Each also ships a ``LearnedAlgorithm`` descriptor (``registry``) carrying the
 three things the DRIVER cannot guess either — the flags it adds to the CLI,
@@ -81,6 +83,9 @@ from .registry import register as register_algorithm
 from .voxel.model import VoxelGrid, voxel_grid_shape
 from .voxel.reconstructor import VoxelReconstructor
 from .voxel import ALGORITHM as VOXEL_ALGORITHM
+from .gaussian import ALGORITHM as GAUSSIAN_ALGORITHM
+from .gaussian.model import GaussianCloud
+from .gaussian.reconstructor import GaussianReconstructor
 
 # ---------------------------------------------------------- registration --
 # Importing this package is what makes an algorithm selectable, and every
@@ -88,6 +93,7 @@ from .voxel import ALGORITHM as VOXEL_ALGORITHM
 # decorator so the set is visible in one place; a third-party representation
 # calls `register_algorithm` from its own module instead.
 register_algorithm(VOXEL_ALGORITHM)
+register_algorithm(GAUSSIAN_ALGORITHM)
 
 __all__ = [
     "DOMAIN_SPECS", "ModelDomain", "Scene", "model_domain_from_bounds",
@@ -108,5 +114,6 @@ __all__ = [
     "LearnedAlgorithm", "register_algorithm", "get_algorithm",
     "algorithm_names", "algorithms", "describe_algorithms",
     "VoxelGrid", "voxel_grid_shape", "VoxelReconstructor", "VOXEL_ALGORITHM",
+    "GaussianCloud", "GaussianReconstructor", "GAUSSIAN_ALGORITHM",
     "resolve_export_grid", "resolve_export_roi",
 ]
