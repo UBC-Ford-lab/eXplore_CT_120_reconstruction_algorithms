@@ -154,12 +154,82 @@ def render(cloud, camera, *, need_screenspace_grad: bool = False) -> dict:
         means3D=means3D,
         means2D=screenspace,
         opacities=cloud.density,
-        scales=cloud.scaling,
-        rotations=cloud.rotation,
-        cov3D_precomp=None,
+        **_shape_kwargs(cloud),
     )
     return {'image': image[0], 'radii': radii, 'visible': radii > 0,
             'screenspace': screenspace}
+
+
+def _shape_kwargs(cloud, allow_precomputed: bool = True) -> dict:
+    """How the cloud states its shapes: ``scaling`` + ``rotation`` (the
+    parameters), or a precomputed world-space covariance ``cov3D_precomp``
+    (N, 6: upper triangle xx, xy, xz, yy, yz, zz) when the cloud carries one —
+    a deformed cloud whose primitives were transported by a Jacobian is most
+    naturally stated that way. The extension accepts exactly one of the two.
+
+    Only the RASTERISER honours the precomputed form (VERIFIED 2026-09-08:
+    identical image to 2e-7 for Sigma = R diag(s^2) R^T, `covariance_upper`;
+    the transposed convention is off by 9 %). The VOXELISER's precomputed
+    path raises an illegal memory access on the very same cloud, so
+    `voxelize` passes ``allow_precomputed=False`` and a cloud that wants
+    transported shapes on the export grid must offer them factorised
+    (eigendecomposition; see the dynamic add-on's `DisplacedCloud`)."""
+    cov = getattr(cloud, 'cov3D_precomp', None) if allow_precomputed else None
+    if cov is not None:
+        return {'scales': None, 'rotations': None, 'cov3D_precomp': cov}
+    return {'scales': cloud.scaling, 'rotations': cloud.rotation,
+            'cov3D_precomp': None}
+
+
+def covariance_to_scaling_rotation(cov6: torch.Tensor):
+    """Inverse of `covariance_upper`: (N, 6) -> (scaling (N, 3), unit
+    quaternion (N, 4)) with Sigma = R diag(s^2) R^T, for the voxeliser."""
+    S = torch.zeros((cov6.shape[0], 3, 3), dtype=cov6.dtype, device=cov6.device)
+    S[:, 0, 0], S[:, 0, 1], S[:, 0, 2] = cov6[:, 0], cov6[:, 1], cov6[:, 2]
+    S[:, 1, 1], S[:, 1, 2], S[:, 2, 2] = cov6[:, 3], cov6[:, 4], cov6[:, 5]
+    S[:, 1, 0], S[:, 2, 0], S[:, 2, 1] = cov6[:, 1], cov6[:, 2], cov6[:, 4]
+    evals, evecs = torch.linalg.eigh(S.double())
+    scaling = evals.clamp_min(1e-20).sqrt().to(cov6.dtype)
+    R = evecs
+    # a proper rotation: flip the last column where det < 0
+    det = torch.linalg.det(R)
+    R = R.clone()
+    R[det < 0, :, 2] *= -1.0
+    return scaling, rotation_to_quaternion(R).to(cov6.dtype)
+
+
+def rotation_to_quaternion(R: torch.Tensor) -> torch.Tensor:
+    """(N, 3, 3) proper rotations -> (N, 4) unit quaternions (r, x, y, z),
+    the layout `model._quat_to_rot` reads. Shepperd's method, branch-free."""
+    m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
+    m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
+    m20, m21, m22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
+    tr = m00 + m11 + m22
+    # four candidate formulations; pick per row the one with the largest pivot
+    q_r = torch.stack([1 + tr, m21 - m12, m02 - m20, m10 - m01], dim=1)
+    q_x = torch.stack([m21 - m12, 1 + m00 - m11 - m22, m01 + m10, m02 + m20], dim=1)
+    q_y = torch.stack([m02 - m20, m01 + m10, 1 - m00 + m11 - m22, m12 + m21], dim=1)
+    q_z = torch.stack([m10 - m01, m02 + m20, m12 + m21, 1 - m00 - m11 + m22], dim=1)
+    pivots = torch.stack([1 + tr, 1 + m00 - m11 - m22, 1 - m00 + m11 - m22,
+                          1 - m00 - m11 + m22], dim=1)
+    choice = pivots.argmax(dim=1)
+    q = torch.where((choice == 0)[:, None], q_r,
+        torch.where((choice == 1)[:, None], q_x,
+        torch.where((choice == 2)[:, None], q_y, q_z)))
+    return q / q.norm(dim=1, keepdim=True).clamp_min(1e-30)
+
+
+def covariance_upper(scaling: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+    """The (N, 6) upper triangle of Sigma = R diag(s^2) R^T, in the layout
+    the extension's ``cov3D_precomp`` expects — the same R as the kernel
+    builds from the quaternion (verified against a rendered image, see
+    tests)."""
+    from .model import _quat_to_rot
+    R = _quat_to_rot(rotation)
+    M = R * scaling[:, None, :]                       # R diag(s)
+    S = M @ M.transpose(1, 2)                          # R diag(s^2) R^T
+    return torch.stack([S[:, 0, 0], S[:, 0, 1], S[:, 0, 2],
+                        S[:, 1, 1], S[:, 1, 2], S[:, 2, 2]], dim=1)
 
 
 def voxelize(cloud, *, n_voxel, extent_world, center_world) -> torch.Tensor:
@@ -194,9 +264,7 @@ def voxelize(cloud, *, n_voxel, extent_world, center_world) -> torch.Tensor:
     volume, _radii = voxelizer(
         means3D=cloud.xyz,
         opacities=cloud.density,
-        scales=cloud.scaling,
-        rotations=cloud.rotation,
-        cov3D_precomp=None,
+        **_shape_kwargs(cloud, allow_precomputed=False),
     )
     return volume
 

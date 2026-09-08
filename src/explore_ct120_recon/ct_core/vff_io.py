@@ -208,8 +208,12 @@ class VFFDataset:
 
         # Apply sub-scan filter only to acquisition files (not sequential proj-* files)
         if sub_scan:
-            self.paths = [p for p in self.paths
-                          if p.name.startswith('proj-') or sub_scan in str(p)]
+            from .scan_setup import phase_tokens
+            toks = phase_tokens(sub_scan)
+            if toks:
+                self.paths = [p for p in self.paths
+                              if p.name.startswith('proj-')
+                              or any(t in p.name for t in toks)]
 
         with open(xml_file, 'r') as f:
             header = xmltodict.parse(f.read())

@@ -164,8 +164,15 @@ class LearnedReconstructor:
                  amp: str = "off",
                  compile_model: bool = False,
                  grad_clip_norm: float = 0.0,
-                 log_fn=None, diag_fn=None):
+                 log_fn=None, diag_fn=None,
+                 view_groups=None):
         self.projections = projections
+        # One integer per projection: the acquisition group (gated phase) it
+        # came from, or None when the scan has a single group. A fact about
+        # the DATA, carried here so any representation may use it — a static
+        # model ignores it, a motion-aware one conditions on it.
+        self.view_groups = (None if view_groups is None
+                            else np.asarray(view_groups, dtype=np.int64))
         # `angles` may be None when a prebuilt Scene is supplied — it carries
         # its own. Resolved in reconstruct() once the scene is known.
         self.angles = None if angles is None else np.asarray(angles)

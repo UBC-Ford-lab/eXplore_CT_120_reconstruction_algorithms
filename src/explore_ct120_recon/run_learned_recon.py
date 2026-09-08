@@ -905,6 +905,7 @@ def main(argv=None):
         l_curve_norm=args.l_curve_norm,
         stop_on=tuple(args.stop_on),
         log_fn=logger.log,
+        view_groups=ctx.view_groups,
         # diag/* scalars every eval + SSIM-heatmap / power-spectrum figures
         # on a coarser cadence (figure_every_evals), all through the logger.
         diag_fn=logger.log_projection_diag,

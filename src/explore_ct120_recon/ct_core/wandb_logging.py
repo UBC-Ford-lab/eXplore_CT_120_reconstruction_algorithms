@@ -391,13 +391,27 @@ class ReconLogger:
     # -- primitives ------------------------------------------------------
 
     def log(self, metrics: dict, step: int | None = None) -> None:
-        """Native per-step scalars (live charts). No-op without W&B."""
+        """Native per-step scalars (live charts). No-op without W&B.
+
+        A value that is a matplotlib ``Figure`` is a panel, not a scalar: it
+        goes through `_emit` (local PNG named after the key and step, W&B
+        image under the key), so a backend can log its own figures through
+        the one callable it is handed without knowing about the logger.
+        """
         if step is not None:
             self._max_step = max(self._max_step, int(step))
-        if self.run is None:
+        scalars = {}
+        for k, v in metrics.items():
+            if isinstance(v, Figure):
+                stem = str(k).replace('/', '_')
+                self._emit(str(k), v, step=step,
+                           filename=(stem if step is None else f"{stem}_{int(step)}"))
+            else:
+                scalars[k] = v
+        if self.run is None or not scalars:
             return
         try:
-            self.run.log(metrics, step=step)
+            self.run.log(scalars, step=step)
         except Exception as e:
             print(f"W&B log failed ({type(e).__name__}: {e})")
 

@@ -509,7 +509,7 @@ class GaussianReconstructor(LearnedReconstructor):
         base_lrs = [g['lr'] for g in optimizer.param_groups]
 
         # ---- evaluation projection ---------------------------------------
-        holdout = (resolve_holdout_index(self.holdout_index, n_views)
+        holdout = (self._resolve_holdout(n_views)
                    if self.crossval and n_views > 1 else None)
         train_views = [i for i in range(n_views)
                        if not (self.withhold_eval and i == holdout)]
@@ -1147,6 +1147,24 @@ class GaussianReconstructor(LearnedReconstructor):
         if b == 'auto':
             self.cfg['wls_var_floor'] = float(fb)
 
+    def _group_views(self, group: int):
+        """Indices of the views in acquisition group ``group``, or None when
+        the scan has a single group (so callers can keep the whole set)."""
+        g = getattr(self, 'view_groups', None)
+        if g is None or len(np.unique(g)) < 2:
+            return None
+        return np.flatnonzero(np.asarray(g) == int(group))
+
+    def _resolve_holdout(self, n_views: int) -> int:
+        """The held-out view: the middle of the FIRST group, not of the file
+        list — with two gated phases the list's middle is the first view of
+        phase 1, the terminal angle of the short scan, the worst possible
+        validation view."""
+        sel = self._group_views(0)
+        if self.holdout_index is None and sel is not None:
+            return int(sel[len(sel) // 2])
+        return resolve_holdout_index(self.holdout_index, n_views)
+
     def _roi_box_mm(self, margin_mm):
         """(lo, hi) of the export ROI + margin in mm, or None without a ROI."""
         if margin_mm is None:
@@ -1276,9 +1294,19 @@ class GaussianReconstructor(LearnedReconstructor):
         geom = self._seed_geometry()
         print(f"  seeding: FDK reference on the model domain, "
               f"{geom['vol_shape']} at {geom['dx']:.3f} mm")
+        # Several acquisition groups (gated phases) repeat the same gantry
+        # positions; an FDK over all of them would weight each angle twice
+        # and average the states. The seed is the FIRST group alone.
+        sel = self._group_views(0)
+        proj = np.asarray(self.projections)
+        angs = np.asarray(self.angles, dtype=np.float32)
+        if sel is not None:
+            print(f"  seeding: from acquisition group 0 only "
+                  f"({len(sel)} of {len(angs)} views)")
+            proj, angs = proj[sel], angs[sel]
         fdk = FDKReconstructor(
-            torch.as_tensor(np.asarray(self.projections)),
-            torch.as_tensor(np.asarray(self.angles, dtype=np.float32)),
+            torch.as_tensor(proj),
+            torch.as_tensor(angs),
             geom, folder_name='gaussian-seed', quantitative=True,
             bright_field=self.bright_field, dark_field=self.dark_field,
             soft_clip_sharpness=self.soft_clip_sharpness,

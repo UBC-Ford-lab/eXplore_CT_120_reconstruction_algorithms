@@ -100,9 +100,11 @@ def add_common_args(parser):
     parser.add_argument(
         '--phase',
         default='00',
-        help='Acquisition phase to reconstruct for multi-phase (gated) scans, '
-             'e.g. 00 or 01. Selects projection files whose name contains '
-             '"-<phase>-" (default: 00). Ignored for sequential proj-* scans.'
+        help='Acquisition phase(s) to reconstruct for multi-phase (gated) '
+             'scans: 00 or 01 select one, "00,01" or "all" load several at '
+             'once — the same gantry positions in different physiological '
+             'states, each view labelled with its group for backends that '
+             'model motion (default: 00). Ignored for sequential proj-* scans.'
     )
     parser.add_argument(
         '--voxel-xy',
@@ -348,6 +350,10 @@ class ScanContext:
     roi_bounds: Optional[dict] = None
     total_angle: float = 0.0
     downsample: int = 1
+    #: One integer per projection: the acquisition group (gated phase) it
+    #: came from, indexing `group_labels`. All zeros for a single phase.
+    view_groups: Optional[np.ndarray] = None
+    group_labels: tuple = ('00',)
     detector_psi: Optional[dict] = field(default=None)
     # Carried on the context rather than threaded through every diagnostic
     # signature so the noise-ceiling frames are levelled exactly like the
@@ -773,6 +779,8 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         roi_bounds=roi_bounds,
         total_angle=scan_data['total_angle'],
         downsample=factor,
+        view_groups=scan_data.get('view_groups'),
+        group_labels=tuple(scan_data.get('group_labels', ('00',))),
         air_normalization=bool(getattr(args, 'air_normalization', True)),
     )
 

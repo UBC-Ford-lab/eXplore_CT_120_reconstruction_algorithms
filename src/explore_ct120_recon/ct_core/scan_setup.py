@@ -147,8 +147,10 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
     print(f"\nLoading projections (pattern: {projection_pattern})...")
     proj_paths = sorted(Path(data_folder).glob(projection_pattern))
     # Apply phase filter only to acquisition files (not sequential proj-* files)
-    if sub_scan:
-        proj_paths = [p for p in proj_paths if p.name.startswith('proj-') or sub_scan in str(p)]
+    phases = phase_tokens(sub_scan)
+    if phases:
+        proj_paths = [p for p in proj_paths if p.name.startswith('proj-')
+                      or any(tok in p.name for tok in phases)]
     n_files = len(proj_paths)
     if n_files == 0:
         raise ScanDataError(
@@ -187,8 +189,13 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
     )
     projections = dataset.projections  # shape (N_angles, N_b, N_a)
     angles = dataset.angles_rad        # shape (N_angles,)
+    view_groups, group_labels = view_groups_for(dataset.paths, phases)
 
     print(f"Loaded {len(angles)} projections, shape: {projections.shape}")
+    if len(group_labels) > 1:
+        counts = np.bincount(view_groups, minlength=len(group_labels))
+        print("  acquisition groups (gated phases): "
+              + ", ".join(f"{lab}: {n} views" for lab, n in zip(group_labels, counts)))
 
     return {
         'projections': projections,
@@ -198,7 +205,51 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
         'xml_header': header,
         'n_files': n_files,
         'total_angle': total_angle_deg,
+        # One integer per projection: which acquisition group (gated phase)
+        # it belongs to, in the order of `group_labels`. All zeros for a
+        # single-phase load.
+        'view_groups': view_groups,
+        'group_labels': group_labels,
     }
+
+
+def phase_tokens(sub_scan) -> list:
+    """The filename tokens a ``--phase`` value selects.
+
+    ``'-00-'`` -> ['-00-']; ``'-00,01-'`` / ``'00,01'`` -> ['-00-', '-01-'];
+    ``'all'`` / ``'-all-'`` -> [] (no filter: every acquisition file). A gated
+    scan stores its phases as ``acq-<phase>-<view>.vff`` at the SAME gantry
+    positions, so loading several phases at once yields repeated angles with
+    a different physiological state each — what a motion-aware model fits.
+    """
+    if not sub_scan:
+        return []
+    raw = str(sub_scan).strip().strip('-')
+    if raw.lower() == 'all':
+        return []
+    return [f"-{tok.strip().strip('-')}-" for tok in raw.split(',') if tok.strip()]
+
+
+def view_groups_for(paths, phases) -> tuple:
+    """(view_groups, group_labels) for the loaded files.
+
+    The label of a file is its phase token (``acq-01-0007.vff`` -> ``01``);
+    files without one (sequential ``proj-*``) form a single group. Labels are
+    ordered as requested when ``phases`` names them, else sorted.
+    """
+    import re
+    labels = []
+    for p in paths:
+        m = re.match(r'^acq-(\d+)-', Path(p).name)
+        labels.append(m.group(1) if m else '')
+    if phases:
+        order = [tok.strip('-') for tok in phases]
+        order = [o for o in order if o in set(labels)] or sorted(set(labels))
+    else:
+        order = sorted(set(labels))
+    index = {lab: i for i, lab in enumerate(order)}
+    groups = np.array([index.get(lab, 0) for lab in labels], dtype=np.int64)
+    return groups, [str(o) for o in order]
 
 
 def parse_crop_boundary(scan_folder, xml_header):
