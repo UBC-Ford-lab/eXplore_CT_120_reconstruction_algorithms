@@ -55,6 +55,7 @@ ct120-learned = "explore_ct120_recon.run_learned_recon:cli"
 ct120-volume-report = "explore_ct120_recon.run_volume_report:cli"
 ct120-projection-report = "explore_ct120_recon.run_projection_report:cli"
 ct120-geometry-calibration = "explore_ct120_recon.run_geometry_calibration:cli"
+ct120-noise-calibration = "explore_ct120_recon.run_noise_calibration:cli"
 
 [tool.setuptools.dynamic]
 version = {attr = "explore_ct120_recon.__version__"}

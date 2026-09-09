@@ -27,7 +27,9 @@ Two families, and the difference matters when reading a config:
   name (a target, a patch sampler, a schedule), so the trainer wires them
   explicitly rather than by string.
 
-Adding a data term is one entry in ``DATA_TERMS`` and nothing else.
+Adding a data term is one entry in ``DATA_TERMS`` and nothing else — plus
+its row in ``BATCH_KIND`` (what shape of batch it scores) and, if it keeps
+something sinogram-sized resident, ``RESIDENT_SINO_COPIES``.
 """
 
 from __future__ import annotations
@@ -37,11 +39,13 @@ from .data_terms import (
     build_phase_wiener_gate,
     build_wiener_kernel,
     filtered_mse,
+    l1_dssim,
     make_huber_loss,
     mse,
     ssim_loss,
     weighted_mse,
     wiener_mse,
+    wls,
 )
 from .priors import (
     bone_anchors_to_mu,
@@ -75,6 +79,38 @@ def _mse_factory(**_):
 
 def _weighted_factory(**_):
     return weighted_mse
+
+
+def _wls_factory(*, weight_state=None, **_):
+    """Weighted least squares with the MEASURED inverse variances.
+
+    Needs ``weight_state`` — a dict whoever draws the batch refreshes with the
+    inverse variances of THIS batch's rays under the key ``"w"`` — because the
+    weight is a property of the measured pixel (its counts above dark), not of
+    the loss, and the loss only ever sees ``(pred, target)``. Same indirection
+    as ``sart``'s ``chord_state``: the registry's uniform contract is kept and
+    every trainer supplies the gather it already knows how to do — a ray
+    sampler indexes a weight map by the (angle, row, column) it drew, a
+    whole-view rasteriser hands over the view's slice.
+
+    The map itself is ``ct_core.noise_model.inverse_variance_weights`` on the
+    counts, built once by ``LearnedReconstructor._build_wls_weights``.
+    """
+    if weight_state is None:
+        raise ValueError(
+            "loss 'wls' needs weight_state={} — a dict the sampler fills with "
+            "this batch's inverse variances (ct_core.noise_model."
+            "inverse_variance_weights). Without it there is no variance and "
+            "the term is just MSE.")
+
+    def _fn(pred, target):
+        w = weight_state.get("w")
+        if w is None:
+            raise RuntimeError(
+                "weight_state is empty — the sampler must populate "
+                "weight_state['w'] before the loss is evaluated.")
+        return wls(pred, target, w)
+    return _fn
 
 
 def _huber_factory(*, delta=None, huber_sigma_mult=1.345, **_):
@@ -181,10 +217,23 @@ def _msssim_factory(**kw):
     return _structural_factory(ms=True, **kw)
 
 
+def _l1_dssim_factory(*, data_range, dssim_weight=0.2, window_size=11,
+                      sigma=1.5, **_):
+    """(1 - w) L1 + w (1 - SSIM) on a patch; ``data_range`` from the scan,
+    like the other structural terms, so the SSIM stabilisers are a constant
+    of the run rather than of whichever patch or view was drawn."""
+    def _fn(pred, target):
+        return l1_dssim(pred, target, data_range=data_range,
+                        dssim_weight=dssim_weight, window_size=window_size,
+                        sigma=sigma)
+    return _fn
+
+
 #: name -> factory. The factory takes keyword options and returns a callable
 #: ``(pred, target) -> scalar``. Unknown keywords are ignored, so one options
 #: dict can be passed whichever term is selected.
 DATA_TERMS = {
+    "wls": _wls_factory,
     "mse": _mse_factory,
     "weighted": _weighted_factory,
     "huber": _huber_factory,
@@ -193,12 +242,21 @@ DATA_TERMS = {
     "sart": _sart_factory,
     "ssim": _ssim_factory,
     "msssim": _msssim_factory,
+    "l1_dssim": _l1_dssim_factory,
 }
 
 #: One line per term, for CLI help and for logging what a run actually used.
 DATA_TERM_HELP = {
-    "mse": "plain L2 on line integrals; the objective classical SIRT descends",
-    "weighted": "L2 weighted by transmission, i.e. by measurement confidence",
+    "wls": "weighted least squares with the MEASURED inverse variance of every "
+           "ray (Poisson slope at the run's binning + detector read noise, "
+           "from the counts above dark; ct_core.noise_model) — the "
+           "maximum-likelihood term for this detector's noise; the value is "
+           "the reduced chi-square, 1.0 = at the photon noise. Needs raw "
+           "counts with bright/dark fields.",
+    "mse": "plain L2 on line integrals; the objective classical SIRT descends, "
+           "so the like-for-like comparison against the classical solvers",
+    "weighted": "L2 weighted by exp(-p): wls without the per-pixel flat field "
+                "or the read-noise floor; kept for comparison",
     "huber": "L2 near zero, L1 in the tail; crossover from the residual's own "
              "robust spread, bounding the influence of bad rays",
     "filtered": "L2 + L2 on ramp-filtered detector rows, weighting spatial "
@@ -211,9 +269,47 @@ DATA_TERM_HELP = {
     "ssim": "L2 + (1 - SSIM) on a projection patch; sensitive to local "
             "contrast and structure, which per-pixel L2 is not",
     "msssim": "L2 + (1 - MS-SSIM), the multi-scale variant",
+    "l1_dssim": "(1 - w) L1 + w (1 - SSIM) on a patch, the splatting "
+                "literature's objective (--loss-option dssim_weight=W, "
+                "default 0.2); kept for comparison",
 }
 
-DEFAULT_DATA_TERM = "mse"
+#: The DEFAULT since 2026-09-09: the likelihood for the measured noise. It was
+#: ``mse`` before, for the like-for-like comparison against SIRT; that
+#: comparison is one flag away (``--loss mse``) and the default run should be
+#: the best-founded objective rather than the most comparable one.
+DEFAULT_DATA_TERM = "wls"
+
+#: What shape of batch each term scores. The sampler follows the loss (see
+#: ``LearnedReconstructor._build_loss``): ``rays`` are any rays, ``rows`` are
+#: complete detector rows (a ramp is a convolution along the row), ``patch`` is
+#: a contiguous 2-D window (SSIM is defined over a local window in both axes).
+#: A whole view satisfies all three, which is how a rasteriser that fits one
+#: view per step can run every term here.
+BATCH_KIND = {
+    "wls": "rays", "mse": "rays", "weighted": "rays", "huber": "rays",
+    "sart": "rays",
+    "filtered": "rows", "wiener": "rows",
+    "ssim": "patch", "msssim": "patch", "l1_dssim": "patch",
+}
+
+#: Terms that need the RAYS' geometry, not just their values: ``sart`` weights
+#: by the chord length through the object, which a backend that never traces a
+#: ray (a rasteriser) cannot supply.
+NEEDS_RAY_GEOMETRY = frozenset({"sart"})
+
+#: Sinogram-sized tensors a term keeps resident on the device beside the
+#: sinogram itself, for the preflight: ``wls`` holds one inverse variance per
+#: measured pixel for the whole run.
+RESIDENT_SINO_COPIES = {"wls": 2}
+
+
+def resident_sinogram_copies(name=None) -> int:
+    """Resident sinogram-sized device tensors for data term ``name``
+    (``DEFAULT_DATA_TERM`` when None): the sinogram plus whatever the term
+    keeps beside it."""
+    key = DEFAULT_DATA_TERM if name is None else str(name).strip().lower()
+    return int(RESIDENT_SINO_COPIES.get(key, 1))
 
 
 def build_data_term(name: str = DEFAULT_DATA_TERM, **options):
@@ -243,9 +339,11 @@ def describe_data_terms(indent: str = "  ") -> str:
 
 __all__ = [
     # registry
-    "DATA_TERMS", "DATA_TERM_HELP", "DEFAULT_DATA_TERM",
+    "DATA_TERMS", "DATA_TERM_HELP", "DEFAULT_DATA_TERM", "BATCH_KIND",
+    "NEEDS_RAY_GEOMETRY", "RESIDENT_SINO_COPIES", "resident_sinogram_copies",
     "build_data_term", "describe_data_terms",
     # data terms
+    "wls", "l1_dssim",
     "mse", "weighted_mse", "make_huber_loss", "filtered_mse", "wiener_mse",
     "ssim_loss", "_build_ramp_kernel", "build_wiener_kernel",
     "build_phase_wiener_gate",

@@ -8,11 +8,20 @@ else, only that it was rendered through the shared differentiable projector.
 
 The family, and what distinguishes them:
 
+* ``wls``      — weighted least squares with the MEASURED inverse variance of
+                 every ray (``ct_core.noise_model``: Poisson slope at the run's
+                 binning + the detector's read noise, from the counts above
+                 dark of the very pixel the line integral came from). The
+                 maximum-likelihood data term for this detector's noise, and
+                 the DEFAULT for every learned backend since 2026-09-09. Its
+                 value is the reduced chi-square: 1.0 = at the photon noise.
 * ``mse``      — plain L2. The objective classical SIRT descends, so it is the
-                 default and the point of comparison for everything else.
-* ``weighted`` — L2 weighted by transmission, i.e. by the measurement's own
-                 statistical weight. Long, heavily attenuated rays carry less
-                 information per unit of line integral and are down-weighted.
+                 like-for-like comparison against the classical solvers.
+* ``weighted`` — L2 weighted by exp(-p), the transmission. What ``wls`` reduces
+                 to when every pixel has the same flat-field count and no read
+                 noise; blind to the per-pixel flat field (a 4x range across
+                 the detector on Scan_1510) and to the read-noise floor. Kept
+                 for comparison.
 * ``huber``    — L2 near zero, L1 in the tail, with the crossover set from the
                  residual's own robust spread rather than pinned. Bounds the
                  influence of the few rays that are simply wrong (a metal clip,
@@ -29,6 +38,10 @@ The family, and what distinguishes them:
                — structural similarity on a projection PATCH instead of
                  per-ray error. Sensitive to local contrast and structure,
                  which per-pixel L2 is not.
+* ``l1_dssim`` — (1 - w) L1 + w (1 - SSIM) on a patch, the objective of the
+                 splatting literature (3DGS, R2-Gaussian). L1 because a
+                 primitive's error is spatially concentrated and squaring it
+                 lets one primitive dominate a step. Kept for comparison.
 
 All of these are one-line to select and are all evaluated against the same
 measured data, which is what makes them comparable.
@@ -43,16 +56,53 @@ def mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def weighted_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Poisson-noise-aware weighted MSE for CT line integrals.
+    """L2 weighted by exp(-target), the transmission.
 
-    Weights each ray by exp(-target), which is proportional to the
-    transmission (inverse noise variance under Poisson photon statistics
-    after the -log transform).  Thick bone paths (high attenuation, high
-    noise) get downweighted; clean air/tissue paths get upweighted.
-    Equivalent to maximum-likelihood estimation for Poisson data.
+    Under pure Poisson statistics with ONE flat-field count for every pixel,
+    Var(p) = 1/(N0 T) so the inverse variance is proportional to exp(-p): thick
+    bone paths get down-weighted, air paths up-weighted. That is the limit of
+    ``wls`` with no read noise and a flat flat-field; it cannot see the
+    per-pixel count (the flat field) or the read-noise floor, because it only
+    has the line integral to look at. Normalised at air = 1, so the value is
+    not a chi-square.
     """
     w = torch.exp(-target)
     return (w * (pred - target) ** 2).mean()
+
+
+def wls(pred: torch.Tensor, target: torch.Tensor,
+        weights: torch.Tensor) -> torch.Tensor:
+    """Weighted least squares in LOG-ATTENUATION units: mean_i w_i r_i^2.
+
+    ``weights`` are the measured inverse variances of THESE rays
+    (``ct_core.noise_model.inverse_variance_weights``, gathered by whoever drew
+    the batch), so the value is the reduced chi-square of the batch: 1.0 means
+    the residual is at the photon noise, and the gradient is the
+    maximum-likelihood one for a Gaussian with that variance. A zero weight
+    (a masked detector seam) drops the ray while keeping the mean over the
+    batch, so the scale of the loss does not depend on how many were masked.
+
+    Mean, not sum, so a learning rate transfers to and from ``mse`` under
+    Adam; the classical summed misfit is ``sart``'s business.
+    """
+    if weights.shape != target.shape:
+        raise ValueError(f"wls weights {tuple(weights.shape)} do not match the "
+                         f"batch {tuple(target.shape)}")
+    r = pred - target
+    return (weights * r * r).mean()
+
+
+def l1_dssim(pred: torch.Tensor, target: torch.Tensor, *, data_range: float,
+             dssim_weight: float = 0.2, window_size: int = 11,
+             sigma: float = 1.5) -> torch.Tensor:
+    """(1 - w) L1 + w (1 - SSIM) on a projection patch — the splatting
+    literature's objective. ``dssim_weight`` 0 is plain L1."""
+    l1 = torch.abs(pred - target).mean()
+    w = float(dssim_weight)
+    if w <= 0:
+        return l1
+    return (1.0 - w) * l1 + w * ssim_loss(pred, target, data_range=data_range,
+                                          window_size=window_size, sigma=sigma)
 
 
 def make_huber_loss(delta=None, sigma_mult=1.345):

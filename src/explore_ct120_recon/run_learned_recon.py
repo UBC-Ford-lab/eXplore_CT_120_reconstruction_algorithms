@@ -29,6 +29,7 @@ Usage:
 import argparse
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -48,6 +49,8 @@ from .ct_core.pipeline import (
     save_outputs,
 )
 from .ct_core.data_budget import RANDOM, data_budget
+from .ct_core.noise_model import NoiseCalibrationKey
+from .ct_core.vff_io import detector_serial_from_scan
 from .ct_core.early_stop import DEFAULT_MIN_LR_FRACTION
 from .ct_core.hu_calibration import resolve_anchors
 from .ct_core.errors import ConfigError, cli_main
@@ -366,15 +369,27 @@ Examples:
   ct120-learned data/scans/Scan_1510
   ct120-learned data/scans/Scan_1510 --iterations 40000
   ct120-learned data/scans/Scan_1510 --downsample 3 --no-crossval
+  ct120-learned data/scans/Scan_1510 --loss mse          # SIRT's objective
   ct120-learned data/scans/Scan_1510 --loss msssim
-  ct120-learned data/scans/Scan_1510 --loss huber
+  ct120-learned data/scans/Scan_1510 --wls-read-noise 18.4 --wls-slope 0.096
+  ct120-learned data/scans/Scan_1510 --algorithm gaussian --loss l1_dssim
 
-Data terms (--loss):
+Data terms (--loss), shared by EVERY algorithm — the same function scores a
+voxel grid, a network or a Gaussian cloud, so a loss value means the same
+thing across backends:
 """ + describe_data_terms() + """
 
 The sampler follows the loss: per-ray terms draw random rays, the ramp-filtered
 terms draw complete detector rows, and the structural terms draw 2-D patches
-(--loss-option patch_size=N, num_patches=N).
+(--loss-option patch_size=N, num_patches=N). A backend that fits whole views
+(gaussian) hands each term the whole view.
+
+The default, wls, weights every ray by the inverse variance of its own
+measured counts (ct_core.noise_model). Its two constants are resolved per
+run — the Poisson slope always from this scan at this binning, the read
+noise from this scan when identifiable, else from the detector's
+calibration file (ct120-noise-calibration on a dense phantom, once per
+detector), else a loud package default — and logged under wls/*.
         """
     )
     add_common_args(parser)
@@ -405,10 +420,53 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
         f'({algorithm.summary}).'))
     parser.add_argument('--loss', default=DEFAULT_DATA_TERM,
                         choices=sorted(DATA_TERMS),
-                        help='Data term (default: %(default)s). MSE is the '
-                             'objective classical SIRT descends, which is what '
-                             'makes the default run a like-for-like comparison '
-                             'against it. See the list below.')
+                        help='Data term (default: %(default)s), the same '
+                             'registry for every algorithm. wls is the '
+                             'maximum-likelihood term for the measured noise '
+                             '(its value is the reduced chi-square); mse is '
+                             'the objective classical SIRT descends, so '
+                             '--loss mse is the like-for-like comparison '
+                             'against the classical solvers. See the list '
+                             'below.')
+    parser.add_argument('--wls-slope', default='auto', metavar='A',
+                        help="with --loss wls: Poisson slope A of the noise "
+                             "model Var(p) = A/count + (sigma_r/ds)^2/count^2, "
+                             "AT THE RUN'S BINNING (not a per-raw-pixel "
+                             "constant: a binned pixel keeps 1.4x/1.7x/2.3x "
+                             "more photon variance at ds2/3/4 than "
+                             "independent raw pixels would, MEASURED — "
+                             "scintillator blur). Default 'auto': measured "
+                             "from this scan's own consecutive views "
+                             "(ct_core.noise_model), needing no repeat "
+                             "acquisition and no attenuation range. A number "
+                             "pins it.")
+    parser.add_argument('--wls-read-noise', default='auto', metavar='SIGMA',
+                        help="with --loss wls: read noise sigma_r in counts "
+                             "PER RAW DETECTOR PIXEL (pools as 1/ds; MEASURED "
+                             "20.2/19.9/21.5/19.8 at ds1-4 on one scan). "
+                             "Default 'auto': measured from this scan when "
+                             "its count range separates the 1/c^2 term from "
+                             "the 1/c term (t >= 4, lever >= 3x — a dense "
+                             "phantom, not a mouse), else the detector's "
+                             "calibration file data/calibration/"
+                             "detector_noise_<serial>.json that such a scan "
+                             "leaves behind (ct120-noise-calibration), else "
+                             "the package default with a loud warning. A "
+                             "number pins it; 0 = pure Poisson.")
+    parser.add_argument('--wls-min-counts', type=float, default=1.0,
+                        metavar='C',
+                        help='with --loss wls: floor on counts above dark '
+                             'before the variance is formed, so a dead pixel '
+                             'gets a large finite variance instead of an '
+                             'infinite weight (default: %(default)s).')
+    parser.add_argument('--wls-seam-t', type=float, default=6.0, metavar='T',
+                        help='with --loss wls: detector columns whose offset '
+                             'against their neighbours is static across ALL '
+                             'views with |t| >= T get zero weight (default: '
+                             '%(default)s; 0 = no mask). A tiled-panel seam '
+                             'is a per-column step no volume can render; '
+                             'MEASURED on Scan_1510 at columns 72 and '
+                             '978-980 (ds3), t = 6.7 and 10.6.')
     parser.add_argument('--emulate-sart', action='store_true',
                         help='Emulate the classical simultaneous update as far '
                              'as this backend goes: --loss sart SUMMED (row '
@@ -784,6 +842,16 @@ def main(argv=None):
         # this driver listing knobs it does not understand.
         **algorithm.config(args),
         'iterations': args.iterations,
+        # The objective. The wls constants are recorded as REQUESTED
+        # ('auto' or a number); what was actually used is logged by the
+        # trainer under wls/* once the noise model is resolved.
+        'loss': 'sart' if args.emulate_sart else args.loss,
+        'loss_options': ','.join(args.loss_option),
+        'wls_slope': args.wls_slope,
+        'wls_read_noise': args.wls_read_noise,
+        'wls_min_counts': args.wls_min_counts,
+        'wls_seam_t': args.wls_seam_t,
+        'emulate_sart': bool(args.emulate_sart),
         'rays_per_batch': args.rays_per_batch,
         'rays_per_batch_mode': 'auto' if auto_batch else 'pinned',
         'lr': _resolve_lr(args, algorithm),
@@ -887,6 +955,10 @@ def main(argv=None):
         lr=_resolve_lr(args, algorithm),
         loss=args.loss,
         loss_options=_parse_loss_options(args.loss_option),
+        wls_slope=args.wls_slope,
+        wls_read_noise=args.wls_read_noise,
+        wls_min_counts=args.wls_min_counts,
+        wls_seam_t=args.wls_seam_t,
         emulate_sart=args.emulate_sart,
         optimizer=args.optimizer,
         sart_outside_weight=args.sart_outside_weight,
@@ -911,6 +983,13 @@ def main(argv=None):
         stop_on=tuple(args.stop_on),
         log_fn=logger.log,
         view_groups=ctx.view_groups,
+        # The detector key for a noise-weighted data term's calibration
+        # cache (ct_core.noise_model): the same serial + scan tag the psi
+        # calibration is filed under, so the two live side by side in
+        # data/calibration. Never logged — it holds a hardware serial.
+        noise_calibration=NoiseCalibrationKey(
+            serial=detector_serial_from_scan(ctx.scan_folder),
+            scan_tag=Path(ctx.scan_folder).name),
         # diag/* scalars every eval + SSIM-heatmap / power-spectrum figures
         # on a coarser cadence (figure_every_evals), all through the logger.
         diag_fn=logger.log_projection_diag,

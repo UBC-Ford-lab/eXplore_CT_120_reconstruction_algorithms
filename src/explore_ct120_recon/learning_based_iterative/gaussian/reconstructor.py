@@ -70,8 +70,7 @@ from ...ct_core.early_stop import (EarlyStopper, HoldoutScorer,
                                                resolve_holdout_index,
                                                resolve_min_iter,
                                                resolve_patience, solution_norm)
-from ...ct_core.projection_diag import (covered_detector_window,
-                                                    ssim_2d)
+from ...ct_core.projection_diag import covered_detector_window
 from ...ct_core.support import export_grid_geometry
 from ..trainer import LearnedReconstructor
 from ..training import lr_multiplier
@@ -80,161 +79,7 @@ from . import camera as cam_mod
 from . import kernel, seeding
 from .kernel import DEFAULT_MAX_VOXELS
 from .model import GaussianCloud
-
-
-def inverse_variance_weights(counts, dark=None, *, var_per_count: float,
-                             var_floor: float, min_counts: float = 1.0,
-                             downsample: int = 1):
-    """Per-pixel inverse variance of the log-attenuation, from the counts.
-
-    Noise model, MEASURED on Scan_1510 (acq-00/acq-01 pair, air pixels, at
-    ds3 = mean of 9 raw pixels: ``Var = 0.0934 / count + 8e-6``) — Gaussian,
-    nearly white, 82 % pure Poisson at the median count. The constants here
-    are PER RAW DETECTOR PIXEL: ``var_per_count`` = 0.8406 and ``var_floor``
-    = 7.2e-5, i.e. nine times the ds3 values, because a pooled pixel is the
-    mean of ds^2 raw ones, its count is on the same scale (a mean), and both
-    the Poisson term and the white electronic floor average down by ds^2:
-    ``Var_ds(p) = var_per_count / (ds^2 count) + var_floor / ds^2``. Pass the
-    sinogram's ``downsample`` and the same constants hold at any binning.
-
-    ``count`` is the detector reading above dark for the SAME binned pixel
-    the log value was formed from, so the per-pixel flat field (a 4x range on
-    this scan) is in the weight, which ``exp(-p)`` weighting cannot see.
-    Counts are floored at ``min_counts`` so a dead pixel gets a finite
-    (large) variance rather than an infinite weight.
-    """
-    c = np.asarray(counts, dtype=np.float32)
-    if dark is not None:
-        d = np.asarray(dark, dtype=np.float32)
-        if d.ndim == c.ndim - 1:
-            d = d[None]
-        c = c - d
-    c = np.maximum(c, float(min_counts))
-    n = float(int(downsample)) ** 2
-    var = (float(var_per_count) / n) / c + float(var_floor) / n
-    return (1.0 / var).astype(np.float32)
-
-
-def detect_seam_columns(sinogram, *, t_min: float = 6.0, halfwidth: int = 3,
-                        dilate: int = 1) -> np.ndarray:
-    """Detector columns whose offset against their neighbours is the SAME in
-    every view — a static detector artefact, not anatomy.
-
-    Per view, each column's mean over rows is compared with the median of its
-    ``2 halfwidth + 1``-column neighbourhood; anatomy sweeps across columns as
-    the gantry turns and averages out, a seam does not. The mean of that
-    offset over views divided by its standard error is a t-statistic; columns
-    with ``|t| >= t_min`` are seams, widened by ``dilate`` on each side to
-    cover the dip that flanks a tiled-panel seam. MEASURED on Scan_1510 (ds3,
-    220 views): t = 10.6 at column 980 and 6.7 at 72, both with a flanking
-    negative lobe, offsets of 0.02-0.06 pixel sigma per view — invisible in a
-    single view, a full-height red stripe in the held-out SSIM map once the
-    fit has converged, because no volume can render a per-column step.
-    Returns sorted column indices (empty when ``t_min <= 0``).
-    """
-    if t_min <= 0:
-        return np.zeros(0, dtype=int)
-    from scipy.ndimage import median_filter
-    P = np.asarray(sinogram, dtype=np.float32)
-    col = P.mean(axis=1)                                   # (views, cols)
-    resid = col - median_filter(col, size=(1, 2 * int(halfwidth) + 1),
-                                mode='nearest')
-    se = resid.std(axis=0) / np.sqrt(P.shape[0])
-    t = resid.mean(axis=0) / np.maximum(se, 1e-12)
-    seed = np.abs(t) >= float(t_min)
-    mask = seed.copy()
-    for k in range(1, int(dilate) + 1):
-        mask[k:] |= seed[:-k]
-        mask[:-k] |= seed[k:]
-    return np.nonzero(mask)[0]
-
-
-#: Scan_1510's constants (acq-00/acq-01 pair, air pixels, per RAW pixel). The
-#: fallback when a scan offers no air pixels to measure its own noise on.
-DEFAULT_WLS_VAR = (0.8406, 7.2e-5)
-
-
-def _auto_or_float(v):
-    if isinstance(v, str) and v.strip().lower() == 'auto':
-        return 'auto'
-    return float(v)
-
-
-def estimate_noise_model(sinogram, counts, *, air_max: float = 0.05,
-                         min_pixels: int = 5000, n_bins: int = 24,
-                         min_lever: float = 1.25) -> dict | None:
-    """Fit ``Var(log-attenuation) = a / count + b`` from the scan's OWN air
-    pixels, with no repeat acquisition and no pinned constants.
-
-    An air pixel sees the same thing in every view, so the difference between
-    consecutive views is pure noise there: ``Var = mean(diff^2) / 2`` per
-    pixel, immune to the slow gain drift (it is a difference) and to the fixed
-    pattern (same pixel both times). The flat field gives those pixels a wide
-    range of counts — 1.5x on Scan_1510 — which is the lever arm that
-    separates the Poisson slope ``a`` from the white floor ``b``: the fit is
-    an ordinary least squares of the per-bin median variance on 1/count over
-    ``n_bins`` count-quantile bins.
-
-    MEASURED on Scan_1510 (ds3, 220 views, 87,739 air pixels): 0.0921/count
-    + 5.0e-6, against 0.0897/count + 6.4e-6 from the acq-00/acq-01 pair on
-    the same pixels and 0.0934/count + 8e-6 pinned before — the slope agrees
-    to 3 %, and sigma at the median count is identical (0.00716). The air
-    threshold matters: ``air_max`` 0.02 leaves too short a lever (R2 0.88,
-    the split of a and b unstable), 0.1 admits object-edge pixels whose
-    content changes between views (slope 0.067, i.e. anatomy counted as a
-    floor). Object pixels themselves are NOT usable: between two
-    acquisitions they differ by 1.7x the photon variance (motion, gating),
-    which is a residual the volume cannot explain, not detector noise.
-
-    ``sinogram`` is the preprocessed log-attenuation the loss will see,
-    ``counts`` the matching detector reading above dark, both ``(views, rows,
-    cols)`` at the run's binning; the returned ``var_per_count`` and
-    ``var_floor`` are at that binning too. Returns None when fewer than
-    ``min_pixels`` are air (a phantom filling the field of view); when the
-    count lever ``p95/p5`` is below ``min_lever`` the floor is pinned at zero
-    and only the slope is fitted, and ``lever_ok`` says so.
-    """
-    P = np.asarray(sinogram, dtype=np.float32)
-    C = np.asarray(counts, dtype=np.float32)
-    if P.shape != C.shape or P.ndim != 3 or P.shape[0] < 3:
-        raise ValueError(f"need matching (views, rows, cols) arrays with >= 3 "
-                         f"views, got {P.shape} and {C.shape}")
-    air = (P.max(axis=0) < float(air_max)) & (C.mean(axis=0) > 1.0)
-    n_air = int(air.sum())
-    if n_air < int(min_pixels):
-        return None
-    c = C.mean(axis=0)[air]
-    d = np.diff(P[:, air], axis=0)
-    v = (d * d).mean(axis=0) / 2.0
-    lo, hi = np.percentile(c, [5, 95])
-    lever = float(hi / max(lo, 1e-9))
-    lever_ok = lever >= float(min_lever)
-    q = np.quantile(c, np.linspace(0.0, 1.0, int(n_bins) + 1))
-    xs, ys = [], []
-    bin_min = max(10, n_air // (4 * int(n_bins)))
-    for a0, a1 in zip(q[:-1], q[1:]):
-        m = (c >= a0) & (c <= a1)
-        if m.sum() < bin_min:
-            continue
-        xs.append(float(np.median(1.0 / c[m])))
-        ys.append(float(np.median(v[m])))
-    xs, ys = np.asarray(xs), np.asarray(ys)
-    if lever_ok and len(xs) >= 3:
-        A = np.stack([xs, np.ones_like(xs)], axis=1)
-        (a, b), *_ = np.linalg.lstsq(A, ys, rcond=None)
-        b = max(float(b), 0.0)
-    else:
-        a = float((xs * ys).sum() / max((xs * xs).sum(), 1e-30))
-        b = 0.0
-    pred = a * xs + b
-    ss = float(((ys - ys.mean()) ** 2).sum())
-    r2 = 1.0 - float(((ys - pred) ** 2).sum()) / ss if ss > 0 else 1.0
-    c_med = float(np.median(c))
-    return {'var_per_count': float(a), 'var_floor': float(b), 'n_air': n_air,
-            'count_p5': float(lo), 'count_p50': c_med, 'count_p95': float(hi),
-            'lever': lever, 'lever_ok': lever_ok, 'r2': float(r2),
-            'sigma_median': float(np.sqrt(a / c_med + b)),
-            'poisson_share': float((a / c_med) / max(a / c_med + b, 1e-30))}
+from .photometric import PhotometricModel
 
 
 class GaussianReconstructor(LearnedReconstructor):
@@ -254,7 +99,6 @@ class GaussianReconstructor(LearnedReconstructor):
                  densify_grad_threshold: float | None = None,
                  min_density_frac: float = 1e-3,
                  max_scale_frac: float = 0.1,
-                 dssim_weight: float = 0.2,
                  min_sigma_mm='auto',
                  max_aspect: float = 4.0,
                  max_sigma_spacing: float = 1.0,
@@ -271,12 +115,11 @@ class GaussianReconstructor(LearnedReconstructor):
                  scale_reg: float = 0.0,
                  seed_roi_weight: float = 1.0,
                  signed_density: float = 0.0,
-                 loss_kind: str = 'l1_dssim',
-                 wls_var_per_count='auto',
-                 wls_var_floor='auto',
-                 wls_min_counts: float = 1.0,
-                 wls_seam_t: float = 6.0,
                  lr_multipliers: dict | None = None,
+                 photometric: str = 'none',
+                 photometric_reg: float = 1e-3,
+                 photometric_ref: float = 0.01,
+                 photometric_lr: float | None = None,
                  checkpoint_path: str | None = None,
                  export_chunk_voxels: int = DEFAULT_MAX_VOXELS,
                  **kwargs):
@@ -292,7 +135,6 @@ class GaussianReconstructor(LearnedReconstructor):
                                     else float(densify_grad_threshold)),
             min_density_frac=float(min_density_frac),
             max_scale_frac=float(max_scale_frac),
-            dssim_weight=float(dssim_weight),
             min_sigma_mm=min_sigma_mm,
             max_aspect=float(max_aspect),
             max_sigma_spacing=float(max_sigma_spacing),
@@ -309,35 +151,41 @@ class GaussianReconstructor(LearnedReconstructor):
             mcmc_noise=float(mcmc_noise), density_reg=float(density_reg),
             scale_reg=float(scale_reg), seed_roi_weight=float(seed_roi_weight),
             signed_density=float(signed_density),
-            loss_kind=str(loss_kind),
-            wls_var_per_count=_auto_or_float(wls_var_per_count),
-            wls_var_floor=_auto_or_float(wls_var_floor),
-            wls_min_counts=float(wls_min_counts),
-            wls_seam_t=float(wls_seam_t),
-            lr_multipliers=dict(lr_multipliers or {}))
-        if self.cfg['loss_kind'] not in ('l1_dssim', 'wls'):
-            raise ValueError(f"loss_kind must be 'l1_dssim' or 'wls', got "
-                             f"{loss_kind!r}")
+            lr_multipliers=dict(lr_multipliers or {}),
+            photometric=str(photometric), photometric_reg=float(photometric_reg),
+            photometric_ref=float(photometric_ref),
+            photometric_lr=(None if photometric_lr is None else float(photometric_lr)))
+        self.photo: PhotometricModel | None = None
         if self.cfg['density_control'] not in ('adaptive', 'mcmc', 'fixed'):
             raise ValueError(f"density_control must be 'adaptive', 'mcmc' or "
                              f"'fixed', got {density_control!r}")
         # A read-only view of the mode: the loop and the tests ask
         # ``cfg['mcmc']`` and the answer must not drift from the mode.
         self.cfg['mcmc'] = self.cfg['density_control'] == 'mcmc'
-        self._noise_fit = None
         self._signal_scale_arg = signal_scale
         self._export_chunk = int(export_chunk_voxels)
         self._checkpoint_path = checkpoint_path
         super().__init__(projections, angles, geometry, **kwargs)
+        # The data term is the SHARED registry's (`loss=`, any of
+        # losses.DATA_TERMS): a whole view is a complete row and a complete
+        # patch, so every term applies — except one that needs the rays'
+        # chord lengths, which a rasteriser never traces.
+        if self.loss == 'sart':
+            raise ValueError("loss 'sart' (and --emulate-sart) weights rays "
+                             "by their chord length through the object; a "
+                             "rasteriser has no rays to measure. Use the "
+                             "voxel backend for the SART emulation.")
+        if self.cfg['photometric'] != 'none' and self.loss != 'wls':
+            raise ValueError("photometric nuisance parameters are fitted "
+                             "against the wls weights; they need loss='wls'")
+        self._data_term = None
         # One step renders one full view, so the "batch" is a whole projection.
         # Reported through the same key every backend uses so `data/*` stays
         # comparable; what differs is `sampling`, which the driver records.
         self.n_gaussians = 0
         self.world_scale = 1.0
         self.signal_scale = 1.0
-        self._wls_w = None
         self._wls_scale = 1.0
-        self._seam_cols = np.zeros(0, dtype=int)
 
     # -- the loop ----------------------------------------------------------
     def reconstruct(self) -> np.ndarray:
@@ -364,49 +212,17 @@ class GaussianReconstructor(LearnedReconstructor):
 
         target = torch.from_numpy(sino * self.signal_scale
                                   * self.world_scale).to(device)
-        self._wls_w = None
+        # Rendered units are signal_scale x world_scale x log-attenuation;
+        # every data term is evaluated in LOG-ATTENUATION units (`_loss`
+        # divides both sides out), the same units the ray trainer scores in,
+        # so a loss value means the same thing whichever backend produced it
+        # and the wls value is the reduced chi-square.
         self._wls_scale = self.signal_scale * self.world_scale
-        if self.cfg['loss_kind'] == 'wls':
-            # Weighted least squares on the log-attenuation, weights = the
-            # measured inverse variances, so the loss IS the reduced
-            # chi-square: 1.0 means the residual is at the photon noise.
-            ds = int(self.geometry.get('sinogram_downsample', 1) or 1)
-            self._resolve_noise_model(sino, ds)
-            w = inverse_variance_weights(
-                self.projections, self.dark_field,
-                var_per_count=self.cfg['wls_var_per_count'],
-                var_floor=self.cfg['wls_var_floor'],
-                min_counts=self.cfg['wls_min_counts'], downsample=ds)
-            if w.shape != sino.shape:
-                raise ValueError(f"count array {w.shape} does not match the "
-                                 f"sinogram {sino.shape}")
-            # Static detector seams get ZERO weight: the loss must not chase
-            # a per-column step that no volume can render.
-            self._seam_cols = detect_seam_columns(sino, t_min=self.cfg['wls_seam_t'])
-            if len(self._seam_cols):
-                w[:, :, self._seam_cols] = 0.0
-                da = float(self.geometry['da']); cpa = float(self.geometry['central_pixel_a'])
-                R_s = float(self.geometry['R_s']); mag = (R_s + float(self.geometry['R_d'])) / R_s
-                r_mm = (self._seam_cols - cpa) * da / mag
-                print(f"    seam mask: {len(self._seam_cols)} detector columns "
-                      f"({100 * len(self._seam_cols) / sino.shape[2]:.2f} %) get zero "
-                      f"weight — columns {self._seam_cols.tolist()} = "
-                      f"{np.round(r_mm, 1).tolist()} mm from the axis at the isocentre")
-                if self.log_fn is not None:
-                    self.log_fn({'wls/seam_columns': int(len(self._seam_cols))}, 0)
-            self._wls_w = torch.from_numpy(w).to(device)
-            sig = 1.0 / np.sqrt(w[w > 0])
-            print(f"    loss: weighted least squares (reduced chi-square) on "
-                  f"log-attenuation; Var = {self.cfg['wls_var_per_count']:.4g}"
-                  f"/count + {self.cfg['wls_var_floor']:.3g} per raw pixel -> "
-                  f"at ds{ds}: {self.cfg['wls_var_per_count'] / ds**2:.4g}"
-                  f"/count + {self.cfg['wls_var_floor'] / ds**2:.3g}; sigma "
-                  f"p5/p50/p95 = {np.percentile(sig, 5):.4f}/"
-                  f"{np.percentile(sig, 50):.4f}/{np.percentile(sig, 95):.4f}"
-                  f"; no L1, no DSSIM")
-        else:
-            print(f"    loss: (1 - {self.cfg['dssim_weight']:g}) L1 + "
-                  f"{self.cfg['dssim_weight']:g} DSSIM on whole views")
+        self._data_term = self._build_data_term(sino, device)
+        if self.loss != 'wls':
+            print(f"    loss: {self.loss} on whole views, in log-attenuation "
+                  f"units" + (f" ({self.loss_options})" if self.loss_options
+                              else ""))
 
         cloud = self._seed(domain, rng, device)
         if self.cfg['resume_from']:
@@ -479,6 +295,27 @@ class GaussianReconstructor(LearnedReconstructor):
         if self._sigma_spacing > 0:
             print(f"    width ceiling: median {cap['cap_median'] / self.world_scale:.4f} mm, "
                   f"{cap['cap_n']:,} of {len(cloud):,} primitives above it at seed")
+        # ---- evaluation projection ---------------------------------------
+        # Resolved BEFORE the optimiser is built: the photometric model's
+        # parameters join its param groups, and the model needs the
+        # training-view set (its zero-mean construction excludes the
+        # held-out view). Building it after the optimiser once left the
+        # per-view parameters out of the optimiser entirely -- printed,
+        # applied, checkpointed, and never trained.
+        holdout = (self._resolve_holdout(n_views)
+                   if self.crossval and n_views > 1 else None)
+        train_views = [i for i in range(n_views)
+                       if not (self.withhold_eval and i == holdout)]
+        if self.cfg['photometric'] != 'none':
+            # Per-view gain / offset / lateral slope, fitted with the cloud
+            # (see photometric.py): the knob a static volume lacks when the
+            # measured intensity drifts over the scan.
+            self.photo = PhotometricModel(n_views, self.cfg['photometric'],
+                                          train_views, ref=self.cfg['photometric_ref'],
+                                          device=device)
+            print(f"    photometric: per-view {self.cfg['photometric']} "
+                  f"(zero-mean over {len(train_views)} training views, prior "
+                  f"weight {self.cfg['photometric_reg']:g} per {self.cfg['photometric_ref']:g})")
         cloud.project_scales(self._min_sigma_w, self._max_aspect)
         optimizer = torch.optim.Adam(
             self._param_groups(cloud),
@@ -508,11 +345,6 @@ class GaussianReconstructor(LearnedReconstructor):
         # group i after a clone/split/prune round.
         base_lrs = [g['lr'] for g in optimizer.param_groups]
 
-        # ---- evaluation projection ---------------------------------------
-        holdout = (self._resolve_holdout(n_views)
-                   if self.crossval and n_views > 1 else None)
-        train_views = [i for i in range(n_views)
-                       if not (self.withhold_eval and i == holdout)]
         window = covered_detector_window(self.geometry, n_b, n_a)
         # Resolved BEFORE the loop rather than after it: the stopping tolerance
         # is expressed per sinogram VISIT, and a visit is not defined without
@@ -973,35 +805,28 @@ class GaussianReconstructor(LearnedReconstructor):
 
     # -- pieces ------------------------------------------------------------
     def _loss(self, pred, target, view=None):
-        """The data term on one whole view.
+        """The data term on one whole view — the SHARED registry term
+        (``LearnedReconstructor._build_data_term``), in log-attenuation units.
 
-        ``loss_kind='wls'``: weighted least squares in LOG-ATTENUATION units,
-        ``mean_i w_i (pred_i - target_i)^2`` with ``w_i = 1 / Var_i`` from the
-        measured counts (`inverse_variance_weights`), i.e. the reduced
-        chi-square of the view; the maximum-likelihood term for the measured
-        noise (Gaussian, mildly heteroscedastic), with nothing else added.
-        Rendered units are divided out first, so the value is in sigmas.
-
-        ``'l1_dssim'`` (default): L1 + DSSIM, the splatting objective. L1
-        rather than L2 because a splat's error is spatially concentrated — a
-        misplaced primitive is a large error over a few pixels, and squaring
-        it lets one primitive dominate a step. The structural term is the
-        submodule's own ``ssim_2d``, not a second implementation, so the
-        number in the loss and the number in ``diag/ssim`` mean the same
-        thing.
+        A view is a complete detector row and a complete 2-D patch, so every
+        registered term applies to it as it stands. For ``wls`` the view's
+        slice of the inverse-variance map is handed over through the same
+        side dict the ray sampler fills for the voxel backend, so the term
+        is literally the same function; its value is the reduced chi-square
+        of the view (1.0 = at the photon noise), with nothing else added.
+        The per-view photometric nuisance (``photo``) is applied to the
+        prediction first, in rendered units.
         """
+        photo = getattr(self, 'photo', None)
+        if photo is not None:
+            if view is None:
+                raise ValueError("the photometric model needs the view index")
+            pred = photo.apply(pred, view, self._wls_scale)
         if self._wls_w is not None:
             if view is None:
                 raise ValueError("wls needs the view index for its weights")
-            r = (pred - target) / self._wls_scale
-            return (self._wls_w[view] * r * r).mean()
-        l1 = torch.abs(pred - target).mean()
-        w = self.cfg['dssim_weight']
-        if w <= 0:
-            return l1
-        dr = float(target.max() - target.min()) or 1.0
-        return (1.0 - w) * l1 + w * (1.0 - ssim_2d(pred, target,
-                                                   data_range=dr))
+            self._weight_state["w"] = self._wls_w[view]
+        return self._data_term(pred / self._wls_scale, target / self._wls_scale)
 
     def _checkpoint(self, cloud) -> str | None:
         """Write the delivered cloud to disk BEFORE the volume is queried.
@@ -1070,82 +895,76 @@ class GaussianReconstructor(LearnedReconstructor):
         return kernel.render(cloud, camera)['image']
 
     def _param_groups(self, cloud) -> list:
-        return cloud.param_groups(self.lr, self.cfg['lr_multipliers'])
+        groups = cloud.param_groups(self.lr, self.cfg['lr_multipliers'])
+        if self.photo is not None:
+            groups += self.photo.param_groups(self.lr, self.cfg['photometric_lr'])
+        return groups
 
     def _regularise(self, loss, cloud, view: int):
-        """Priors added to the data term; none for a static cloud."""
+        """Priors added to the data term: the photometric prior when that
+        model is on; a subclass adds its own."""
+        if self.photo is not None and self.cfg['photometric_reg'] > 0:
+            loss = loss + self.cfg['photometric_reg'] * self.photo.prior()
         return loss
 
     def _state(self, cloud) -> dict:
         """What the best-iterate / L-curve snapshots carry."""
-        return cloud.snapshot()
+        s = cloud.snapshot()
+        if self.photo is not None:
+            s['photometric'] = self.photo.snapshot()
+        return s
 
     def _restore_state(self, cloud, state: dict) -> None:
         cloud.restore(state)
+        if self.photo is not None and 'photometric' in state:
+            self.photo.restore(state['photometric'])
 
     def _checkpoint_payload(self, cloud) -> dict:
         """The representation's part of the checkpoint file (`_checkpoint`)."""
-        return {'cloud': cloud.snapshot()}
+        payload = {'cloud': cloud.snapshot()}
+        if self.photo is not None:
+            payload['photometric'] = self.photo.snapshot()
+        return payload
 
     @torch.no_grad()
     def _line_integral(self, cloud, camera, view=None) -> np.ndarray:
         """One rendered projection, in mm^-1 * mm, cropped to the scored window."""
         img = cam_mod.Camera.to_ours(self._render_eval(cloud, camera, view))
+        if self.photo is not None and view is not None:
+            img = self.photo.apply(img, view, self._wls_scale)
         arr = img.detach().cpu().numpy() / (self.world_scale * self.signal_scale)
         b0, b1, a0, a1 = covered_detector_window(self.geometry, *arr.shape)
         return np.ascontiguousarray(arr[b0:b1, a0:a1])
 
     @torch.no_grad()
     def _evaluate(self, cloud, camera, scorer, view=None) -> dict:
-        return scorer.score(self._line_integral(cloud, camera, view))
-
-    def _resolve_noise_model(self, sino, ds: int) -> None:
-        """Fill 'auto' WLS constants from the scan itself (`estimate_noise_model`).
-
-        The fit is at the run's binning; the config keeps the per-RAW-pixel
-        convention `inverse_variance_weights` expects, so both are multiplied
-        by ds^2 on the way in. Without enough air pixels the Scan_1510 pair
-        constants stand in, loudly: they describe one detector at one
-        exposure and are wrong by an unknown factor anywhere else.
-        """
-        a, b = self.cfg['wls_var_per_count'], self.cfg['wls_var_floor']
-        if a != 'auto' and b != 'auto':
-            print(f"    noise model: pinned by the caller")
-            return
-        counts = np.asarray(self.projections, dtype=np.float32)
-        if self.dark_field is not None:
-            counts = counts - np.asarray(self.dark_field, dtype=np.float32)[None]
-        fit = estimate_noise_model(sino, counts, **self.noise_fit_kwargs)
-        self._noise_fit = fit
-        if fit is None:
-            fa, fb = DEFAULT_WLS_VAR
-            print(f"    noise model: WARNING — too few air pixels to measure "
-                  f"this scan's noise; using Scan_1510's constants "
-                  f"({fa:g}/count + {fb:g} per raw pixel), which are only "
-                  f"right for that detector at that exposure")
+        if (self.photo is not None and view is not None
+                and not bool(self.photo.train_mask[int(view)])):
+            # the withheld view: its triple in closed form, cloud frozen
+            img = cam_mod.Camera.to_ours(self._render_eval(cloud, camera, view))
+            b0, b1, a0, a1 = covered_detector_window(self.geometry, *img.shape)
+            pred = img[b0:b1, a0:a1]
+            target = torch.as_tensor(np.asarray(scorer.target, dtype=np.float32),
+                                     device=img.device) * self._wls_scale
+            w = (self._wls_w[int(view), b0:b1, a0:a1] if self._wls_w is not None
+                 else None)
+            self.photo.fit_view(int(view), pred, target, w, self._wls_scale)
+        metrics = scorer.score(self._line_integral(cloud, camera, view))
+        if self.photo is not None:
+            summary = self.photo.summary()
+            metrics.update(summary)
             if self.log_fn is not None:
-                self.log_fn({'wls/noise_fit_ok': 0}, 0)
-        else:
-            fa, fb = fit['var_per_count'] * ds ** 2, fit['var_floor'] * ds ** 2
-            print(f"    noise model: measured from {fit['n_air']:,} air pixels "
-                  f"over consecutive views: Var = {fit['var_per_count']:.4g}"
-                  f"/count + {fit['var_floor']:.3g} at ds{ds} (R2 "
-                  f"{fit['r2']:.3f}, count p5/p50/p95 {fit['count_p5']:.0f}/"
-                  f"{fit['count_p50']:.0f}/{fit['count_p95']:.0f}, lever "
-                  f"{fit['lever']:.2f}"
-                  + ("" if fit['lever_ok'] else " — too short, floor pinned at 0")
-                  + f"; sigma {fit['sigma_median']:.5f} at the median count, "
-                  f"{100 * fit['poisson_share']:.0f} % Poisson)")
-            if self.log_fn is not None:
-                self.log_fn({'wls/noise_fit_ok': 1,
-                             'wls/var_per_count_raw': fa, 'wls/var_floor_raw': fb,
-                             'wls/noise_fit_r2': fit['r2'],
-                             'wls/noise_air_pixels': fit['n_air'],
-                             'wls/noise_sigma_median': fit['sigma_median']}, 0)
-        if a == 'auto':
-            self.cfg['wls_var_per_count'] = float(fa)
-        if b == 'auto':
-            self.cfg['wls_var_floor'] = float(fb)
+                self.log_fn({f'diag/{k}': v for k, v in summary.items()},
+                            step=int(self.iterations_run))
+                n_evals = len(self.crossval_history) + 1
+                if n_evals % self.figure_every_evals == 0:
+                    try:
+                        self.log_fn({'photo/params': self.photo.figure(
+                            getattr(self, 'view_groups', None))},
+                            step=int(self.iterations_run))
+                    except Exception as e:      # a figure never ends a run
+                        print(f"  photometric panel skipped ({type(e).__name__}: {e})")
+        return metrics
 
     def _group_views(self, group: int):
         """Indices of the views in acquisition group ``group``, or None when
@@ -1260,10 +1079,6 @@ class GaussianReconstructor(LearnedReconstructor):
         # Density is seeded in mm^-1 and the kernel works in rendered units.
         return GaussianCloud(xyz, scaling, rotation,
                              density * self.signal_scale).to(device)
-
-    #: Overrides for `estimate_noise_model` (thresholds); a class attribute
-    #: so a harness with a tiny detector can lower `min_pixels`.
-    noise_fit_kwargs: dict = {}
 
     #: Seeds do not need a fine reference. The seed only has to say WHERE mass
     #: is and in what proportion; a 0.15 mm map answers that as well as a

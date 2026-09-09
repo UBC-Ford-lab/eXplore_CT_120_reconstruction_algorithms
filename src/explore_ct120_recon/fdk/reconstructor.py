@@ -134,6 +134,96 @@ def _chunk_that_fits(available_bytes: float, bytes_per_item: float, n_items: int
     return max(1, min(int(available_bytes // bytes_per_item), n_items))
 
 
+def angular_coverage_deg(angles) -> float:
+    """How much of the circle a set of view angles (radians) covers, in degrees.
+
+    The span plus one step (each view stands for a slab of width dbeta), so a
+    full scan whose step exceeds the tolerance is not misread as short; see
+    `FDKReconstructor.angular_coverage_deg` for the measured consequence.
+    """
+    angles = np.asarray(angles.cpu() if hasattr(angles, 'cpu') else angles,
+                        dtype=np.float64).ravel()
+    if angles.size < 2:
+        return 360.0
+    steps = np.diff(np.unwrap(angles))
+    if not steps.size:
+        return 360.0
+    return float(np.degrees(abs(steps.sum()) + abs(np.median(steps))))
+
+
+def parker_weights(angles, n_a: int, da: float, sdd: float, *,
+                   full_scan_deg: float = 355.0, verbose: bool = True):
+    """Parker short-scan redundancy weights, (N_angles, N_a), or None.
+
+    ``angles`` in radians, in acquisition order; ``n_a`` detector columns of
+    pitch ``da`` (same units as ``sdd``, the source-to-detector distance),
+    centred on the detector middle (the pipeline's projections are
+    COR-centred). Weights are 1 wherever a ray has no conjugate in the scan
+    and sin^2 ramps in the two redundant wedges (0 at the first view rising
+    to 1; 1 falling to 0 at the last view), such that the two samples of any
+    doubly-measured line sum to exactly 1. None for a full circle (every ray
+    already has its conjugate) and for a scan shorter than 180 degrees.
+
+    ONE implementation, shared by the FDK (which multiplies it into the
+    filtered projections) and any least-squares backend (which multiplies it
+    into the per-pixel weights): each line integral is then one measurement
+    in both, and a short scan's terminal views do not vote twice.
+    """
+    if angular_coverage_deg(angles) >= full_scan_deg:
+        return None
+    ang = torch.as_tensor(np.asarray(angles.cpu() if hasattr(angles, 'cpu')
+                                     else angles, dtype=np.float32))
+    n_angles = int(ang.numel())
+    # The span (not the coverage) parameterises the ramps: beta runs from 0
+    # at the first view to Lambda at the last one.
+    Lambda = float(ang[-1] - ang[0])
+    epsilon = Lambda - np.pi
+    if epsilon <= 0:
+        if verbose:
+            print(f"  Parker weighting: scan range {np.rad2deg(Lambda):.1f}° < 180°, skipping.")
+        return None
+    col_idx = torch.arange(int(n_a), dtype=torch.float32)
+    gamma = torch.arctan(((col_idx - n_a / 2) * float(da)) / float(sdd))     # (N_a,)
+    gamma_m = float(torch.arctan(torch.tensor((n_a / 2) * float(da) / float(sdd))))
+    beta = (ang - ang[0]).float().unsqueeze(1)                              # (N_angles, 1)
+    g = gamma.unsqueeze(0)                                                  # (1, N_a)
+    # Parker (1982): the ray (beta, gamma) is measured again at
+    # (beta + pi + 2 gamma, -gamma) — VERIFIED on Scan_1510's own sinogram
+    # (conjugate mismatch 0.017 under this pairing vs 0.042 under its
+    # mirror). The ramp-up spans [0, eps - 2 gamma] and the ramp-down
+    # [pi - 2 gamma, Lambda], widths eps - 2 gamma and eps + 2 gamma, so the
+    # two samples of any doubly-measured line sum to exactly 1 and the
+    # weight is continuous (sin^2(pi/2) = 1 at both inner boundaries). An
+    # earlier version put the ramp-down at [pi + 2 gamma, Lambda] with the
+    # ramp-up's width "for continuity": pair sums then ranged 0..2 across
+    # the fan (MEASURED), i.e. off-centre lines were counted twice or not
+    # at all.
+    d_up = epsilon - 2.0 * g               # (1, N_a)
+    d_down = epsilon + 2.0 * g             # (1, N_a)
+    weights = torch.ones(n_angles, int(n_a), dtype=torch.float32)
+    has_up = d_up > 0
+    safe_up = torch.where(has_up, d_up, torch.ones_like(d_up))
+    in_rampup = has_up & (beta >= 0) & (beta < d_up)
+    rampup_arg = torch.where(has_up, (np.pi / 2.0) * beta / safe_up,
+                             torch.zeros_like(beta))
+    weights = torch.where(in_rampup, torch.sin(rampup_arg) ** 2, weights)
+    has_down = d_down > 0
+    safe_down = torch.where(has_down, d_down, torch.ones_like(d_down))
+    in_rampdown = has_down & (beta > np.pi - 2.0 * g) & (beta <= Lambda)
+    rampdown_arg = torch.where(has_down,
+                               (np.pi / 2.0) * (Lambda - beta) / safe_down,
+                               torch.zeros_like(beta))
+    weights = torch.where(in_rampdown, torch.sin(rampdown_arg) ** 2, weights)
+    weights = weights.clamp(0.0, 1.0)
+    if verbose:
+        print(f"  Parker weighting: Λ={np.rad2deg(Lambda):.1f}°, "
+              f"ε={np.rad2deg(epsilon):.1f}°, γ_m={np.rad2deg(gamma_m):.1f}°, "
+              f"margin={np.rad2deg(epsilon - 2*gamma_m):.2f}°")
+        print(f"  Weight range: [{float(weights.min()):.4f}, {float(weights.max()):.4f}], "
+              f"mean={float(weights.mean()):.4f}")
+    return weights
+
+
 class FDKReconstructor:
     def __init__(self, projections, angles, geometry, folder_name,
                  quantitative=False,
@@ -295,118 +385,23 @@ class FDKReconstructor:
     def angular_coverage_deg(self) -> float:
         """How much of the circle this scan actually covers, in degrees.
 
-        NOT ``angles[-1] - angles[0]``, which is the span between the FIRST and
-        LAST view and so undercounts a full scan by exactly one step: 36 views
-        at 10 deg cover the whole circle but span only 350 deg. Judging
-        "is this a full scan?" on the span therefore misclassifies any full
-        scan whose step exceeds 360 - FULL_SCAN_DEG, and then applies
-        short-scan Parker weights to a circle where every ray already has its
-        conjugate — which shades the reconstruction and shifts the object
-        (measured: 0.65 mm on a synthetic sphere at 10 deg/view).
-
-        Each view stands for a slab of width dbeta, so the coverage is the
-        span plus one step. ``np.unwrap`` first, because the angles come out of
-        the loader modulo 360.
+        NOT ``angles[-1] - angles[0]``, which undercounts a full scan by one
+        step and then applies short-scan Parker weights to a circle where
+        every ray already has its conjugate — which shades the reconstruction
+        and shifts the object (measured: 0.65 mm on a synthetic sphere at
+        10 deg/view). See the module-level `angular_coverage_deg`.
         """
-        angles = np.asarray(self.angles.cpu() if hasattr(self.angles, 'cpu')
-                            else self.angles, dtype=np.float64).ravel()
-        if angles.size < 2:
-            return 360.0
-        steps = np.diff(np.unwrap(angles))
-        if not steps.size:
-            return 360.0
-        return float(np.degrees(abs(steps.sum()) + abs(np.median(steps))))
+        return angular_coverage_deg(self.angles)
 
     def is_full_scan(self) -> bool:
         """Whether the views cover the whole circle (see angular_coverage_deg)."""
         return self.angular_coverage_deg() >= self.FULL_SCAN_DEG
 
     def _compute_parker_weights(self):
-        """Compute Parker (short-scan) redundancy weights for fan-beam geometry.
-
-        Returns a weight matrix of shape (N_angles, N_a) that ensures each ray
-        is counted exactly once, eliminating intensity shading from redundant
-        measurements in short scans (π + 2γ_m < Λ < 2π).
-
-        For full-circle scans returns None (no correction needed) — judged on
-        the COVERAGE, not on the first-to-last span; see angular_coverage_deg.
-        """
-        # Skip for (near-)full circle scans: every ray already has a conjugate
-        if self.is_full_scan():
-            return None
-
-        # Total angular range swept between the first and last view. This stays
-        # the span (not the coverage) because it parameterises the ramp
-        # regions below, where beta runs from 0 at the first view to Lambda at
-        # the last one — changing it would move every weight in every
-        # short-scan reconstruction ever validated.
-        Lambda = float(self.angles[-1] - self.angles[0])
-
-        epsilon = Lambda - np.pi  # scan excess over π
-        if epsilon <= 0:
-            # Scan is shorter than π — Parker weighting not applicable
-            print(f"  Parker weighting: scan range {np.rad2deg(Lambda):.1f}° < 180°, skipping.")
-            return None
-
-        # Fan angle for each detector column
-        col_idx = torch.arange(self.N_a, dtype=torch.float32)
-        # Use detector center (VFF projections are already COR-centered)
-        gamma = torch.arctan(((col_idx - self.N_a / 2) * self.da) / self.SDD)  # (N_a,)
-
-        # Max half-fan angle
-        gamma_m = float(torch.arctan(torch.tensor((self.N_a / 2) * self.da / self.SDD)))
-
-        # Relative projection angle (from scan start)
-        beta_rel = (self.angles - self.angles[0]).cpu().float()  # (N_angles,)
-
-        # Broadcast: beta_rel (N_angles, 1) and gamma (1, N_a) -> (N_angles, N_a)
-        beta = beta_rel.unsqueeze(1)  # (N_angles, 1)
-        g = gamma.unsqueeze(0)        # (1, N_a)
-
-        # Transition width — same d for ramp-up and ramp-down ensures
-        # continuity at every boundary: sin²(π/2) = 1.
-        d = epsilon - 2.0 * g          # (1, N_a)
-
-        # Boundary between full-weight and ramp-down: β = π + 2γ
-        boundary = np.pi + 2.0 * g     # (1, N_a)
-
-        # Initialize weights to 1.0 (full weight)
-        weights = torch.ones(self.N_angles, self.N_a, dtype=torch.float32)
-
-        # Only columns with d > 0 have redundancy and need weighting
-        has_redundancy = (d > 0)        # (1, N_a) broadcast to (N_angles, N_a)
-        safe_d = torch.where(has_redundancy, d, torch.ones_like(d))
-
-        # Region 1: Ramp-up at scan start — 0 ≤ β < d
-        in_rampup = has_redundancy & (beta >= 0) & (beta < d)
-        rampup_arg = torch.where(
-            has_redundancy,
-            (np.pi / 2.0) * beta / safe_d,
-            torch.zeros_like(beta),
-        )
-        weights = torch.where(in_rampup, torch.sin(rampup_arg) ** 2, weights)
-
-        # Region 2: Full weight — d ≤ β ≤ π + 2γ (already 1.0)
-
-        # Region 3: Ramp-down at scan end — π + 2γ < β ≤ Λ
-        in_rampdown = has_redundancy & (beta > boundary) & (beta <= Lambda)
-        rampdown_arg = torch.where(
-            has_redundancy,
-            (np.pi / 2.0) * (Lambda - beta) / safe_d,
-            torch.zeros_like(beta),
-        )
-        weights = torch.where(in_rampdown, torch.sin(rampdown_arg) ** 2, weights)
-
-        # Clamp to [0, 1] for numerical safety
-        weights = weights.clamp(0.0, 1.0)
-
-        print(f"  Parker weighting: Λ={np.rad2deg(Lambda):.1f}°, "
-              f"ε={np.rad2deg(epsilon):.1f}°, γ_m={np.rad2deg(gamma_m):.1f}°, "
-              f"margin={np.rad2deg(epsilon - 2*gamma_m):.2f}°")
-        print(f"  Weight range: [{float(weights.min()):.4f}, {float(weights.max()):.4f}], "
-              f"mean={float(weights.mean()):.4f}")
-
-        return weights
+        """Parker (short-scan) redundancy weights, (N_angles, N_a), or None for
+        a full circle — `parker_weights`, with this run's geometry."""
+        return parker_weights(self.angles, self.N_a, self.da, self.SDD,
+                              full_scan_deg=self.FULL_SCAN_DEG)
 
     def _preprocess_and_filter(self):
         """

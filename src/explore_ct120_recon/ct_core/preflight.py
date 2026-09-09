@@ -253,10 +253,13 @@ def _tigre_footprint(req: MachineRequest) -> Footprint:
 
 def learned_footprint(req: MachineRequest, *, param_bytes: int,
                       activation_bytes_per_sample: int = 0,
-                      note: str = "") -> Footprint:
+                      note: str = "", sino_copies: int = 1) -> Footprint:
     """The shape EVERY learning-based algorithm's footprint has.
 
-    Resident = the optimizer's copies of the parameters + the sinogram;
+    Resident = the optimizer's copies of the parameters + ``sino_copies``
+    sinogram-sized tensors (the sinogram itself, plus whatever the data term
+    keeps beside it: ``wls`` holds an inverse variance per measured pixel for
+    the whole run, so 2 — ``losses.resident_sinogram_copies``);
     marginal = the renderer's per-ray-sample traffic PLUS whatever the model
     itself retains per sample; host = projections + float sinogram + the
     exported volume. The shape is shared; the two numbers in it are not.
@@ -293,8 +296,13 @@ def learned_footprint(req: MachineRequest, *, param_bytes: int,
                  f"ray-sample on top of the renderer's "
                  f"{BATCH_BYTES_PER_SAMPLE} B — {per_sample / BATCH_BYTES_PER_SAMPLE:.0f}x "
                  f"the traffic a voxel grid has — which is what sizes the batch.")
+    sino_copies = max(1, int(sino_copies))
+    if sino_copies > 1:
+        base += (f" The data term keeps {sino_copies - 1} more sinogram-sized "
+                 f"tensor{'s' if sino_copies > 2 else ''} resident.")
     return Footprint(
-        persistent_gpu_bytes=copies * int(param_bytes) + req.sino_bytes,
+        persistent_gpu_bytes=(copies * int(param_bytes)
+                              + sino_copies * req.sino_bytes),
         host_bytes=2 * req.sino_bytes + req.vol_bytes,
         gpu_required=False,
         bytes_per_ray_sample=per_sample,

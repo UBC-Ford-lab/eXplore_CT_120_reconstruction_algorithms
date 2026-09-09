@@ -10,9 +10,11 @@ the file this pattern is meant to be copied from.
 """
 from __future__ import annotations
 
+import argparse
 import os
 
 from ...ct_core.preflight import Footprint, MachineRequest
+from ..losses import resident_sinogram_copies
 from ..registry import LearnedAlgorithm
 
 from .kernel import BYTES_PER_SLAB_VOXEL, DEFAULT_MAX_VOXELS
@@ -217,41 +219,41 @@ def add_args(group) -> None:
                         'gives the edge its negative lobe without opening the '
                         'cancelling-pair null space. Needs the rasteriser '
                         'built with the |alpha| cutoff patch.')
-    g.add_argument('--gauss-loss', choices=('l1_dssim', 'wls'),
-                   default='wls', dest='gauss_loss',
-                   help="data term (default: wls). 'wls' = weighted least "
-                        "squares on the log-attenuation with the MEASURED "
-                        "inverse variances (Var = A/count + B, counts above "
-                        "dark from the binned raw projections) and NOTHING "
-                        "else — the loss value is the reduced chi-square, 1.0 "
-                        "= at the photon noise. 'l1_dssim' is the splatting "
-                        "literature's objective, kept for comparison.")
-    g.add_argument('--gauss-wls-var', nargs=2, default=('auto', 'auto'),
+    # The data term is the driver's --loss (shared registry, default wls)
+    # since 2026-09-09; these are the flags it replaced. They fail at PARSE
+    # time with the new spelling rather than being ignored (`_Retired`).
+    for flag in RETIRED_FLAGS:
+        g.add_argument(flag, nargs='*', action=_Retired, help=argparse.SUPPRESS,
+                       default=None, dest=RETIRED_DESTS[flag])
+    g.add_argument('--gauss-wls-var', nargs=2, default=None,
                    metavar=('A', 'B'), dest='gauss_wls_var',
-                   help="noise model for --gauss-loss wls, PER RAW DETECTOR "
-                        "PIXEL: Var(log-attenuation) = A/count + B, scaled by "
-                        "1/ds^2 for a pooled sinogram. Default 'auto auto': "
-                        "MEASURED from the scan's own air pixels across "
-                        "consecutive views (reconstructor.estimate_noise_"
-                        "model; on Scan_1510 it reproduces the acquisition-"
-                        "pair value to 3 %%). Falls back to Scan_1510's "
-                        "0.8406 7.2e-5 with a warning when a scan has no air "
-                        "pixels. Either may be a number to pin it.")
-    g.add_argument('--gauss-wls-min-counts', type=float, default=1.0,
-                   dest='gauss_wls_min_counts', metavar='C',
-                   help='floor on counts above dark before the variance is '
-                        'formed, so a dead pixel gets a large finite variance '
-                        'instead of an infinite weight (default: 1).')
-    g.add_argument('--gauss-wls-seam-t', type=float, default=6.0,
-                   dest='gauss_wls_seam_t', metavar='T',
-                   help='with --gauss-loss wls: detector columns whose offset '
-                        'against their neighbours is static across ALL views '
-                        'with |t| >= T get zero weight (default: 6; 0 = no '
-                        'mask). A tiled-panel seam is a per-column step no '
-                        'volume can render; MEASURED on Scan_1510 at columns '
-                        '72 and 978-980 (ds3), t = 6.7 and 10.6.')
-    g.add_argument('--gauss-dssim', type=float, default=0.2, dest='gauss_dssim',
-                   help='weight of the structural term in L1 + w*DSSIM.')
+                   action=_RetiredWlsVar, help=argparse.SUPPRESS)
+    g.add_argument('--gauss-photometric',
+                   choices=('none', 'offset', 'affine', 'affine_lateral'),
+                   default='none', dest='gauss_photometric',
+                   help="with --loss wls (the default): per-view photometric nuisance "
+                        "parameters fitted with the cloud — 'offset' (one "
+                        "log-attenuation offset per view), 'affine' (+ a gain), "
+                        "'affine_lateral' (+ a linear-in-column term); zero-mean "
+                        "over the training views by construction, the "
+                        "held-out view's fitted in closed form at each "
+                        "evaluation (default: none). MEASURED on Scan_1510: "
+                        "a 0.8 %% intensity drift over the last 40 views that "
+                        "air levelling misses; a static cloud absorbs it by "
+                        "stretching primitives along those views' detector "
+                        "direction (the rib->lung streaks).")
+    g.add_argument('--gauss-photometric-reg', type=float, default=1e-3,
+                   dest='gauss_photometric_reg', metavar='W',
+                   help='weight of the L2 prior on the per-view parameters, in '
+                        'units of --gauss-photometric-ref (default: 1e-3).')
+    g.add_argument('--gauss-photometric-ref', type=float, default=0.01,
+                   dest='gauss_photometric_ref', metavar='X',
+                   help='the prior\'s unit: a deviation of X (gain fraction / '
+                        'log-attenuation) costs the weight once (default: 0.01).')
+    g.add_argument('--gauss-photometric-lr', type=float, default=None,
+                   dest='gauss_photometric_lr', metavar='MULT',
+                   help='LR multiplier on the photometric group relative to '
+                        '--lr (default: 1).')
     g.add_argument('--gauss-max-aspect', type=float, default=2.0,
                    dest='gauss_max_aspect', metavar='K',
                    help='cap on a primitive\'s longest/shortest axis ratio '
@@ -325,10 +327,55 @@ def add_args(group) -> None:
                             f'carry the least rate by default.')
 
 
-def _auto_or_float(v):
-    if isinstance(v, str) and v.strip().lower() == 'auto':
-        return 'auto'
-    return float(v)
+RETIRED_FLAGS = {
+    '--gauss-loss': "--gauss-loss is retired: the data term is the driver's "
+                    "--loss for every learned backend (default wls; l1_dssim "
+                    "is in the same registry).",
+    '--gauss-wls-slope': "--gauss-wls-slope is retired: it is --wls-slope, "
+                         "shared by every backend's wls term.",
+    '--gauss-wls-read-noise': "--gauss-wls-read-noise is retired: it is "
+                              "--wls-read-noise, shared by every backend's "
+                              "wls term.",
+    '--gauss-wls-min-counts': "--gauss-wls-min-counts is retired: it is "
+                              "--wls-min-counts.",
+    '--gauss-wls-seam-t': "--gauss-wls-seam-t is retired: it is --wls-seam-t.",
+    '--gauss-dssim': "--gauss-dssim is retired: --loss l1_dssim "
+                     "--loss-option dssim_weight=W.",
+}
+RETIRED_DESTS = {k: 'retired_' + k.strip('-').replace('-', '_')
+                 for k in RETIRED_FLAGS}
+
+
+class _Retired(argparse.Action):
+    """A flag that moved to the shared driver: fail at PARSE time, naming
+    the new spelling, rather than letting a stale command line run for
+    hours with a silently ignored option."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(RETIRED_FLAGS[option_string])
+
+
+RETIRED_WLS_VAR_MESSAGE = (
+    "--gauss-wls-var is retired: the wls noise model is now "
+    "Var = A/count + (sigma_r/ds)^2/count^2 (a read-noise floor, not a "
+    "constant one) and its two constants have different units. Use "
+    "--wls-slope A (at the run's binning) and --wls-read-noise SIGMA "
+    "(counts per raw pixel), shared by every backend; both default to "
+    "'auto'.")
+
+
+class _RetiredWlsVar(argparse.Action):
+    """Fail at PARSE time, before a scan is loaded.
+
+    Retired 2026-09-09 with the noise model's change of shape. The old second
+    value was a CONSTANT floor per raw pixel (7.2e-5 on Scan_1510); the new
+    one is a read noise in counts (~20). Reusing the flag would have let a
+    stale command line pass 7.2e-5 counts of read noise — effectively pure
+    Poisson — without a word, hours into a run.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(RETIRED_WLS_VAR_MESSAGE)
 
 
 def _checkpoint_default(args) -> str | None:
@@ -347,6 +394,17 @@ def _checkpoint_default(args) -> str | None:
 
 
 def options(args) -> dict:
+    if getattr(args, 'gauss_wls_var', None) is not None:
+        # The parser action catches a command line; this catches a namespace
+        # built by hand (tests, embedding callers).
+        raise ValueError(RETIRED_WLS_VAR_MESSAGE)
+    for flag, dest in RETIRED_DESTS.items():
+        if getattr(args, dest, None) is not None:
+            raise ValueError(RETIRED_FLAGS[flag])
+    for stale in ('gauss_loss', 'gauss_wls_slope', 'gauss_wls_read_noise',
+                  'gauss_wls_min_counts', 'gauss_wls_seam_t', 'gauss_dssim'):
+        if getattr(args, stale, None) is not None:
+            raise ValueError(RETIRED_FLAGS['--' + stale.replace('_', '-')])
     frm, until = args.gauss_densify_window
     return dict(
         n_seed=int(args.gauss_seeds),
@@ -361,7 +419,6 @@ def options(args) -> dict:
         densify_fraction=float(args.gauss_densify_fraction),
         densify_grad_threshold=(None if args.gauss_densify_grad is None
                                 else float(args.gauss_densify_grad)),
-        dssim_weight=float(args.gauss_dssim),
         checkpoint_path=_checkpoint_default(args),
         max_aspect=float(args.gauss_max_aspect),
         max_sigma_spacing=float(args.gauss_max_sigma_spacing),
@@ -377,11 +434,10 @@ def options(args) -> dict:
         scale_reg=float(args.gauss_scale_reg),
         seed_roi_weight=float(args.gauss_seed_roi_weight),
         signed_density=float(args.gauss_signed_density),
-        loss_kind=str(args.gauss_loss),
-        wls_var_per_count=_auto_or_float(args.gauss_wls_var[0]),
-        wls_var_floor=_auto_or_float(args.gauss_wls_var[1]),
-        wls_min_counts=float(args.gauss_wls_min_counts),
-        wls_seam_t=float(args.gauss_wls_seam_t),
+        photometric=str(args.gauss_photometric),
+        photometric_reg=float(args.gauss_photometric_reg),
+        photometric_ref=float(args.gauss_photometric_ref),
+        photometric_lr=args.gauss_photometric_lr,
         densify_gate_z=(None if float(args.gauss_densify_gate) <= 0
                         else float(args.gauss_densify_gate)),
         min_sigma_mm=(args.gauss_min_sigma
@@ -410,14 +466,17 @@ def footprint_stages(args, req: MachineRequest) -> dict:
     """
     n = _n_max(args)
     sino = int(req.sino_bytes)
-    wls = str(getattr(args, 'gauss_loss', 'wls')) == 'wls'
+    # The data term's resident sinogram-sized tensors: 2 for wls (the weights
+    # beside the target), 1 otherwise — from the driver's --loss, the registry
+    # default when sized by name only.
+    resident = resident_sinogram_copies(getattr(args, 'loss', None))
     # Seeding: the FDK reference on the model domain (see the constant),
     # beside the target and the WLS weights, which are already resident.
-    seed = ((2 if wls else 1) * sino + SEED_SINO_COPIES * sino
+    seed = (resident * sino + SEED_SINO_COPIES * sino
             + int(req.vol_bytes) // 8)
     # Training: the whole sinogram is resident (a splat step fits a full
     # view, never a ray batch), and WLS keeps a weight per pixel beside it.
-    train = ((2 if wls else 1) * sino
+    train = (resident * sino
              + TRAIN_BYTES_PER_PIXEL * int(req.n_b) * int(req.n_a)
              + n * TRAIN_BYTES_PER_GAUSSIAN)
     # Export: ONE SLAB on the device, the volume assembled on the host
@@ -429,7 +488,7 @@ def footprint_stages(args, req: MachineRequest) -> dict:
     # sinogram is still resident then, and the cloud is queried in place.
     slab = (min(int(req.vol_bytes) // 4, DEFAULT_MAX_VOXELS)
             * BYTES_PER_SLAB_VOXEL)
-    export = (2 if wls else 1) * sino + slab + n * EXPORT_BYTES_PER_GAUSSIAN
+    export = resident * sino + slab + n * EXPORT_BYTES_PER_GAUSSIAN
     return {'seed': int(seed), 'train': int(train), 'export': int(export)}
 
 

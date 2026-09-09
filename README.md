@@ -17,7 +17,7 @@ grid, from those measurements.*
 |---|---|---|
 | Analytic (`fdk/`) | FDK with ramp / Shepp-Logan / cosine / Hamming windows, Parker weighting | PyTorch |
 | Classical iterative (`iterative/`) | ASTRA: SIRT, CGLS, SART. TIGRE: OS-SART, SART, SIRT, MLEM, +TV | CUDA + ASTRA or TIGRE |
-| Learning-based (`learning_based_iterative/`) | Differentiable projector + gradient descent. `--algorithm voxel` (dense grid, the default) or `--algorithm gaussian` (anisotropic 3-D Gaussian splatting through an X-ray rasteriser, with a counts-weighted least-squares loss); other representations pluggable | CUDA (+ the rasteriser for `gaussian`) |
+| Learning-based (`learning_based_iterative/`) | Differentiable projector + gradient descent. `--algorithm voxel` (dense grid, the default) or `--algorithm gaussian` (anisotropic 3-D Gaussian splatting through an X-ray rasteriser); other representations pluggable | CUDA (+ the rasteriser for `gaussian`) |
 
 All three share the same loading, preprocessing, geometry calibration, HU
 calibration and output format, so their volumes are directly comparable.
@@ -56,6 +56,7 @@ ct120-learned data/scans/Scan_1988 --algorithm gaussian
 ct120-volume-report VOLUME.vff
 ct120-projection-report data/scans/Scan_1988 --volume a.vff --volume b.vff
 ct120-geometry-calibration data/scans/Scan_1988
+ct120-noise-calibration data/scans/Scan_1988
 ```
 
 (`python -m explore_ct120_recon.run_fdk_recon ...` is the same thing.)
@@ -97,16 +98,32 @@ Defaults that matter, each with a `--no-...` or explicit override:
 
 Fits a volume model to the line integrals through a differentiable ray
 tracer, with Adam, non-negativity, LR warmup and plateau reduction, and a
-held-out projection for early stopping. Main flags: `--loss` (`mse`,
-`huber`, `ssim`, `msssim`, `sart`, ...), `--iterations`, `--rays-per-batch`
-(sized from free VRAM by default), `--emulate-sart`, `--compile`.
+held-out projection for early stopping. Main flags: `--loss` (`wls` — the
+default for every algorithm — `mse`, `huber`, `ssim`, `msssim`, `sart`,
+`l1_dssim`, ...), `--iterations`, `--rays-per-batch` (sized from free VRAM
+by default), `--emulate-sart`, `--compile`.
+
+The data term is ONE registry shared by every representation
+(`learning_based_iterative/losses`): the same function scores a voxel grid,
+a network or a Gaussian cloud, so a loss value means the same thing across
+backends. The default `wls` weights every ray by the inverse variance of its
+own measured counts, `Var(p) = A/count + (sigma_r/ds)^2/count^2`
+(`ct_core/noise_model.py`), so its value is the reduced chi-square and its
+gradient the maximum-likelihood one for the detector's noise. The Poisson
+slope `A` is measured from the scan's own consecutive views at the run's
+binning on every run; the read noise `sigma_r` (per raw pixel) is measured
+when the scan's count range allows it, else inherited from the detector's
+calibration file (below), else a loud package default. `--wls-slope` /
+`--wls-read-noise` pin either; `wls/*` in the run log says what was used.
+`--loss mse` is the objective classical SIRT descends, the like-for-like
+comparison against the classical solvers.
 
 A new representation only has to answer three hooks in a
 `LearnedReconstructor` subclass: `build_model`, `build_domain`,
 `export_volume`. Register it with a `LearnedAlgorithm` descriptor and it
 becomes an `--algorithm` choice; `voxel/` is the 100-line example and
 `gaussian/` the full-size one (its own per-view training loop, seeding from
-an FDK of the scan, a measured noise model, shape constraints). A descriptor
+an FDK of the scan, shape constraints — but the same data term). A descriptor
 may also re-default the shared flags for its representation
 (`driver_defaults`: binning, iteration cap, stopping metric — `gaussian` runs
 at `--downsample 3` with an SSIM stopper unless told otherwise). A
@@ -124,7 +141,14 @@ for any finished volume, including the vendor's. `ct120-projection-report`
 forward-projects one or more volumes and scores them against the measured
 projections on the same angles and detector window.
 `ct120-geometry-calibration` pre-measures the detector rotation, for
-example on a GPU node before submitting long jobs. Use `--vendor` with the
+example on a GPU node before submitting long jobs. `ct120-noise-calibration`
+measures the detector's noise model (Poisson slope + read noise) from a
+scan's own consecutive views and files the read noise per detector, so that
+scans which cannot determine it themselves — anything that attenuates too
+little to separate the `1/count^2` read-noise term from the `1/count`
+Poisson term, i.e. a mouse — inherit it from one that could, i.e. a dense
+phantom. Run it once per detector on the densest object you have; the
+`wls` data term (every learned algorithm's default) reads the result. Use `--vendor` with the
 report tools for a GE volume; it applies the vendor's axis conventions and
 locates the ROI from the scan.
 

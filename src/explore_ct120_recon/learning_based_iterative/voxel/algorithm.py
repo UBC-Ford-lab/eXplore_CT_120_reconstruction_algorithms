@@ -13,6 +13,7 @@ what it is.
 from __future__ import annotations
 
 from ...ct_core.preflight import learned_footprint
+from ..losses import resident_sinogram_copies
 from ..registry import Footprint, LearnedAlgorithm, MachineRequest
 from .reconstructor import VoxelReconstructor
 
@@ -45,20 +46,23 @@ def footprint(args, req: MachineRequest) -> Footprint:
     """VRAM/RAM for a dense grid — the shared learned shape, one number filled.
 
     THE VOXEL-SPECIFIC LINE is ``param_bytes=req.vol_bytes``: the parameters
-    ARE the exported voxels, so the count is already in the request and
-    ``args`` goes unread. That is exactly what a network cannot do — its
-    weight count is a property of the architecture (table size, levels, MLP
-    width), none of which the export grid knows.
+    ARE the exported voxels, so the count is already in the request. That is
+    exactly what a network cannot do — its weight count is a property of the
+    architecture (table size, levels, MLP width), none of which the export
+    grid knows.
 
-    A representation whose footprint DOES read ``args`` must still answer when
-    ``args`` is None, falling back to the same defaults its CLI advertises:
-    ``estimate('<name>', ...)`` sizes a job from shapes alone, with no argparse
-    namespace anywhere (see ``registry._StaticFootprint``).
+    The only thing read from ``args`` is the driver's ``--loss``, for the
+    data term's resident tensors (``wls`` keeps a weight per measured pixel
+    beside the sinogram). A footprint must still answer when ``args`` is
+    None, falling back to the same defaults its CLI advertises:
+    ``estimate('<name>', ...)`` sizes a job from shapes alone, with no
+    argparse namespace anywhere (see ``registry._StaticFootprint``).
     """
-    del args                       # deliberately unread; see the docstring
-    return learned_footprint(req, param_bytes=req.vol_bytes,
-                             note="Voxel grid: one parameter per exported "
-                                  "voxel (the grid IS the volume).")
+    return learned_footprint(
+        req, param_bytes=req.vol_bytes,
+        sino_copies=resident_sinogram_copies(getattr(args, 'loss', None)),
+        note="Voxel grid: one parameter per exported voxel (the grid IS the "
+             "volume).")
 
 
 ALGORITHM = LearnedAlgorithm(

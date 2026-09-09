@@ -83,8 +83,13 @@ from ..ct_core.data_budget import RANDOM, data_budget, measurement_count
 from ..ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
                                   LCurve, StoppingRules, metrics_dict,
                                   solution_norm, resolve_holdout_index)
+from ..ct_core.noise_model import (NoiseModel, auto_or_float,
+                                   detect_seam_columns,
+                                   inverse_variance_weights,
+                                   resolve_noise_model)
 from ..ct_core.preprocessing import preprocess_sinogram
-from .losses import DEFAULT_DATA_TERM, build_data_term
+from .losses import (BATCH_KIND, DATA_TERMS, DEFAULT_DATA_TERM,
+                     NEEDS_RAY_GEOMETRY, build_data_term)
 from .ray_sampler import (rays_from_indices, sample_projection_patch,
                           sample_random_rays, sample_random_rows)
 from .renderer import (fusion_supported, ray_domain_intersect,
@@ -144,6 +149,10 @@ class LearnedReconstructor:
                  log_every: int = 500,
                  loss: str = DEFAULT_DATA_TERM,
                  loss_options: dict | None = None,
+                 wls_slope='auto',
+                 wls_read_noise='auto',
+                 wls_min_counts: float = 1.0,
+                 wls_seam_t: float = 6.0,
                  emulate_sart: bool = False,
                  optimizer: str | None = None,
                  sart_outside_weight: float = 0.25,
@@ -165,8 +174,18 @@ class LearnedReconstructor:
                  compile_model: bool = False,
                  grad_clip_norm: float = 0.0,
                  log_fn=None, diag_fn=None,
-                 view_groups=None):
+                 view_groups=None,
+                 noise_calibration=None):
         self.projections = projections
+        # Which DETECTOR (and scan) this data came from, for a data term that
+        # weights by the measured noise: a ``ct_core.noise_model.
+        # NoiseCalibrationKey`` (serial, scan tag, calibration directory) or
+        # None when there is nothing to key a cache by. A fact about the data,
+        # like ``view_groups`` — the driver knows it, no representation does,
+        # and every representation may use it. It carries a hardware serial,
+        # which is why it travels here and NOT on the geometry dict that the
+        # run config is built from.
+        self.noise_calibration = noise_calibration
         # One integer per projection: the acquisition group (gated phase) it
         # came from, or None when the scan has a single group. A fact about
         # the DATA, carried here so any representation may use it — a static
@@ -260,7 +279,23 @@ class LearnedReconstructor:
         self.figure_every_evals = max(1, int(figure_every_evals))
         self.log_every = int(log_every)
         self.loss = str(loss).strip().lower()
+        if self.loss not in DATA_TERMS:
+            raise ValueError(f"loss must be one of {sorted(DATA_TERMS)}, got "
+                             f"{loss!r}")
         self.loss_options = dict(loss_options or {})
+        # The wls noise model's constants (ct_core.noise_model): 'auto' or a
+        # number each. The Poisson slope is AT THIS RUN'S BINNING, the read
+        # noise PER RAW PIXEL; both are resolved once the sinogram exists
+        # (`_build_wls_weights`) and the values actually used are written
+        # back here, so what the run used is what it reports.
+        self.wls_slope = auto_or_float(wls_slope)
+        self.wls_read_noise = auto_or_float(wls_read_noise)
+        self.wls_min_counts = float(wls_min_counts)
+        self.wls_seam_t = float(wls_seam_t)
+        self.noise_model: NoiseModel | None = None
+        self._wls_w: torch.Tensor | None = None
+        self._weight_state: dict = {}
+        self._seam_cols = np.zeros(0, dtype=int)
         self.emulate_sart = bool(emulate_sart)
         self.sart_outside_weight = float(sart_outside_weight)
         self.sart_coverage_rays = int(sart_coverage_rays)
@@ -392,6 +427,21 @@ class LearnedReconstructor:
             raise ValueError(
                 f"optimizer must be one of {sorted(OPTIMIZERS)}, got "
                 f"{self.optimizer_name!r}")
+        if self.loss == "wls" and loss_fn is None:
+            # Fail here, not an hour in: the weights are the measured counts'
+            # inverse variances, so a run that only has line integrals (a
+            # synthetic sinogram, a caller-owned Scene without the raw frames)
+            # has nothing to weight by. Refusing is the honest answer; the
+            # alternative — inventing a flat field so exp(-p) can stand in —
+            # is a different data term (`weighted`) and must be asked for.
+            if projections is None or bright_field is None:
+                raise ValueError(
+                    "loss 'wls' weights every ray by the inverse variance of "
+                    "its measured counts, so it needs the raw projections "
+                    "with their bright field (dark optional). This run has "
+                    "line integrals only. Pass projections=counts, "
+                    "bright_field=..., or choose loss='mse' (the classical "
+                    "objective) / 'weighted' (exp(-p), no counts needed).")
 
         # Optional live-metric sink: Callable[[dict, int], None]. Keeps this
         # package free of any wandb import; the driver passes ReconLogger.log.
@@ -619,24 +669,140 @@ class LearnedReconstructor:
 
     # ------------------------------------------------------------------- run
 
+    #: Overrides for ``ct_core.noise_model.estimate_noise_model`` (bins,
+    #: strides, gates); a class attribute so a harness with a tiny detector
+    #: can lower ``min_bin_samples`` or ``n_bins``.
+    noise_fit_kwargs: dict = {}
+
+    def _build_wls_weights(self, sino, device) -> torch.Tensor:
+        """The ``wls`` term's inverse-variance map, (N_views, n_b, n_a) on
+        ``device`` — one implementation for every backend.
+
+        ``sino`` is the preprocessed sinogram the loss will see (numpy); the
+        counts are ``self.projections`` above ``self.dark_field``, the SAME
+        binned pixels the line integrals were formed from, so the per-pixel
+        flat field is in the weight. Three steps, all shared:
+
+        1. the noise model — ``ct_core.noise_model.resolve_noise_model``
+           decides the Poisson slope (at this run's binning) and the read
+           noise (per raw pixel) from the pinned values, this scan's own
+           measurement, the detector's calibration file or the package
+           default, and logs which (``wls/*``);
+        2. the weights — ``inverse_variance_weights`` on the counts;
+        3. static detector seams get ZERO weight (``detect_seam_columns``):
+           a per-column step no volume can render must not be chased.
+
+        The constants actually used are written back to ``wls_slope`` /
+        ``wls_read_noise`` and the map is kept on ``self._wls_w``.
+        """
+        sino = np.asarray(sino, dtype=np.float32)
+        ds = int(self.geometry.get('sinogram_downsample', 1) or 1)
+        counts = np.asarray(self.projections, dtype=np.float32)
+        if counts.shape != sino.shape:
+            raise ValueError(f"count array {counts.shape} does not match the "
+                             f"sinogram {sino.shape}: the wls weights must "
+                             f"come from the same binned pixels")
+        if self.dark_field is not None:
+            counts = counts - np.asarray(self.dark_field, dtype=np.float32)[None]
+        model = resolve_noise_model(
+            sino, counts, downsample=ds,
+            poisson_slope=self.wls_slope, read_noise=self.wls_read_noise,
+            calibration=self.noise_calibration, log_fn=self.log_fn,
+            **self.noise_fit_kwargs)
+        self.noise_model = model
+        self.wls_slope = float(model.poisson_slope)
+        self.wls_read_noise = float(model.read_noise)
+        w = inverse_variance_weights(
+            counts, None, poisson_slope=model.poisson_slope,
+            read_noise=model.read_noise, min_counts=self.wls_min_counts,
+            downsample=ds)
+        self._seam_cols = detect_seam_columns(sino, t_min=self.wls_seam_t)
+        if len(self._seam_cols):
+            w[:, :, self._seam_cols] = 0.0
+            geom = self.geometry
+            try:
+                da = float(geom['da']); cpa = float(geom['central_pixel_a'])
+                R_s = float(geom['R_s']); mag = (R_s + float(geom['R_d'])) / R_s
+                where = (f" = {np.round((self._seam_cols - cpa) * da / mag, 1).tolist()}"
+                         f" mm from the axis at the isocentre")
+            except (KeyError, TypeError, ValueError):
+                where = ""
+            print(f"    seam mask: {len(self._seam_cols)} detector columns "
+                  f"({100 * len(self._seam_cols) / sino.shape[2]:.2f} %) get zero "
+                  f"weight — columns {self._seam_cols.tolist()}{where}")
+        if self.log_fn is not None:
+            self.log_fn({'wls/seam_columns': int(len(self._seam_cols))}, 0)
+        sig = 1.0 / np.sqrt(w[w > 0])
+        print(f"    loss: weighted least squares (reduced chi-square) on "
+              f"log-attenuation; {model.describe()}; sigma p5/p50/p95 = "
+              f"{np.percentile(sig, 5):.4f}/{np.percentile(sig, 50):.4f}/"
+              f"{np.percentile(sig, 95):.4f}")
+        self._wls_w = torch.from_numpy(np.ascontiguousarray(w)).to(device)
+        return self._wls_w
+
+    def _build_data_term(self, sino, device, **extra):
+        """``self.loss`` as a callable ``(pred, target) -> scalar``, with the
+        scan-dependent state every term needs bound in.
+
+        ONE code path for every backend: the ray trainer below and the
+        whole-view rasteriser (``gaussian``) both come through here, so the
+        term a run names is the same function whichever representation
+        renders ``pred``. What differs per backend is only the batch — which
+        is why the sampler is resolved separately (``_build_loss``) and why
+        ``wls`` and ``sart`` take their per-batch weights through a side
+        dict the batch-maker fills.
+
+        ``sino`` is the preprocessed sinogram (numpy or tensor, any device);
+        ``extra`` are options a caller binds itself (``chord_state``).
+        """
+        if self.loss in NEEDS_RAY_GEOMETRY and "chord_state" not in extra:
+            raise ValueError(
+                f"loss {self.loss!r} weights by the rays' chord lengths, "
+                f"which this backend does not trace")
+        opts = dict(self.loss_options)
+        opts.update(extra)
+        n_a = int(sino.shape[2])
+        if self.loss == "wls":
+            self._weight_state = {}
+            opts["weight_state"] = self._weight_state
+            sino_np = (sino.detach().cpu().numpy() if torch.is_tensor(sino)
+                       else np.asarray(sino))
+            self._build_wls_weights(sino_np, device)
+        elif self.loss in ("filtered", "wiener"):
+            if "ramp_kernel" not in opts and "wiener_kernel" not in opts:
+                from .losses import _build_ramp_kernel
+                key = "wiener_kernel" if self.loss == "wiener" else "ramp_kernel"
+                opts[key] = _build_ramp_kernel(n_a, torch.float32, device)
+                if self.loss == "wiener":
+                    print("    no measured SNR gate supplied — falling back to "
+                          "a plain ramp, i.e. equivalent to 'filtered'")
+        elif BATCH_KIND.get(self.loss) == "patch":
+            if "data_range" not in opts:
+                # SSIM's stabilisers need a dynamic range. Taken from the
+                # measured sinogram so it is a constant of the scan rather than
+                # of whichever patch was drawn.
+                lo = float(sino.min()); hi = float(sino.max())
+                opts["data_range"] = (hi - lo) or 1.0
+        return build_data_term(self.loss, **opts)
+
     def _build_loss(self, scene, gen, device):
         """(loss_fn, sample_batch, description) for ``self.loss``.
 
         The data term and the sampler are resolved together because the term
-        dictates the shape of a batch:
+        dictates the shape of a batch (``losses.BATCH_KIND``):
 
-          * per-ray terms (mse, weighted, huber) take any rays;
+          * per-ray terms (wls, mse, weighted, huber, sart) take any rays;
           * ramp-filtered terms (filtered, wiener) need COMPLETE detector rows —
             the filter is a convolution along the row, so a scattered subset of
             rays has no row to filter;
-          * structural terms (ssim, msssim) need a contiguous 2-D PATCH, since
-            SSIM is defined over a local window in both axes.
+          * structural terms (ssim, msssim, l1_dssim) need a contiguous 2-D
+            PATCH, since SSIM is defined over a local window in both axes.
 
         `loss_options` is forwarded to the registry, which ignores keys that do
         not apply to the selected term.
         """
-        opts = dict(self.loss_options)
         n_b, n_a = scene.sinogram.shape[1], scene.sinogram.shape[2]
+        extra = {}
 
         if self.loss == "sart":
             from .sart import ray_support_lengths, roi_bounds
@@ -646,17 +812,18 @@ class LearnedReconstructor:
             # The loss reads this dict; the sampler refreshes it. L_i is a
             # property of the batch's rays, so it has to be recomputed per step.
             chord_state: dict = {}
-            opts["chord_state"] = chord_state
-            opts.setdefault("sart_clamp_lo", 0.25)
-            opts.setdefault("sart_clamp_hi", 4.0)
+            extra["chord_state"] = chord_state
+            extra.setdefault("sart_clamp_lo", self.loss_options.get("sart_clamp_lo", 0.25))
+            extra.setdefault("sart_clamp_hi", self.loss_options.get("sart_clamp_hi", 4.0))
             # --emulate-sart reproduces the classical update, which descends
             # the SUMMED misfit; C then supplies the per-voxel column-sum
             # normalisation. The two belong together — the sum without an
             # absolute C overshoots by the column sum, the mean with one
             # undershoots by the batch weight — so they are set from the same
             # flag and never independently.
-            opts.setdefault("sart_reduction",
-                            "sum" if self.emulate_sart else "mean")
+            extra.setdefault("sart_reduction", self.loss_options.get(
+                "sart_reduction", "sum" if self.emulate_sart else "mean"))
+            term = self._build_data_term(scene.sinogram, device, **extra)
 
             def sample_batch(*, exclude_angle=None):
                 o, d, tgt = sample_random_rays(
@@ -670,16 +837,13 @@ class LearnedReconstructor:
             desc = (f"{self.rays_per_batch} random rays per step, row-weighted "
                     f"by 1/L over the object ROI (r={radius:.1f} mm, "
                     f"outside_weight={self.sart_outside_weight})")
+            return term, sample_batch, desc
 
-        elif self.loss in ("filtered", "wiener"):
+        term = self._build_data_term(scene.sinogram, device)
+        kind = BATCH_KIND.get(self.loss, "rays")
+
+        if kind == "rows":
             n_rows = max(1, self.rays_per_batch // n_a)
-            if "ramp_kernel" not in opts and "wiener_kernel" not in opts:
-                from .losses import _build_ramp_kernel
-                key = "wiener_kernel" if self.loss == "wiener" else "ramp_kernel"
-                opts[key] = _build_ramp_kernel(n_a, torch.float32, device)
-                if self.loss == "wiener":
-                    print("    no measured SNR gate supplied — falling back to "
-                          "a plain ramp, i.e. equivalent to 'filtered'")
 
             def sample_batch(*, exclude_angle=None):
                 return sample_random_rows(scene, n_rows, generator=gen,
@@ -687,25 +851,31 @@ class LearnedReconstructor:
                                           exclude_angle=exclude_angle)
             desc = f"{n_rows} complete detector rows per step ({n_a} cols)"
 
-        elif self.loss in ("ssim", "msssim"):
-            side = int(opts.pop("patch_size", 64))
-            n_patches = int(opts.pop("num_patches",
-                                     max(1, self.rays_per_batch // (side * side))))
+        elif kind == "patch":
+            side = int(self.loss_options.get("patch_size", 64))
+            n_patches = int(self.loss_options.get(
+                "num_patches", max(1, self.rays_per_batch // (side * side))))
             side = min(side, n_b, n_a)
-            if "data_range" not in opts:
-                # SSIM's stabilisers need a dynamic range. Taken from the
-                # measured sinogram so it is a constant of the scan rather than
-                # of whichever patch was drawn.
-                sino = scene.sinogram
-                opts["data_range"] = float(sino.max() - sino.min())
 
             def sample_batch(*, exclude_angle=None):
                 return sample_projection_patch(scene, side, side,
                                                generator=gen, device=device,
                                                exclude_angle=exclude_angle,
                                                num_patches=n_patches)
-            desc = (f"{n_patches} x {side}x{side} projection patches per step, "
-                    f"data_range={opts['data_range']:.3f}")
+            desc = f"{n_patches} x {side}x{side} projection patches per step"
+
+        elif self.loss == "wls":
+            w_map, w_state = self._wls_w, self._weight_state
+
+            def sample_batch(*, exclude_angle=None):
+                return sample_random_rays(scene, self.rays_per_batch,
+                                          generator=gen, device=device,
+                                          exclude_angle=exclude_angle,
+                                          subpixel=self.subpixel_rays,
+                                          weight_map=w_map,
+                                          weight_state=w_state)
+            desc = (f"{self.rays_per_batch} random rays per step, each "
+                    f"weighted by its pixel's measured inverse variance")
 
         else:
             def sample_batch(*, exclude_angle=None):
@@ -715,7 +885,7 @@ class LearnedReconstructor:
                                           subpixel=self.subpixel_rays)
             desc = f"{self.rays_per_batch} random rays per step"
 
-        return build_data_term(self.loss, **opts), sample_batch, desc
+        return term, sample_batch, desc
 
     def reconstruct(self) -> np.ndarray:
         device = self._device()
@@ -978,10 +1148,17 @@ class LearnedReconstructor:
         _term_name = ("caller-supplied" if self._loss_fn is not None
                       else self.loss)
         print(f"\n  Data term: {_term_name} — {batch_desc}")
-        if (self._loss_fn is None and self.loss != "mse"
-                and not self.emulate_sart):
-            print(f"    (default is mse, the objective classical SIRT "
-                  f"descends; this run departs from it)")
+        if self._loss_fn is None and not self.emulate_sart:
+            if self.loss == "wls":
+                print(f"    (the default: maximum likelihood for the measured "
+                      f"noise; the loss value is the reduced chi-square, "
+                      f"1.0 = at the photon noise. --loss mse is the "
+                      f"objective classical SIRT descends)")
+            elif self.loss != DEFAULT_DATA_TERM:
+                print(f"    (the default is {DEFAULT_DATA_TERM}; this run "
+                      f"departs from it"
+                      + (", to the objective classical SIRT descends)"
+                         if self.loss == "mse" else ")"))
 
         # ---- stopping rules --------------------------------------------------
         # The shared implementation, so this backend, TIGRE, ASTRA and muNeRF all

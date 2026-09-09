@@ -171,8 +171,18 @@ def sample_random_rays(
     device: torch.device | str | None = None,
     exclude_angle: int | None = None,
     subpixel: bool = True,
+    weight_map: torch.Tensor | None = None,
+    weight_state: dict | None = None,
 ):
     """Sample n rays uniformly across (angle, row, col).
+
+    ``weight_map`` (N_angles, N_b, N_a), if given, is gathered at the SAME
+    (angle, row, column) as the target and stored under ``weight_state["w"]``
+    for the ``wls`` data term — the per-pixel inverse variances of exactly the
+    measurements this batch scores. The indices are drawn here and nowhere
+    else, so this is the one place that gather can be done consistently; the
+    subpixel jitter does not move it, a ray inside a pixel is that pixel's
+    measurement. Same side-channel pattern as ``sart``'s chord lengths.
 
     The sinogram-side cost is a single vectorized advanced-index gather
     (`sino[a, b, c]` for n indices) executed in PyTorch C++; for n=1024 random
@@ -228,6 +238,11 @@ def sample_random_rays(
         # reproducible and stays out of the global one.
         b_sub = torch.rand(n, generator=generator, device=device) - 0.5
         a_sub = torch.rand(n, generator=generator, device=device) - 0.5
+    if weight_map is not None:
+        if weight_state is None:
+            raise ValueError("weight_map needs weight_state={} to put the "
+                             "gathered weights in")
+        weight_state["w"] = weight_map.to(angle_idx.device)[angle_idx, b_idx, a_idx]
     return rays_from_indices(scene, angle_idx, b_idx, a_idx, b_sub, a_sub)
 
 

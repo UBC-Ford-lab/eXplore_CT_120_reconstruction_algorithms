@@ -594,6 +594,8 @@ class GaussianCloud(nn.Module):
     @torch.no_grad()
     def _reset_moments(self, optimizer, which: torch.Tensor) -> None:
         for group in optimizer.param_groups:
+            if group.get('name') not in self._tensors():
+                continue        # non-cloud groups (photometric, motion) have no primitive axis
             p = group['params'][0]
             state = optimizer.state.get(p, None)
             if state is None:
