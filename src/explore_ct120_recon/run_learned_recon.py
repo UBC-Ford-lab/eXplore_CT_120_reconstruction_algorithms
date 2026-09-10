@@ -1063,8 +1063,17 @@ def main(argv=None):
         reconstructor.reconstructed_volume, ctx.geometry)
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
-    _, _, volume_hu = save_outputs(vol_export, ctx, args, output_path,
-                                   logger=logger, algorithm=algorithm.name)
+    _, anchors, volume_hu = save_outputs(vol_export, ctx, args, output_path,
+                                         logger=logger, algorithm=algorithm.name)
+
+    # The representation's own extras, in the calibration the volume got.
+    # Off the critical path: the volume is on disk, a failure here is a note.
+    try:
+        algorithm.after_save(reconstructor, ctx, args, output_path, anchors,
+                             logger)
+    except Exception as e:                      # noqa: BLE001 — reported, not raised
+        print(f"  {algorithm.name}: after_save failed ({type(e).__name__}: {e}); "
+              f"the volume and the run record stand")
 
     # replay_steps=False: the trainer already streamed these live via diag_fn.
     logger.log_convergence(reconstructor.crossval_history, replay_steps=False)

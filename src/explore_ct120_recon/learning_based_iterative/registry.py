@@ -73,6 +73,10 @@ def _no_options(args) -> dict:
     return {}
 
 
+def _no_after_save(reconstructor, ctx, args, output_path, anchors, logger) -> None:
+    """An algorithm with nothing to add once the volume is on disk."""
+
+
 @dataclass(frozen=True)
 class LearnedAlgorithm:
     """One selectable representation, and everything the driver needs from it.
@@ -134,6 +138,15 @@ class LearnedAlgorithm:
     #: the driver's parser declares; an unknown one is a ConfigError at
     #: startup, never a silently ignored setting.
     driver_defaults: dict = field(default_factory=dict)
+    #: ``(reconstructor, ctx, args, output_path, anchors, logger) -> None``,
+    #: called by the driver AFTER the delivered volume is calibrated and
+    #: written: the seam for a representation that has more to deliver than
+    #: one static volume (a time-aware model's state sequence, say) and wants
+    #: it in the SAME HU calibration the volume got. ``anchors`` is the
+    #: `HUAnchors` the export used; ``output_path`` the base the VFF went to.
+    #: Nothing here is on the critical path — a failure is reported, the run
+    #: and its volume stand.
+    after_save: Callable[[Any, Any, Any, str, Any, Any], None] = _no_after_save
 
     def __post_init__(self):
         if self.footprint is None:
