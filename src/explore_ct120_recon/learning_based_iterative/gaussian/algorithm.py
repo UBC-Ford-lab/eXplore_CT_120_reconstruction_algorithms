@@ -229,19 +229,21 @@ def add_args(group) -> None:
                    metavar=('A', 'B'), dest='gauss_wls_var',
                    action=_RetiredWlsVar, help=argparse.SUPPRESS)
     g.add_argument('--gauss-photometric',
-                   choices=('none', 'offset', 'affine', 'affine_lateral'),
-                   default='none', dest='gauss_photometric',
+                   choices=('auto', 'none', 'offset', 'affine', 'affine_lateral'),
+                   default='auto', dest='gauss_photometric',
                    help="with --loss wls (the default): per-view photometric nuisance "
                         "parameters fitted with the cloud — 'offset' (one "
                         "log-attenuation offset per view), 'affine' (+ a gain), "
                         "'affine_lateral' (+ a linear-in-column term); zero-mean "
                         "over the training views by construction, the "
                         "held-out view's fitted in closed form at each "
-                        "evaluation (default: none). MEASURED on Scan_1510: "
-                        "a 0.8 %% intensity drift over the last 40 views that "
-                        "air levelling misses; a static cloud absorbs it by "
-                        "stretching primitives along those views' detector "
-                        "direction (the rib->lung streaks).")
+                        "evaluation. 'auto' = affine_lateral under wls, none "
+                        "under any other loss (default: auto). MEASURED on "
+                        "Scan_1510: air levelling leaves a smooth +-2 %% gain "
+                        "and -0.006 offset drift; fitting it lifts the held-out "
+                        "SSIM 0.887 -> 0.899 (+0.43 dB) and stops the cloud "
+                        "stretching primitives along the redundant direction, "
+                        "at no change to the delivered volume.")
     g.add_argument('--gauss-photometric-reg', type=float, default=1e-3,
                    dest='gauss_photometric_reg', metavar='W',
                    help='weight of the L2 prior on the per-view parameters, in '

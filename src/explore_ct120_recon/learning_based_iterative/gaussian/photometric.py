@@ -115,11 +115,28 @@ class PhotometricModel:
     @torch.no_grad()
     def fit_view(self, view: int, pred: torch.Tensor, target: torch.Tensor,
                  weights: torch.Tensor | None, scale: float,
-                 ridge: float = 1e-3) -> torch.Tensor:
+                 reg: float = 1e-3) -> torch.Tensor:
         """Closed-form (g, o, s) for one view: weighted least squares of
-        ``target - pred`` on [pred, scale, scale * u] with an L2 ridge in the
-        prior's units. Writes the triple into the view's row and returns it.
-        Inputs in RENDERED units, (n_b, n_a)."""
+        ``target - pred`` on [pred, scale, scale * u] with the TRAINING prior
+        as the ridge. Writes the triple into the view's row and returns the
+        effective correction. Inputs in RENDERED units, (n_b, n_a).
+
+        The ridge is the training objective in these units and nothing else.
+        A training view minimises ``mean_pix(w r^2) + reg * |x / ref|^2`` in
+        log-attenuation units; times P pixels that is ``sum_pix(w r^2)
+        + reg * P * |x / ref|^2``, and with residuals in rendered units
+        (``r_rend = scale * r_log``) the ridge becomes
+        ``reg * P * scale^2 / ref^2``. MEASURED on Scan_1510 (run m43erxsc):
+        the earlier ``ridge * sum(w) / ref^2`` was 462x that, shrinking the
+        held-out gain from 0.0197 to 0.0026 while its neighbours sat at 0.016,
+        and the held-out PSNR read 39.05 dB for a cloud that scores 40.35.
+
+        The solved triple is the correction the view NEEDS, i.e. what
+        `effective` must return for it; `effective` subtracts the training
+        means from every row, so the row is stored with those means added
+        back. Storing the triple raw applied ``triple - means`` instead
+        (an offset error of 0.0023 on the same run).
+        """
         n_a = pred.shape[1]
         cols = [pred.reshape(-1)] if self.use_gain else []
         cols.append(torch.full_like(pred.reshape(-1), float(scale)))
@@ -132,7 +149,7 @@ class PhotometricModel:
              else weights.reshape(-1).double())
         AtA = A.T @ (A * w[:, None])
         Aty = A.T @ (w * y)
-        lam = ridge * float(w.sum()) / (self.ref ** 2)
+        lam = float(reg) * A.shape[0] * float(scale) ** 2 / (self.ref ** 2)
         sol = torch.linalg.solve(AtA + lam * torch.eye(A.shape[1], dtype=A.dtype,
                                                        device=A.device), Aty)
         triple = torch.zeros(3, dtype=torch.float32, device=pred.device)
@@ -142,7 +159,10 @@ class PhotometricModel:
         triple[1] = sol[i].float(); i += 1
         if self.use_slope:
             triple[2] = sol[i].float()
-        self.params[int(view)] = triple
+        p = self.params
+        m = self.train_mask.to(p.device)
+        means = (p * m[:, None]).sum(dim=0) / m.sum().clamp_min(1)
+        self.params[int(view)] = triple + means
         return triple
 
     # -- optimiser / state --------------------------------------------------

@@ -116,7 +116,7 @@ class GaussianReconstructor(LearnedReconstructor):
                  seed_roi_weight: float = 1.0,
                  signed_density: float = 0.0,
                  lr_multipliers: dict | None = None,
-                 photometric: str = 'none',
+                 photometric: str = 'auto',
                  photometric_reg: float = 1e-3,
                  photometric_ref: float = 0.01,
                  photometric_lr: float | None = None,
@@ -175,7 +175,19 @@ class GaussianReconstructor(LearnedReconstructor):
                              "by their chord length through the object; a "
                              "rasteriser has no rays to measure. Use the "
                              "voxel backend for the SART emulation.")
-        if self.cfg['photometric'] != 'none' and self.loss != 'wls':
+        # 'auto' = the per-view affine + lateral-slope nuisance whenever the
+        # data term is wls, and nothing otherwise. DEFAULT since 2026-09-10:
+        # MEASURED on Scan_1510 (run m43erxsc vs l5tn6qmh, one variable) it
+        # recovers a smooth drift (gain +-2 %, offset -0.006 over the last
+        # 40 views), lifts the held-out fit 0.8873 -> 0.8993 SSIM / +0.43 dB
+        # and stops the cloud stretching primitives along the redundant
+        # direction (azimuth band 51 % -> 17 %), for three numbers per view.
+        # It did NOT change the delivered volume (6 HU rms), so it is the
+        # honest data term rather than a cure for the rib->lung streaks.
+        if self.cfg['photometric'] == 'auto':
+            self.cfg['photometric'] = ('affine_lateral' if self.loss == 'wls'
+                                       else 'none')
+        elif self.cfg['photometric'] != 'none' and self.loss != 'wls':
             raise ValueError("photometric nuisance parameters are fitted "
                              "against the wls weights; they need loss='wls'")
         self._data_term = None
@@ -605,7 +617,7 @@ class GaussianReconstructor(LearnedReconstructor):
                     snapshot_fn=((lambda: self._state(cloud))
                                  if self.save_best else None))
                 if self.lr_plateau is not None and self.lr_plateau.step(
-                        improved, optimizer):
+                        improved, optimizer, iteration=it):
                     # A reduction resets the stopper's patience on purpose: a
                     # noise dip should buy an LR cut, not end the run.
                     stopper.num_bad = 0
@@ -652,7 +664,7 @@ class GaussianReconstructor(LearnedReconstructor):
 
                 if rules.should_stop():
                     if (self.lr_plateau is not None
-                            and not self.lr_plateau.at_floor(optimizer)):
+                            and not self.lr_plateau.at_floor(optimizer, it)):
                         # Patience ran out but the LR has further to fall.
                         # Stopping here would deliver an un-annealed cloud.
                         stopper.num_bad = 0
@@ -948,7 +960,8 @@ class GaussianReconstructor(LearnedReconstructor):
                                      device=img.device) * self._wls_scale
             w = (self._wls_w[int(view), b0:b1, a0:a1] if self._wls_w is not None
                  else None)
-            self.photo.fit_view(int(view), pred, target, w, self._wls_scale)
+            self.photo.fit_view(int(view), pred, target, w, self._wls_scale,
+                                reg=self.cfg['photometric_reg'])
         metrics = scorer.score(self._line_integral(cloud, camera, view))
         if self.photo is not None:
             summary = self.photo.summary()

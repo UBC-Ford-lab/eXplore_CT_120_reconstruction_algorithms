@@ -788,6 +788,7 @@ class PlateauLRReducer:
         self.num_bad = 0
         self.cooldown_left = 0
         self.num_reductions = 0
+        self.level = 1.0            # base x level = the chain's current LR
         self.base_lrs: list[float] | None = None
         self.min_lrs: list[float] | None = None
 
@@ -796,25 +797,53 @@ class PlateauLRReducer:
         post-warmup base) as the reference for the decay factor and floor."""
         self.base_lrs = [float(g["lr"]) for g in optimizer.param_groups]
         self.min_lrs = [lr * self.min_lr_fraction for lr in self.base_lrs]
+        self.level = 1.0            # a re-activation (staged run) starts afresh
         self.num_bad = 0
         self.cooldown_left = 0
         self.active = True
 
-    def at_floor(self, optimizer) -> bool:
-        """True once every param group has decayed to its LR floor."""
-        if not self.active or self.min_lrs is None:
-            return False
-        return all(float(g["lr"]) <= mn * (1.0 + 1e-9)
-                   for g, mn in zip(optimizer.param_groups, self.min_lrs))
 
     def current_lrs(self, optimizer) -> list[float]:
         return [float(g["lr"]) for g in optimizer.param_groups]
 
-    def step(self, improved: bool, optimizer) -> bool:
+    def _held(self, group: dict, iteration: int | None) -> bool:
+        """A param group carrying ``lr_hold_until`` keeps its base LR until
+        that iteration, whatever the reduction count: parameters that join
+        a run late (a motion model switched on at 0.25 of the run) are still
+        at their first steps when the cloud's plateau draws a cut, and a
+        cut aimed at the cloud must not land on them. Once the hold expires
+        the group joins the chain at the CURRENT level."""
+        hold = group.get("lr_hold_until")
+        return (hold is not None and iteration is not None
+                and int(iteration) < int(hold))
+
+    def apply(self, optimizer, iteration: int | None = None) -> None:
+        """Set every group's LR from the chain's level: base x level,
+        floored — or the base while the group's hold lasts. Idempotent."""
+        if not self.active:
+            return
+        for g, base, mn in zip(optimizer.param_groups, self.base_lrs,
+                               self.min_lrs):
+            g["lr"] = (base if self._held(g, iteration)
+                       else max(base * self.level, mn))
+
+    def at_floor(self, optimizer, iteration: int | None = None) -> bool:
+        """True once every param group has decayed to its LR floor. A held
+        group is never at the floor, so a run cannot end while a hold lasts."""
+        if not self.active or self.min_lrs is None:
+            return False
+        return all(float(g["lr"]) <= mn * (1.0 + 1e-9)
+                   and not self._held(g, iteration)
+                   for g, mn in zip(optimizer.param_groups, self.min_lrs))
+
+    def step(self, improved: bool, optimizer, iteration: int | None = None) -> bool:
         """Consume one held-out evaluation. ``improved`` is the flag from
-        ``EarlyStopper.update``. Returns True iff the LR was reduced this call."""
+        ``EarlyStopper.update``. Returns True iff the LR was reduced this call.
+        ``iteration`` releases expired holds (see `_held`); without it every
+        group follows the chain, as before."""
         if not self.active:
             return False
+        self.apply(optimizer, iteration)          # releases expired holds
         if improved:
             self.num_bad = 0
             return False
@@ -822,13 +851,13 @@ class PlateauLRReducer:
             self.cooldown_left -= 1
             return False
         self.num_bad += 1
-        if self.num_bad < self.patience or self.at_floor(optimizer):
+        if self.num_bad < self.patience or self.at_floor(optimizer, iteration):
             return False
-        for g, mn in zip(optimizer.param_groups, self.min_lrs):
-            g["lr"] = max(float(g["lr"]) * self.factor, mn)
+        self.num_reductions += 1
+        self.level *= self.factor
+        self.apply(optimizer, iteration)
         self.num_bad = 0
         self.cooldown_left = self.cooldown
-        self.num_reductions += 1
         return True
 
 

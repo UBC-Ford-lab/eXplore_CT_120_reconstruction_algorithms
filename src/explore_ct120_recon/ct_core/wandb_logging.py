@@ -396,16 +396,23 @@ class ReconLogger:
         A value that is a matplotlib ``Figure`` is a panel, not a scalar: it
         goes through `_emit` (local PNG named after the key and step, W&B
         image under the key), so a backend can log its own figures through
-        the one callable it is handed without knowing about the logger.
+        the one callable it is handed without knowing about the logger. A
+        uint8 array of frames, (T, H, W) or (T, H, W, 3), is an animation:
+        `_emit_frames` writes a GIF and logs it as a W&B video under the
+        same ``plots/`` key, so a backend's sweep through its states (the
+        dynamic model's breathing) needs no W&B object either.
         """
         if step is not None:
             self._max_step = max(self._max_step, int(step))
         scalars = {}
         for k, v in metrics.items():
+            stem = str(k).replace('/', '_')
+            filename = stem if step is None else f"{stem}_{int(step)}"
             if isinstance(v, Figure):
-                stem = str(k).replace('/', '_')
-                self._emit(str(k), v, step=step,
-                           filename=(stem if step is None else f"{stem}_{int(step)}"))
+                self._emit(str(k), v, step=step, filename=filename)
+            elif (isinstance(v, np.ndarray) and v.dtype == np.uint8
+                    and v.ndim in (3, 4)):
+                self._emit_frames(str(k), v, step=step, filename=filename)
             else:
                 scalars[k] = v
         if self.run is None or not scalars:
@@ -444,6 +451,35 @@ class ReconLogger:
                     self.run.log({f"plots/{name}": image})
             except Exception as e:
                 print(f"W&B image log failed ({type(e).__name__}: {e})")
+
+    def _emit_frames(self, name: str, frames: np.ndarray, step: int | None = None,
+                     filename: str | None = None, fps: int = 6) -> None:
+        """Save uint8 frames as a GIF (always — W&B uploads a video from a
+        file, and a run without W&B still keeps it) and log it as a video.
+        The GIF lands in the plot directory even with plots disabled: it is
+        the upload's source, and a `plots/` key without a file is nothing."""
+        self.plot_dir.mkdir(parents=True, exist_ok=True)
+        path = self.plot_dir / f"{filename or name}.gif"
+        try:
+            from PIL import Image
+            ims = [Image.fromarray(np.ascontiguousarray(f)) for f in frames]
+            ims[0].save(path, save_all=True, append_images=ims[1:], loop=0,
+                        duration=int(1000 / fps))
+            if self.plots_enabled:
+                print(f"  Plot: {path} ({len(ims)} frames)")
+        except Exception as e:
+            print(f"GIF write failed ({type(e).__name__}: {e})")
+            return
+        if self.run is not None:
+            try:
+                import wandb
+                video = wandb.Video(str(path), format="gif")
+                if step is not None:
+                    self.log({f"plots/{name}": video}, step=step)
+                else:
+                    self.run.log({f"plots/{name}": video})
+            except Exception as e:
+                print(f"W&B video log failed ({type(e).__name__}: {e})")
 
     # -- standard figures ------------------------------------------------
 

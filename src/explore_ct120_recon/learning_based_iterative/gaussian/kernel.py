@@ -181,21 +181,36 @@ def _shape_kwargs(cloud, allow_precomputed: bool = True) -> dict:
             'cov3D_precomp': None}
 
 
-def covariance_to_scaling_rotation(cov6: torch.Tensor):
+EIGH_CHUNK = 65536
+
+
+def covariance_to_scaling_rotation(cov6: torch.Tensor, chunk: int = EIGH_CHUNK):
     """Inverse of `covariance_upper`: (N, 6) -> (scaling (N, 3), unit
-    quaternion (N, 4)) with Sigma = R diag(s^2) R^T, for the voxeliser."""
-    S = torch.zeros((cov6.shape[0], 3, 3), dtype=cov6.dtype, device=cov6.device)
-    S[:, 0, 0], S[:, 0, 1], S[:, 0, 2] = cov6[:, 0], cov6[:, 1], cov6[:, 2]
-    S[:, 1, 1], S[:, 1, 2], S[:, 2, 2] = cov6[:, 3], cov6[:, 4], cov6[:, 5]
-    S[:, 1, 0], S[:, 2, 0], S[:, 2, 1] = cov6[:, 1], cov6[:, 2], cov6[:, 4]
-    evals, evecs = torch.linalg.eigh(S.double())
-    scaling = evals.clamp_min(1e-20).sqrt().to(cov6.dtype)
-    R = evecs
-    # a proper rotation: flip the last column where det < 0
-    det = torch.linalg.det(R)
-    R = R.clone()
-    R[det < 0, :, 2] *= -1.0
-    return scaling, rotation_to_quaternion(R).to(cov6.dtype)
+    quaternion (N, 4)) with Sigma = R diag(s^2) R^T, for the voxeliser.
+
+    Factorised in chunks of ``chunk`` rows: the batched CUDA eigensolver
+    sizes one workspace for the whole batch — MEASURED 7.75 GiB at 1 M
+    3x3 matrices and an invalid-value error (an overflowed size) at 2.4 M,
+    which killed the live breathing panel and would have killed the export
+    of run zxw89mcg — while 65536-row chunks take 0.7 s for 2.4 M.
+    """
+    n = cov6.shape[0]
+    scaling = torch.empty((n, 3), dtype=cov6.dtype, device=cov6.device)
+    quat = torch.empty((n, 4), dtype=cov6.dtype, device=cov6.device)
+    for i in range(0, n, max(1, int(chunk))):
+        c = cov6[i:i + chunk]
+        S = torch.zeros((c.shape[0], 3, 3), dtype=c.dtype, device=c.device)
+        S[:, 0, 0], S[:, 0, 1], S[:, 0, 2] = c[:, 0], c[:, 1], c[:, 2]
+        S[:, 1, 1], S[:, 1, 2], S[:, 2, 2] = c[:, 3], c[:, 4], c[:, 5]
+        S[:, 1, 0], S[:, 2, 0], S[:, 2, 1] = c[:, 1], c[:, 2], c[:, 4]
+        evals, evecs = torch.linalg.eigh(S.double())
+        scaling[i:i + chunk] = evals.clamp_min(1e-20).sqrt().to(cov6.dtype)
+        R = evecs.clone()
+        # a proper rotation: flip the last column where det < 0
+        det = torch.linalg.det(R)
+        R[det < 0, :, 2] *= -1.0
+        quat[i:i + chunk] = rotation_to_quaternion(R).to(cov6.dtype)
+    return scaling, quat
 
 
 def rotation_to_quaternion(R: torch.Tensor) -> torch.Tensor:
