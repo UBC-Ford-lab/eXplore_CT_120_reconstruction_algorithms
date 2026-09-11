@@ -104,7 +104,7 @@ def add_common_args(parser):
              'scans: 00 or 01 select one, "00,01" or "all" load several at '
              'once — the same gantry positions in different physiological '
              'states, each view labelled with its group for backends that '
-             'model motion (default: 00). Ignored for sequential proj-* scans.'
+             'model motion (default: %(default)s). Ignored for sequential proj-* scans.'
     )
     parser.add_argument(
         '--voxel-xy',
