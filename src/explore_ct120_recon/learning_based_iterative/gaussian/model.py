@@ -622,17 +622,26 @@ class GaussianCloud(nn.Module):
         """One round of clone / split / prune. Returns a small stats dict.
 
         ``eligible`` (bool, one per primitive) confines clone and split to a
-        subset; the gradient quantile is still taken over everything seen, so
-        the threshold means the same thing with or without it. Pruning is
-        never confined.
+        subset. Pruning is never confined.
+        THE RATE. ``fraction`` is the share of the CANDIDATES refined per
+        round — the primitives that were seen, are eligible and (with the
+        gate live) pass it — so the quantile is taken over that set and not
+        over the whole cloud. MEASURED (run g8k77wwx, Scan_1510 ds3, 2.4 M
+        seeds, ROI-confined, gate 3): with the quantile over the whole cloud
+        97 % of the eligible primitives passed the gate, yet 150-350 of a
+        nominal 48,000 were split per round, because the top 2 % by excess
+        sat on the truncated periphery outside the ROI and among the gated
+        — the same starvation gate16k showed (5,840 -> 370 splits/round).
+        Ranking within the candidates makes ``fraction`` mean what it says.
 
         ``gate_z`` vetoes primitives whose data gradient is not distinguishable
         from their noise gradient (`gate_z()` below the threshold), so a round
         can only refine where the data decide. The quantile stays as the RATE
         limit, taken over the excess gradient (data minus null) while the gate
-        is live and over the raw norm otherwise; the gate is a veto on top of
-        it, and densification ends on its own when nothing passes —
-        `stats['gated']` counts what did. Needs `record_null_gradients` to
+        is live and over the raw norm otherwise, and among the candidates the
+        gate lets through; densification ends on its own when nothing passes
+        — `stats['gated']` counts what did, `stats['candidates']` the set the
+        quantile ranked. Needs `record_null_gradients` to
         have been fed; without it every primitive passes and the ranking is
         upstream's.
 
@@ -672,25 +681,26 @@ class GaussianCloud(nn.Module):
             grads = (self.gate_sum / self.grad_denom.clamp_min(1.0)).clamp_min(0.0)
             grads[self.grad_denom == 0] = 0.0
 
-        if absolute is not None:
-            thresh = float(absolute)
-        else:
-            seen = grads[self.grad_denom > 0]
-            thresh = (float(torch.quantile(seen.float(),
-                                           1.0 - float(fraction)))
-                      if seen.numel() else float('inf'))
-
-        selected = grads >= thresh
+        # The candidates: seen, eligible, and past the gate when it is live.
+        # The quantile ranks THEM (see the docstring), and only they can be
+        # selected.
+        candidates = self.grad_denom > 0
         if eligible is not None:
-            selected &= eligible.to(selected.device)
+            candidates &= eligible.to(candidates.device)
         n_gated = -1
         if gate_on:
             coherent = self.gate_z() >= float(gate_z)
-            seen = coherent & (self.grad_denom > 0)
-            if eligible is not None:
-                seen &= eligible.to(seen.device)
-            n_gated = int(seen.sum())          # of the eligible ones
-            selected &= coherent
+            candidates &= coherent
+            n_gated = int(candidates.sum())    # of the eligible ones
+        n_candidates = int(candidates.sum())
+        if absolute is not None:
+            thresh = float(absolute)
+        else:
+            seen = grads[candidates]
+            thresh = (float(torch.quantile(seen.float(),
+                                           1.0 - float(fraction)))
+                      if seen.numel() else float('inf'))
+        selected = (grads >= thresh) & candidates
         scales = self.scaling
         n_floored = 0
         if split_mode == 'preserving':
@@ -784,6 +794,7 @@ class GaussianCloud(nn.Module):
                 'cloned': int(clone_mask.sum()), 'split': int(split_mask.sum()),
                 'pruned': int(drop.sum()), 'threshold': float(thresh),
                 'eligible': (n0 if eligible is None else int(eligible.sum())),
+                'candidates': n_candidates,
                 # -1 = no null gradients were recorded, so the gate was idle.
                 'gated': n_gated, 'floored': n_floored,
                 # The children are the LAST n_new primitives (pruning keeps

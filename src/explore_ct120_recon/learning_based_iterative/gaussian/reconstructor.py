@@ -720,6 +720,9 @@ class GaussianReconstructor(LearnedReconstructor):
                 if self.log_fn is not None:
                     self.log_fn({'model/n_gaussians': stats['after'],
                                  'model/densify_eligible': stats['eligible'],
+                                 # the set the quantile ranked: eligible, seen
+                                 # and past the gate; fraction x this = splits
+                                 'model/densify_candidates': stats.get('candidates', -1),
                                  'model/densify_threshold': stats['threshold'],
                                  'model/cloned': stats['cloned'],
                                  'model/split': stats['split'],
@@ -745,6 +748,7 @@ class GaussianReconstructor(LearnedReconstructor):
                 lr_now = float(optimizer.param_groups[0]['lr'])
                 last = getattr(self, '_last_densify', None)
                 gated = (f"  gated {last['gated']:,}/{last['eligible']:,}"
+                         f", split {last.get('split', 0):,}/round"
                          if last is not None and last['gated'] >= 0
                          and d_from <= it <= d_until else "")
                 if (last is not None and 'relocated' in last
