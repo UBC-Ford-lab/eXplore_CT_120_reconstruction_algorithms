@@ -114,6 +114,7 @@ class GaussianReconstructor(LearnedReconstructor):
                  density_reg: float = 0.01,
                  scale_reg: float = 0.0,
                  seed_roi_weight: float = 1.0,
+                 seed_edge_weight: float = 0.0,
                  signed_density: float = 0.0,
                  lr_multipliers: dict | None = None,
                  photometric: str = 'auto',
@@ -150,6 +151,7 @@ class GaussianReconstructor(LearnedReconstructor):
             mcmc_dead_frac=float(mcmc_dead_frac),
             mcmc_noise=float(mcmc_noise), density_reg=float(density_reg),
             scale_reg=float(scale_reg), seed_roi_weight=float(seed_roi_weight),
+            seed_edge_weight=float(seed_edge_weight),
             signed_density=float(signed_density),
             lr_multipliers=dict(lr_multipliers or {}),
             photometric=str(photometric), photometric_reg=float(photometric_reg),
@@ -1077,7 +1079,8 @@ class GaussianReconstructor(LearnedReconstructor):
                 noise_floor_quantile=self.cfg['seed_floor_quantile'],
                 scale_factor=self.cfg['seed_scale'], rng=rng,
                 roi_box_mm=self._roi_box_mm(1.0),
-                roi_weight=self.cfg['seed_roi_weight'])
+                roi_weight=self.cfg['seed_roi_weight'],
+                edge_weight=self.cfg['seed_edge_weight'])
         xyz, scaling, rotation, density = parts
         # Report the width against the pitch it will be exported onto. A cloud
         # of width sigma can only represent `G_sigma * (non-negative measure)`,

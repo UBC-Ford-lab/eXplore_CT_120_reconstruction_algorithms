@@ -209,6 +209,17 @@ def add_args(group) -> None:
                         'to ADD budget inside while keeping the outside count '
                         'of a known-good run: W ~ N_total / N_outside - 1 '
                         '(2.4 M with 400 k outside -> W=5).')
+    g.add_argument('--gauss-seed-edge-weight', type=float, default=0.0,
+                   dest='gauss_seed_edge_weight', metavar='F',
+                   help='take this share (0-1) of the seed sampling weight '
+                        "from the reference's edge strength (|grad| above "
+                        'its median) instead of its mass (default: 0 = '
+                        'mass-proportional). The count is the resolution '
+                        'budget; mass spends it where attenuation is, edges '
+                        'are where resolution is needed. MEASURED on '
+                        'Scan_1510: the mass seed puts 44 primitives per 1k '
+                        'voxels in flat tissue and 24 at bone edges; F=0.5 '
+                        'is estimated to give 22 and 118.')
     g.add_argument('--gauss-signed-density', type=float, default=0.0,
                    metavar='F', dest='gauss_signed_density',
                    help='allow NEGATIVE amplitudes down to -F x the seed '
@@ -435,6 +446,7 @@ def options(args) -> dict:
         density_reg=float(args.gauss_density_reg),
         scale_reg=float(args.gauss_scale_reg),
         seed_roi_weight=float(args.gauss_seed_roi_weight),
+        seed_edge_weight=float(args.gauss_seed_edge_weight),
         signed_density=float(args.gauss_signed_density),
         photometric=str(args.gauss_photometric),
         photometric_reg=float(args.gauss_photometric_reg),

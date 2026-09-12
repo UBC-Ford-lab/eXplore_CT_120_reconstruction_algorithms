@@ -54,7 +54,8 @@ import numpy as np
 def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
                      noise_floor_quantile: float = 0.5, block: int = 2,
                      scale_factor: float = 1.0, rng=None, verbose: bool = True,
-                     roi_box_mm=None, roi_weight: float = 1.0):
+                     roi_box_mm=None, roi_weight: float = 1.0,
+                     edge_weight: float = 0.0, edge_sigma_vox: float = 1.0):
     """Mass-proportional seed from a reference volume of mu in mm^-1.
 
     ``volume`` is (Nx, Ny, Nz) on the grid ``geometry`` describes. Returns
@@ -68,6 +69,21 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
     the bed and the truncated periphery (MEASURED on Scan_1510: 400 k of
     800 k). Those regions still need primitives, since their shadows are in
     every projection, but not at the ROI's resolution.
+
+    ``edge_weight`` = f in [0, 1] takes that share of the sampling weight from
+    the reference's EDGE STRENGTH instead of its mass: |grad| of the volume
+    smoothed by ``edge_sigma_vox`` voxels, with its median subtracted (the
+    noise gradient of flat regions and air, the same floor idea as the mass
+    floor). f = 0 is the mass-proportional seed above. WHY: the count is the
+    resolution budget and mass spends it where the attenuation is, not where
+    the structure is. MEASURED on Scan_1510 (2.4 M fixed cloud, prod recipe):
+    44 primitives per 1,000 voxels in flat soft tissue against 24 at bone
+    edges (|grad| 1.6-3.2 kHU/mm), because an edge is thin and carries little
+    mass — the seed is densest exactly where nothing needs resolving, which is
+    where the speckle comes from, and thinnest where the blur is. Growing the
+    cloud did not fix it: gated adaptive densification 2.4 -> 5 M multiplied
+    every edge-strength bin by the same 2.1-2.4x. The ROI multiplier applies
+    to the mixed weight; the density calibration still conserves the mass.
     """
     rng = np.random.default_rng() if rng is None else rng
     vol = np.asarray(volume, dtype=np.float32)
@@ -83,6 +99,14 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
     sub = vol[::3, ::3, ::3].ravel()
     floor = float(np.quantile(sub, noise_floor_quantile))
     weight = np.maximum(vol - floor, 0.0)
+    f = float(edge_weight)
+    if not 0.0 <= f <= 1.0:
+        raise ValueError(f"edge_weight must be in [0, 1], got {f}")
+    edge_note = ''
+    mass_weight = weight
+    if f > 0.0:
+        weight, edge_note = _mix_edge_weight(weight, vol, f=f, dx=dx, dz=dz,
+                                             sigma_vox=float(edge_sigma_vox))
     if roi_box_mm is not None and float(roi_weight) != 1.0:
         ox, oy, oz = (float(v) for v in geometry.get('vol_origin',
                                                      (0.0, 0.0, 0.0)))
@@ -94,6 +118,16 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
             & ((cy >= lo[1]) & (cy <= hi[1]))[None, :, None] \
             & ((cz >= lo[2]) & (cz <= hi[2]))[None, None, :]
         weight = np.where(inside, weight * float(roi_weight), weight)
+        if f > 0.0:
+            mass_weight = np.where(inside, mass_weight * float(roi_weight),
+                                   mass_weight)
+    # The density calibration (`_finish`) targets the ROI-WEIGHTED mass of
+    # the reference, as it always has (the multiplier was applied before the
+    # sum): with an edge term the sampling weight is a unit-sum mixture and
+    # says nothing about mass, so the target is kept on the mass weight alone
+    # and is the same number whatever f is — the edge term moves primitives,
+    # it does not change what they add up to.
+    mass_mm = float((mass_weight if f > 0.0 else weight).sum()) * dx * dx * dz
 
     # Block-reduce before sampling. np.random.choice with an explicit p over
     # every voxel materialises a float64 probability vector: on a 909 M-voxel
@@ -131,14 +165,42 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
     # the first few hundred iterations toward axis-aligned structure.
     pos_mm += (rng.random(pos_mm.shape) - 0.5) * np.array([dx, dx, dz])
 
-    mass_mm = float(weight.sum()) * dx * dx * dz
     return _finish(pos_mm, mass_mm, world_scale=world_scale,
                    n_points=int(n_points), rng=rng, scale_factor=scale_factor,
                    verbose=verbose,
                    note=f"mass-proportional from a {nx}x{ny}x{nz} reference "
                         f"(noise floor q={noise_floor_quantile:g} -> "
-                        f"{floor:.5f} mm^-1)")
+                        f"{floor:.5f} mm^-1){edge_note}")
 
+
+
+def _mix_edge_weight(weight, vol, *, f: float, dx: float, dz: float,
+                     sigma_vox: float):
+    """``(1 - f) * mass + f * edge``, each normalised to unit sum.
+
+    ``edge`` is |grad| of the Gaussian-smoothed reference (mm^-1 per mm,
+    anisotropic voxels honoured) with its median over the volume subtracted
+    and clipped at zero: the median is the noise gradient of air and flat
+    tissue, so what remains is structure. Returns the mixed weight and a note
+    for the seeding line. A reference with no edge above the floor keeps the
+    mass weight untouched.
+    """
+    from scipy import ndimage
+    sm = ndimage.gaussian_filter(vol, sigma_vox) if sigma_vox > 0 else vol
+    g = np.zeros_like(vol)
+    for axis, h in enumerate((dx, dx, dz)):
+        d = np.gradient(sm, h, axis=axis)
+        g += d * d
+    g = np.sqrt(g, out=g)
+    gfloor = float(np.median(g[::3, ::3, ::3]))
+    edge = np.maximum(g - gfloor, 0.0)
+    etot = float(edge.sum())
+    mtot = float(weight.sum())
+    if etot <= 0.0 or mtot <= 0.0:
+        return weight, ' (edge weight: no edge above the floor, mass only)'
+    mixed = (1.0 - f) * (weight / mtot) + f * (edge / etot)
+    return mixed, (f' + edge-weighted f={f:g} (|grad| floor '
+                   f'{gfloor:.4g} mm^-2, sigma {sigma_vox:g} vox)')
 
 def seed_uniform(*, domain, world_scale, n_points, rng=None,
                  scale_factor: float = 1.0, mass_mm: float | None = None,
