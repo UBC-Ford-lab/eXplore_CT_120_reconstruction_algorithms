@@ -55,7 +55,8 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
                      noise_floor_quantile: float = 0.5, block: int = 2,
                      scale_factor: float = 1.0, rng=None, verbose: bool = True,
                      roi_box_mm=None, roi_weight: float = 1.0,
-                     edge_weight: float = 0.0, edge_sigma_vox: float = 1.0):
+                     edge_extra: int = 0, edge_floor_quantile: float = 0.9,
+                     edge_sigma_vox: float = 1.0):
     """Mass-proportional seed from a reference volume of mu in mm^-1.
 
     ``volume`` is (Nx, Ny, Nz) on the grid ``geometry`` describes. Returns
@@ -70,26 +71,34 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
     800 k). Those regions still need primitives, since their shadows are in
     every projection, but not at the ROI's resolution.
 
-    ``edge_weight`` = f in [0, 1] takes that share of the sampling weight from
-    the reference's EDGE STRENGTH instead of its mass: |grad| of the volume
-    smoothed by ``edge_sigma_vox`` voxels, with its median subtracted (the
-    noise gradient of flat regions and air, the same floor idea as the mass
-    floor). f = 0 is the mass-proportional seed above. WHY: the count is the
-    resolution budget and mass spends it where the attenuation is, not where
-    the structure is. MEASURED on Scan_1510 (2.4 M fixed cloud, prod recipe):
-    44 primitives per 1,000 voxels in flat soft tissue against 24 at bone
-    edges (|grad| 1.6-3.2 kHU/mm), because an edge is thin and carries little
-    mass — the seed is densest exactly where nothing needs resolving, which is
-    where the speckle comes from, and thinnest where the blur is. Growing the
-    cloud did not fix it: gated adaptive densification 2.4 -> 5 M multiplied
-    every edge-strength bin by the same 2.1-2.4x. The ROI multiplier applies
-    to the mixed weight; the density calibration still conserves the mass.
+    ``edge_extra`` ADDS that many primitives on top of the ``n_points`` mass
+    seed, drawn from the reference's edge strength alone: |grad| of the volume
+    smoothed by ``edge_sigma_vox`` voxels, where it clears its
+    ``edge_floor_quantile`` quantile over the voxels above the mass floor,
+    zero elsewhere and outside ``roi_box_mm`` when a box is given. The mass seed is drawn FIRST
+    with the same random stream, so its positions are byte-identical to the
+    run without extras: the additions change the cloud only where the
+    extras land (and the shared amplitude, which conserves the reference
+    mass over the larger width sum). WHY ADDITIVE, WHY THIS FLOOR. The mass
+    seed spends the budget where attenuation is, not where structure is —
+    MEASURED on Scan_1510 (2.4 M, prod recipe): 44 primitives per 1,000
+    voxels in flat soft tissue against 24 at bone edges (|grad| 1.6-3.2
+    kHU/mm). A MIXTURE of mass and edge weight (run 7qt0snoc, f = 0.5 with
+    the floor at the domain median) thinned soft tissue without reaching
+    bone: the FDK's soft-tissue noise gradient (~200 HU/mm) beats a floor set
+    by air (~150), so 57 % of the edge weight was noise texture and 23 % the
+    specimen outline and bed; bone's share went 12 -> 13 %. A floor at the
+    q90 of |grad| over above-floor voxels (~1.3 kHU/mm) puts 98 % of the edge
+    weight on real interfaces (bone 33 %), and adding rather than mixing
+    leaves the soft-tissue seed exactly as it was.
     """
     rng = np.random.default_rng() if rng is None else rng
     vol = np.asarray(volume, dtype=np.float32)
     nx, ny, nz = vol.shape
     dx = float(geometry['dx'])
     dz = float(geometry['dz'])
+    origin = tuple(float(v) for v in geometry.get('vol_origin',
+                                                  (0.0, 0.0, 0.0)))
 
     # A noise floor, subtracted before it becomes a sampling weight. Without it
     # every air voxel is a lottery ticket and most of the cloud lands in air —
@@ -99,91 +108,95 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
     sub = vol[::3, ::3, ::3].ravel()
     floor = float(np.quantile(sub, noise_floor_quantile))
     weight = np.maximum(vol - floor, 0.0)
-    f = float(edge_weight)
-    if not 0.0 <= f <= 1.0:
-        raise ValueError(f"edge_weight must be in [0, 1], got {f}")
-    edge_note = ''
-    mass_weight = weight
-    if f > 0.0:
-        weight, edge_note = _mix_edge_weight(weight, vol, f=f, dx=dx, dz=dz,
-                                             sigma_vox=float(edge_sigma_vox))
-    if roi_box_mm is not None and float(roi_weight) != 1.0:
-        ox, oy, oz = (float(v) for v in geometry.get('vol_origin',
-                                                     (0.0, 0.0, 0.0)))
-        lo, hi = (np.asarray(v, dtype=np.float64) for v in roi_box_mm)
-        cx = (np.arange(nx) - (nx - 1) / 2.0) * dx + ox
-        cy = (np.arange(ny) - (ny - 1) / 2.0) * dx + oy
-        cz = (np.arange(nz) - (nz - 1) / 2.0) * dz + oz
-        inside = ((cx >= lo[0]) & (cx <= hi[0]))[:, None, None] \
-            & ((cy >= lo[1]) & (cy <= hi[1]))[None, :, None] \
-            & ((cz >= lo[2]) & (cz <= hi[2]))[None, None, :]
-        weight = np.where(inside, weight * float(roi_weight), weight)
-        if f > 0.0:
-            mass_weight = np.where(inside, mass_weight * float(roi_weight),
-                                   mass_weight)
-    # The density calibration (`_finish`) targets the ROI-WEIGHTED mass of
-    # the reference, as it always has (the multiplier was applied before the
-    # sum): with an edge term the sampling weight is a unit-sum mixture and
-    # says nothing about mass, so the target is kept on the mass weight alone
-    # and is the same number whatever f is — the edge term moves primitives,
-    # it does not change what they add up to.
-    mass_mm = float((mass_weight if f > 0.0 else weight).sum()) * dx * dx * dz
-
-    # Block-reduce before sampling. np.random.choice with an explicit p over
-    # every voxel materialises a float64 probability vector: on a 909 M-voxel
-    # domain that is 7 GB and it will not run. Reducing by 2^3 first and then
-    # jittering uniformly inside the chosen block is the same distribution to
-    # within one block, at 1/8 the memory.
-    b = int(block)
-    nb = [max(1, d // b) for d in weight.shape]
-    trimmed = weight[:nb[0] * b, :nb[1] * b, :nb[2] * b]
-    blocks = trimmed.reshape(nb[0], b, nb[1], b, nb[2], b).sum(axis=(1, 3, 5))
-    flat = blocks.ravel().astype(np.float64)
-    total = flat.sum()
-    if total <= 0:
+    inside = None
+    if roi_box_mm is not None:
+        inside = _inside_box(vol.shape, roi_box_mm, dx=dx, dz=dz,
+                             origin=origin)
+        if float(roi_weight) != 1.0:
+            weight = np.where(inside, weight * float(roi_weight), weight)
+    if float(weight.sum()) <= 0:
         if verbose:
             print("  seeding: reference volume carries no mass above the "
                   "noise floor — falling back to uniform")
         return seed_uniform(domain=domain, world_scale=world_scale,
                             n_points=n_points, rng=rng,
                             scale_factor=scale_factor)
-    flat /= total
+    # The density calibration (`_finish`) targets the ROI-weighted mass, as
+    # it always has; the extras do not change it.
+    mass_mm = float(weight.sum()) * dx * dx * dz
+    pos_mm = _draw(weight, int(n_points), rng=rng, block=block, dx=dx, dz=dz,
+                   origin=origin)
+    note = (f"mass-proportional from a {nx}x{ny}x{nz} reference "
+            f"(noise floor q={noise_floor_quantile:g} -> {floor:.5f} mm^-1)")
+    n_extra = int(edge_extra)
+    if n_extra > 0:
+        ew, enote = _edge_weight(vol, above=vol > floor, inside=inside,
+                                 dx=dx, dz=dz, sigma_vox=float(edge_sigma_vox),
+                                 quantile=float(edge_floor_quantile))
+        if ew is not None:
+            pos_mm = np.concatenate([pos_mm, _draw(ew, n_extra, rng=rng,
+                                                   block=block, dx=dx, dz=dz,
+                                                   origin=origin)])
+        note += enote
+    return _finish(pos_mm, mass_mm, world_scale=world_scale,
+                   n_points=len(pos_mm), rng=rng, scale_factor=scale_factor,
+                   verbose=verbose, note=note)
 
-    pick = rng.choice(flat.size, size=int(n_points), replace=True, p=flat)
+
+def _inside_box(shape, box_mm, *, dx, dz, origin):
+    """Boolean mask of the grid voxels whose centres lie in ``box_mm``."""
+    nx, ny, nz = shape
+    ox, oy, oz = origin
+    lo, hi = (np.asarray(v, dtype=np.float64) for v in box_mm)
+    cx = (np.arange(nx) - (nx - 1) / 2.0) * dx + ox
+    cy = (np.arange(ny) - (ny - 1) / 2.0) * dx + oy
+    cz = (np.arange(nz) - (nz - 1) / 2.0) * dz + oz
+    return ((cx >= lo[0]) & (cx <= hi[0]))[:, None, None] \
+        & ((cy >= lo[1]) & (cy <= hi[1]))[None, :, None] \
+        & ((cz >= lo[2]) & (cz <= hi[2]))[None, None, :]
+
+
+def _draw(weight, n, *, rng, block, dx, dz, origin):
+    """``n`` positions in mm sampled in proportion to ``weight`` (>= 0).
+
+    Block-reduce before sampling. np.random.choice with an explicit p over
+    every voxel materialises a float64 probability vector: on a 909 M-voxel
+    domain that is 7 GB and it will not run. Reducing by 2^3 first and then
+    jittering uniformly inside the chosen block is the same distribution to
+    within one block, at 1/8 the memory. Then a jitter within the voxel so
+    the seed is not a lattice; a lattice biases the first few hundred
+    iterations toward axis-aligned structure.
+    """
+    nx, ny, nz = weight.shape
+    b = int(block)
+    nb = [max(1, d // b) for d in weight.shape]
+    trimmed = weight[:nb[0] * b, :nb[1] * b, :nb[2] * b]
+    blocks = trimmed.reshape(nb[0], b, nb[1], b, nb[2], b).sum(axis=(1, 3, 5))
+    flat = blocks.ravel().astype(np.float64)
+    flat /= flat.sum()
+    pick = rng.choice(flat.size, size=int(n), replace=True, p=flat)
     bi = np.stack(np.unravel_index(pick, blocks.shape), axis=-1)
     idx = bi * b + rng.integers(0, b, size=bi.shape)
     idx = np.minimum(idx, np.array([nx - 1, ny - 1, nz - 1]))
-
-    # Voxel index -> mm, with the grid's own origin, then -> normalised world.
-    ox, oy, oz = (float(v) for v in geometry.get('vol_origin', (0.0, 0.0, 0.0)))
+    ox, oy, oz = origin
     pos_mm = np.stack([
         (idx[:, 0] - (nx - 1) / 2.0) * dx + ox,
         (idx[:, 1] - (ny - 1) / 2.0) * dx + oy,
         (idx[:, 2] - (nz - 1) / 2.0) * dz + oz,
     ], axis=-1)
-    # Jitter within the voxel so the seed is not a lattice; a lattice biases
-    # the first few hundred iterations toward axis-aligned structure.
     pos_mm += (rng.random(pos_mm.shape) - 0.5) * np.array([dx, dx, dz])
-
-    return _finish(pos_mm, mass_mm, world_scale=world_scale,
-                   n_points=int(n_points), rng=rng, scale_factor=scale_factor,
-                   verbose=verbose,
-                   note=f"mass-proportional from a {nx}x{ny}x{nz} reference "
-                        f"(noise floor q={noise_floor_quantile:g} -> "
-                        f"{floor:.5f} mm^-1){edge_note}")
+    return pos_mm
 
 
+def _edge_weight(vol, *, above, inside, dx, dz, sigma_vox, quantile):
+    """Edge-strength sampling weight, or None when nothing clears the floor.
 
-def _mix_edge_weight(weight, vol, *, f: float, dx: float, dz: float,
-                     sigma_vox: float):
-    """``(1 - f) * mass + f * edge``, each normalised to unit sum.
-
-    ``edge`` is |grad| of the Gaussian-smoothed reference (mm^-1 per mm,
-    anisotropic voxels honoured) with its median over the volume subtracted
-    and clipped at zero: the median is the noise gradient of air and flat
-    tissue, so what remains is structure. Returns the mixed weight and a note
-    for the seeding line. A reference with no edge above the floor keeps the
-    mass weight untouched.
+    |grad| of the Gaussian-smoothed reference (mm^-1 per mm, anisotropic
+    voxels honoured) where it clears its ``quantile`` over the
+    ``above``-floor voxels (the specimen, not the air: a floor taken over
+    the whole domain is the air noise gradient, which the tissue noise
+    gradient beats everywhere — see `seed_from_volume`), zero elsewhere and
+    outside ``inside`` when given. Returns the weight and a note for the seeding line.
     """
     from scipy import ndimage
     sm = ndimage.gaussian_filter(vol, sigma_vox) if sigma_vox > 0 else vol
@@ -192,15 +205,22 @@ def _mix_edge_weight(weight, vol, *, f: float, dx: float, dz: float,
         d = np.gradient(sm, h, axis=axis)
         g += d * d
     g = np.sqrt(g, out=g)
-    gfloor = float(np.median(g[::3, ::3, ::3]))
-    edge = np.maximum(g - gfloor, 0.0)
-    etot = float(edge.sum())
-    mtot = float(weight.sum())
-    if etot <= 0.0 or mtot <= 0.0:
-        return weight, ' (edge weight: no edge above the floor, mass only)'
-    mixed = (1.0 - f) * (weight / mtot) + f * (edge / etot)
-    return mixed, (f' + edge-weighted f={f:g} (|grad| floor '
-                   f'{gfloor:.4g} mm^-2, sigma {sigma_vox:g} vox)')
+    ref = g[above][::5] if bool(above.any()) else g.ravel()[::5]
+    gfloor = float(np.quantile(ref, quantile)) if ref.size else 0.0
+    # Weight = |grad| where it clears the floor, zero elsewhere (a threshold,
+    # not a subtraction: on a plateau of equal edge values the quantile IS
+    # the maximum and subtraction would leave nothing).
+    edge = np.where((g >= gfloor) & (g > 0.0), g, 0.0)
+    if inside is not None:
+        edge = np.where(inside, edge, 0.0)
+    if float(edge.sum()) <= 0.0:
+        return None, ' (edge extras: nothing above the floor, none added)'
+    share = (100.0 * float(edge[above].sum()) / float(edge.sum())
+             if bool(above.any()) else 100.0)
+    return edge, (f' + edge-only extras (|grad| floor q{quantile:g} = '
+                  f'{gfloor:.4g} mm^-2, sigma {sigma_vox:g} vox, '
+                  f'{share:.0f} % of the weight above the mass floor)')
+
 
 def seed_uniform(*, domain, world_scale, n_points, rng=None,
                  scale_factor: float = 1.0, mass_mm: float | None = None,

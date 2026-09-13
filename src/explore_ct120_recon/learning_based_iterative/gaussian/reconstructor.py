@@ -114,7 +114,8 @@ class GaussianReconstructor(LearnedReconstructor):
                  density_reg: float = 0.01,
                  scale_reg: float = 0.0,
                  seed_roi_weight: float = 1.0,
-                 seed_edge_weight: float = 0.0,
+                 seed_edge_extra: int = 0,
+                 seed_edge_floor: float = 0.9,
                  signed_density: float = 0.0,
                  lr_multipliers: dict | None = None,
                  photometric: str = 'auto',
@@ -125,7 +126,12 @@ class GaussianReconstructor(LearnedReconstructor):
                  export_chunk_voxels: int = DEFAULT_MAX_VOXELS,
                  **kwargs):
         self.cfg = dict(
-            n_seed=int(n_seed), max_gaussians=int(max_gaussians),
+            n_seed=int(n_seed),
+            # the cap admits the seed plus its edge extras (fixed control
+            # never grows, but the footprint and the L-curve snapshots size
+            # themselves on the cap)
+            max_gaussians=max(int(max_gaussians),
+                              int(n_seed) + int(seed_edge_extra)),
             seed_from=str(seed_from), seed_scale=float(seed_scale),
             seed_floor_quantile=float(seed_floor_quantile),
             densify_from=float(densify_from),
@@ -151,7 +157,8 @@ class GaussianReconstructor(LearnedReconstructor):
             mcmc_dead_frac=float(mcmc_dead_frac),
             mcmc_noise=float(mcmc_noise), density_reg=float(density_reg),
             scale_reg=float(scale_reg), seed_roi_weight=float(seed_roi_weight),
-            seed_edge_weight=float(seed_edge_weight),
+            seed_edge_extra=int(seed_edge_extra),
+            seed_edge_floor=float(seed_edge_floor),
             signed_density=float(signed_density),
             lr_multipliers=dict(lr_multipliers or {}),
             photometric=str(photometric), photometric_reg=float(photometric_reg),
@@ -1080,7 +1087,8 @@ class GaussianReconstructor(LearnedReconstructor):
                 scale_factor=self.cfg['seed_scale'], rng=rng,
                 roi_box_mm=self._roi_box_mm(1.0),
                 roi_weight=self.cfg['seed_roi_weight'],
-                edge_weight=self.cfg['seed_edge_weight'])
+                edge_extra=self.cfg['seed_edge_extra'],
+                edge_floor_quantile=self.cfg['seed_edge_floor'])
         xyz, scaling, rotation, density = parts
         # Report the width against the pitch it will be exported onto. A cloud
         # of width sigma can only represent `G_sigma * (non-negative measure)`,
