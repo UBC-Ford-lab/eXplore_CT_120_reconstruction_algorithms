@@ -82,11 +82,22 @@ from .model import GaussianCloud
 from .photometric import PhotometricModel
 
 
+def _resolve_cap(max_gaussians, n_seed) -> int:
+    """The primitive cap is never below the seed: fixed density control
+    keeps the seed as it is, and the footprint, the L-curve snapshots and
+    the densifier all size themselves on the cap. An 'auto' seed is sized
+    later, from the reference, so here the cap stands on its own."""
+    cap = int(max_gaussians)
+    if str(n_seed) != 'auto':
+        cap = max(cap, int(n_seed))
+    return cap
+
+
 class GaussianReconstructor(LearnedReconstructor):
     """A cloud of anisotropic Gaussians, fitted one view at a time."""
 
     def __init__(self, projections, angles, geometry, *,
-                 n_seed: int = 300_000,
+                 n_seed: int | str = 300_000,
                  max_gaussians: int = 2_000_000,
                  seed_from: str = 'fdk',
                  seed_scale: float = 1.0,
@@ -114,8 +125,7 @@ class GaussianReconstructor(LearnedReconstructor):
                  density_reg: float = 0.01,
                  scale_reg: float = 0.0,
                  seed_roi_weight: float = 1.0,
-                 seed_edge_extra: int = 0,
-                 seed_edge_floor: float = 0.9,
+                 seed_spacing_mm: float | None = None,
                  signed_density: float = 0.0,
                  lr_multipliers: dict | None = None,
                  photometric: str = 'auto',
@@ -126,12 +136,14 @@ class GaussianReconstructor(LearnedReconstructor):
                  export_chunk_voxels: int = DEFAULT_MAX_VOXELS,
                  **kwargs):
         self.cfg = dict(
-            n_seed=int(n_seed),
-            # the cap admits the seed plus its edge extras (fixed control
-            # never grows, but the footprint and the L-curve snapshots size
-            # themselves on the cap)
-            max_gaussians=max(int(max_gaussians),
-                              int(n_seed) + int(seed_edge_extra)),
+            n_seed=('auto' if str(n_seed) == 'auto' else int(n_seed)),
+            # The cap admits the seed (fixed control never grows, but the
+            # footprint and the L-curve snapshots size themselves on the
+            # cap). An 'auto' seed is only known once the reference exists;
+            # `_seed` lifts the cap again then.
+            max_gaussians=_resolve_cap(max_gaussians, n_seed),
+            seed_spacing_mm=(None if seed_spacing_mm is None
+                             else float(seed_spacing_mm)),
             seed_from=str(seed_from), seed_scale=float(seed_scale),
             seed_floor_quantile=float(seed_floor_quantile),
             densify_from=float(densify_from),
@@ -157,8 +169,6 @@ class GaussianReconstructor(LearnedReconstructor):
             mcmc_dead_frac=float(mcmc_dead_frac),
             mcmc_noise=float(mcmc_noise), density_reg=float(density_reg),
             scale_reg=float(scale_reg), seed_roi_weight=float(seed_roi_weight),
-            seed_edge_extra=int(seed_edge_extra),
-            seed_edge_floor=float(seed_edge_floor),
             signed_density=float(signed_density),
             lr_multipliers=dict(lr_multipliers or {}),
             photometric=str(photometric), photometric_reg=float(photometric_reg),
@@ -1073,23 +1083,34 @@ class GaussianReconstructor(LearnedReconstructor):
 
     def _seed(self, domain, rng, device) -> GaussianCloud:
         ref = self._reference_volume()
+        n_seed = self.cfg['n_seed']
         if ref is None:
+            if n_seed == 'auto':
+                # No reference means no specimen to size against: the cap is
+                # the only count on hand (the production default).
+                n_seed = int(self.cfg['max_gaussians'])
+                print(f"  seeding: count 'auto' needs a reference volume; "
+                      f"using the cap, {n_seed:,d}")
             parts = seeding.seed_uniform(
                 domain=domain, world_scale=self.world_scale,
-                n_points=self.cfg['n_seed'], rng=rng,
+                n_points=n_seed, rng=rng,
                 scale_factor=self.cfg['seed_scale'])
         else:
             ref_vol, ref_geom = ref
             parts = seeding.seed_from_volume(
                 ref_vol, geometry=ref_geom, domain=domain,
-                world_scale=self.world_scale, n_points=self.cfg['n_seed'],
+                world_scale=self.world_scale, n_points=n_seed,
                 noise_floor_quantile=self.cfg['seed_floor_quantile'],
                 scale_factor=self.cfg['seed_scale'], rng=rng,
                 roi_box_mm=self._roi_box_mm(1.0),
                 roi_weight=self.cfg['seed_roi_weight'],
-                edge_extra=self.cfg['seed_edge_extra'],
-                edge_floor_quantile=self.cfg['seed_edge_floor'])
+                spacing_mm=self.cfg['seed_spacing_mm'])
         xyz, scaling, rotation, density = parts
+        # The resolved count is the run's count from here on: the config the
+        # run reports, and the cap the snapshots and density control use.
+        self.cfg['n_seed'] = int(len(xyz))
+        self.cfg['max_gaussians'] = max(int(self.cfg['max_gaussians']),
+                                        int(len(xyz)))
         # Report the width against the pitch it will be exported onto. A cloud
         # of width sigma can only represent `G_sigma * (non-negative measure)`,
         # so this ratio is the resolution ceiling AT THE START, and how far the
@@ -1100,10 +1121,15 @@ class GaussianReconstructor(LearnedReconstructor):
         sigma_mm = float(np.median(np.asarray(scaling))) / self.world_scale
         pitch = float(np.mean([self.geometry['dx'], self.geometry['dx'],
                                self.geometry['dz']]))
+        target = self.cfg['seed_spacing_mm']
         print(f"    seed width {sigma_mm:.4f} mm = {sigma_mm / pitch:.1f}x the "
               f"{pitch:.4f} mm voxel  (FWHM {2.3548 * sigma_mm:.3f} mm; "
               f"MTF at 1 lp/mm = "
-              f"{math.exp(-2 * math.pi ** 2 * sigma_mm ** 2):.3g})")
+              f"{math.exp(-2 * math.pi ** 2 * sigma_mm ** 2):.3g})"
+              + ("" if not target else
+                 f"; {sigma_mm / target:.2f}x the {target:g} mm target "
+                 f"spacing (the whole cloud, bed included; the ROI is "
+                 f"seeded at the target)"))
         # Density is seeded in mm^-1 and the kernel works in rendered units.
         return GaussianCloud(xyz, scaling, rotation,
                              density * self.signal_scale).to(device)

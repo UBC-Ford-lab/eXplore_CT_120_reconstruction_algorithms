@@ -110,6 +110,22 @@ MU_WATER_80KV = 0.0219  # mm⁻¹
 # Linear attenuation coefficient of air (effectively zero)
 MU_AIR = 0.0  # mm⁻¹
 
+# System point-spread function of the CT120, Gaussian sigma in mm at the
+# ISOCENTRE. MEASURED on Scan_1510 (2026-09-06/07), twice: the animal-holder
+# tube's tangent cusp fitted in 469 projection bands gave 8.95 raw px = 0.253
+# mm at the detector = 0.224 mm at the isocentre (M = 1.131), flat across
+# gantry angle and across magnification 20-70 mm => DETECTOR-dominated
+# (scintillator/optics), not focal-spot or geometry; and the bed rod's edge
+# in the volume gave erf sigma 0.23-0.25 mm in every reconstruction, the
+# vendor's included. It is a property of the detector, not of the protocol:
+# kV/mA change the noise, downsampling adds only (ds px)^2/12 in quadrature
+# (0.75 px^2 at ds3 against 80). The column direction only; rows unmeasured.
+# It is NOT measured automatically — a new detector needs the tube-cusp fit
+# (scratch scripts psf_fit.py / psf_fit_rod.py in the muNeRF session
+# record) or a blade radiograph, and this constant updated with provenance.
+# Used by the Gaussian seeder to size the cloud (`--gauss-seed-spacing`).
+PSF_SIGMA_MM = 0.22  # mm at the isocentre
+
 
 def parse_calibration_from_xml(xml_path: str) -> Dict[str, float]:
     """

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 
+from ...ct_core.calibration import PSF_SIGMA_MM
 from ...ct_core.preflight import Footprint, MachineRequest
 from ..losses import resident_sinogram_copies
 from ..registry import LearnedAlgorithm
@@ -65,13 +66,26 @@ SEED_SINO_COPIES = 6
 #: reasonable step and mu's scale is irrelevant.
 DEFAULT_LR = 1e-4
 
-#: Production cloud size (seed = cap under fixed density control). MEASURED
-#: Scan_1510 ds3: 3.06 GiB resident in training (~0.7 kB per primitive above
-#: the sinogram), 188 min to the 16 000-iteration cap on a P100 at ~1.4 it/s.
-#: The seed's ROI weight of 5 puts ~2.0 M of these inside the delivered ROI
-#: and keeps ~0.4 M on the bed and the truncated periphery, whose shadows are
-#: in every projection (see --gauss-seed-roi-weight).
+#: The primitive CAP, and the count a run without a reference falls back to.
+#: The production seed count itself is 'auto' (see --gauss-seeds): sized so
+#: the seed spacing inside the ROI equals the scanner PSF sigma, which gives
+#: ~2.0 M on Scan_1510 at 0.22 mm; the hand-picked 2.4 M of the 2026-09
+#: sweep (0.94 sigma) was the same regime. MEASURED Scan_1510 ds3 at 2.4 M:
+#: 3.06 GiB resident in training (~0.7 kB per primitive above the sinogram),
+#: 188 min to the 16 000-iteration cap on a P100 at ~1.4 it/s. The seed's
+#: ROI weight of 5 keeps ~1/6 of the cloud on the bed and the truncated
+#: periphery, whose shadows are in every projection (--gauss-seed-roi-weight).
 DEFAULT_N_GAUSSIANS = 2_400_000
+
+
+def _seed_count(text):
+    """``--gauss-seeds``: 'auto' or a positive integer."""
+    if str(text).strip().lower() == 'auto':
+        return 'auto'
+    n = int(text)
+    if n <= 0:
+        raise argparse.ArgumentTypeError('--gauss-seeds must be positive')
+    return n
 
 
 def add_args(group) -> None:
@@ -81,19 +95,35 @@ def add_args(group) -> None:
     algorithm, so these attach directly rather than nesting another one.
     """
     g = group
-    g.add_argument('--gauss-seeds', type=int, default=DEFAULT_N_GAUSSIANS,
-                   dest='gauss_seeds',
-                   help='primitives to start from (default: %(default)s, the '
-                        'production budget: ~0.7 kB each so VRAM is not the '
-                        'limit, wall-clock is — it/s ~ 1/N). Splatting cannot '
-                        'create matter where no primitive was seeded, so this '
-                        'is a floor on what the model can represent, not just '
-                        'a speed knob.')
+    g.add_argument('--gauss-seeds', type=_seed_count, default='auto',
+                   dest='gauss_seeds', metavar='N|auto',
+                   help="primitives to start from (default: auto = as many as "
+                        "put the seed spacing inside the ROI at "
+                        "--gauss-seed-spacing; ~2.0 M on Scan_1510). A cloud "
+                        "at spacing D reproduces an image blurred by sigma to "
+                        "exp(-pi^2 sigma^2 / 2 D^2): under 1 %% at D = sigma, "
+                        "and MEASURED (count sweep 2.4-19.2 M) every "
+                        "primitive beyond that fits photon noise as speckle "
+                        "with no held-out gain. Splatting cannot create "
+                        "matter where no primitive was seeded, so an explicit "
+                        "N is a floor on what the model can represent, not "
+                        "just a speed knob (~0.7 kB each; it/s ~ 1/N).")
+    g.add_argument('--gauss-seed-spacing', type=float, default=PSF_SIGMA_MM,
+                   dest='gauss_seed_spacing', metavar='MM',
+                   help='target seed spacing in mm for --gauss-seeds auto: '
+                        'the mass-weighted median spacing inside the export '
+                        'ROI (default: %(default)s = the CT120 system PSF '
+                        'sigma at the isocentre, MEASURED, a detector '
+                        'constant — see ct_core.calibration.PSF_SIGMA_MM). '
+                        'Smaller = more primitives and more speckle, larger '
+                        '= fewer and blobbier; the PSF is where resolution is '
+                        'complete.')
     g.add_argument('--gauss-max', type=int, default=DEFAULT_N_GAUSSIANS,
                    dest='gauss_max',
                    help='cap on primitives after densification (default: '
-                        '%(default)s = the seed count, i.e. no growth under '
-                        'the default fixed density control).')
+                        '%(default)s; lifted to the seed count when that is '
+                        'larger, so under the default fixed density control '
+                        'there is no growth).')
     g.add_argument('--gauss-seed-from', choices=('fdk', 'uniform'),
                    default='fdk', dest='gauss_seed_from',
                    help="'fdk' (default) seeds mass-proportionally from an FDK "
@@ -209,23 +239,6 @@ def add_args(group) -> None:
                         'to ADD budget inside while keeping the outside count '
                         'of a known-good run: W ~ N_total / N_outside - 1 '
                         '(2.4 M with 400 k outside -> W=5).')
-    g.add_argument('--gauss-seed-edge-extra', type=int, default=0,
-                   dest='gauss_seed_edge_extra', metavar='N',
-                   help='add N primitives ON TOP of the mass-proportional '
-                        "seed, drawn from the reference's edge strength "
-                        'alone (|grad| above its --gauss-seed-edge-floor '
-                        'quantile, inside the export ROI). The mass seed is '
-                        'drawn first with the same random stream, so soft '
-                        'tissue is seeded exactly as without extras; only '
-                        'the edges get denser. MEASURED on Scan_1510: the '
-                        'mass seed puts 43 primitives per 1k voxels at bone '
-                        'edges; +400k is estimated to give 169 (default: 0).')
-    g.add_argument('--gauss-seed-edge-floor', type=float, default=0.9,
-                   dest='gauss_seed_edge_floor', metavar='Q',
-                   help='quantile of |grad| over the above-floor voxels below '
-                        'which the edge extras see no edge (default: 0.9). '
-                        "At 0.5 the FDK's soft-tissue noise gradient passes "
-                        'and the extras become texture, not edges.')
     g.add_argument('--gauss-signed-density', type=float, default=0.0,
                    metavar='F', dest='gauss_signed_density',
                    help='allow NEGATIVE amplitudes down to -F x the seed '
@@ -360,6 +373,12 @@ RETIRED_FLAGS = {
     '--gauss-wls-seam-t': "--gauss-wls-seam-t is retired: it is --wls-seam-t.",
     '--gauss-dssim': "--gauss-dssim is retired: --loss l1_dssim "
                      "--loss-option dssim_weight=W.",
+    '--gauss-seed-edge-extra': "--gauss-seed-edge-extra is retired: edge "
+                               "extras were MEASURED to change nothing (the "
+                               "bone edge is PSF-limited); the seed is "
+                               "mass-only, sized by --gauss-seeds auto.",
+    '--gauss-seed-edge-floor': "--gauss-seed-edge-floor is retired with "
+                               "--gauss-seed-edge-extra.",
 }
 RETIRED_DESTS = {k: 'retired_' + k.strip('-').replace('-', '_')
                  for k in RETIRED_FLAGS}
@@ -426,8 +445,9 @@ def options(args) -> dict:
             raise ValueError(RETIRED_FLAGS['--' + stale.replace('_', '-')])
     frm, until = args.gauss_densify_window
     return dict(
-        n_seed=int(args.gauss_seeds),
+        n_seed=_seed_count(args.gauss_seeds),
         max_gaussians=int(args.gauss_max),
+        seed_spacing_mm=float(args.gauss_seed_spacing),
         seed_from=str(args.gauss_seed_from),
         seed_scale=float(args.gauss_seed_scale),
         seed_floor_quantile=float(args.gauss_seed_floor),
@@ -452,8 +472,6 @@ def options(args) -> dict:
         density_reg=float(args.gauss_density_reg),
         scale_reg=float(args.gauss_scale_reg),
         seed_roi_weight=float(args.gauss_seed_roi_weight),
-        seed_edge_extra=int(args.gauss_seed_edge_extra),
-        seed_edge_floor=float(args.gauss_seed_edge_floor),
         signed_density=float(args.gauss_signed_density),
         photometric=str(args.gauss_photometric),
         photometric_reg=float(args.gauss_photometric_reg),

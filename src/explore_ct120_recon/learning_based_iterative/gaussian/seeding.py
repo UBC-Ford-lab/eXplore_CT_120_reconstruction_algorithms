@@ -55,8 +55,7 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
                      noise_floor_quantile: float = 0.5, block: int = 2,
                      scale_factor: float = 1.0, rng=None, verbose: bool = True,
                      roi_box_mm=None, roi_weight: float = 1.0,
-                     edge_extra: int = 0, edge_floor_quantile: float = 0.9,
-                     edge_sigma_vox: float = 1.0):
+                     spacing_mm: float | None = None):
     """Mass-proportional seed from a reference volume of mu in mm^-1.
 
     ``volume`` is (Nx, Ny, Nz) on the grid ``geometry`` describes. Returns
@@ -71,26 +70,16 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
     800 k). Those regions still need primitives, since their shadows are in
     every projection, but not at the ROI's resolution.
 
-    ``edge_extra`` ADDS that many primitives on top of the ``n_points`` mass
-    seed, drawn from the reference's edge strength alone: |grad| of the volume
-    smoothed by ``edge_sigma_vox`` voxels, where it clears its
-    ``edge_floor_quantile`` quantile over the voxels above the mass floor,
-    zero elsewhere and outside ``roi_box_mm`` when a box is given. The mass seed is drawn FIRST
-    with the same random stream, so its positions are byte-identical to the
-    run without extras: the additions change the cloud only where the
-    extras land (and the shared amplitude, which conserves the reference
-    mass over the larger width sum). WHY ADDITIVE, WHY THIS FLOOR. The mass
-    seed spends the budget where attenuation is, not where structure is —
-    MEASURED on Scan_1510 (2.4 M, prod recipe): 44 primitives per 1,000
-    voxels in flat soft tissue against 24 at bone edges (|grad| 1.6-3.2
-    kHU/mm). A MIXTURE of mass and edge weight (run 7qt0snoc, f = 0.5 with
-    the floor at the domain median) thinned soft tissue without reaching
-    bone: the FDK's soft-tissue noise gradient (~200 HU/mm) beats a floor set
-    by air (~150), so 57 % of the edge weight was noise texture and 23 % the
-    specimen outline and bed; bone's share went 12 -> 13 %. A floor at the
-    q90 of |grad| over above-floor voxels (~1.3 kHU/mm) puts 98 % of the edge
-    weight on real interfaces (bone 33 %), and adding rather than mixing
-    leaves the soft-tissue seed exactly as it was.
+    ``n_points='auto'`` derives the count from ``spacing_mm`` — see
+    `seed_count_for_spacing` — so the cloud is sized by physics rather than
+    by a per-scan constant. WHY NOT AN EDGE-WEIGHTED SEED. Mass-proportional
+    placement already gives every part of the specimen about one primitive
+    per cell (MEASURED Scan_1510, 2.4 M: 45 per 1,000 voxels in flat tissue,
+    47-50 at bone edges, narrowing to 0.10 mm there), and adding 400 k edge
+    primitives (run 71godme5, +60 % at bone edges) changed nothing: the
+    bone edge is rendered at the scanner PSF (10-90 % width 0.55 mm =
+    2.56 x 0.215 mm) whatever the count. More primitives at an interface
+    are a null direction of the forward model, so the seed stays mass-only.
     """
     rng = np.random.default_rng() if rng is None else rng
     vol = np.asarray(volume, dtype=np.float32)
@@ -121,26 +110,85 @@ def seed_from_volume(volume, *, geometry, domain, world_scale, n_points,
         return seed_uniform(domain=domain, world_scale=world_scale,
                             n_points=n_points, rng=rng,
                             scale_factor=scale_factor)
-    # The density calibration (`_finish`) targets the ROI-weighted mass, as
-    # it always has; the extras do not change it.
     mass_mm = float(weight.sum()) * dx * dx * dz
-    pos_mm = _draw(weight, int(n_points), rng=rng, block=block, dx=dx, dz=dz,
-                   origin=origin)
     note = (f"mass-proportional from a {nx}x{ny}x{nz} reference "
             f"(noise floor q={noise_floor_quantile:g} -> {floor:.5f} mm^-1)")
-    n_extra = int(edge_extra)
-    if n_extra > 0:
-        ew, enote = _edge_weight(vol, above=vol > floor, inside=inside,
-                                 dx=dx, dz=dz, sigma_vox=float(edge_sigma_vox),
-                                 quantile=float(edge_floor_quantile))
-        if ew is not None:
-            pos_mm = np.concatenate([pos_mm, _draw(ew, n_extra, rng=rng,
-                                                   block=block, dx=dx, dz=dz,
-                                                   origin=origin)])
-        note += enote
+    if isinstance(n_points, str) or n_points is None:
+        if spacing_mm is None:
+            raise ValueError("n_points='auto' needs spacing_mm")
+        n_points, cnote = _count_for_spacing(weight, inside, dx=dx, dz=dz,
+                                             spacing_mm=float(spacing_mm))
+        note += cnote
+    pos_mm = _draw(weight, int(n_points), rng=rng, block=block, dx=dx, dz=dz,
+                   origin=origin)
     return _finish(pos_mm, mass_mm, world_scale=world_scale,
                    n_points=len(pos_mm), rng=rng, scale_factor=scale_factor,
                    verbose=verbose, note=note)
+
+
+def seed_count_for_spacing(volume, *, geometry, spacing_mm: float,
+                           noise_floor_quantile: float = 0.5,
+                           roi_box_mm=None, roi_weight: float = 1.0) -> int:
+    """The primitive count at which the seed's spacing equals ``spacing_mm``.
+
+    WHY A SPACING RULE. A cloud of Gaussians is a sampled basis: at mean
+    spacing D it reproduces an image band-limited by a Gaussian of width
+    sigma with an aliasing error of ``exp(-pi^2 sigma^2 / (2 D^2))`` — under
+    1 % at D = sigma, 3 % at 1.2 sigma, and nothing left to gain below
+    sigma. The reconstructed image IS band-limited by the scanner's PSF
+    (MEASURED 0.22 mm at the isocentre on the CT120; every reconstruction,
+    the vendor's included, renders edges at that width), so D = sigma_PSF
+    is resolution-complete and every primitive beyond it can only fit
+    photon noise. The count sweep on Scan_1510 (2.4 / 4.8 / 9.6 / 19.2 M)
+    measured exactly that: the 2.4 M optimum has D = 0.94 sigma_PSF inside
+    the specimen; 4.8 M (0.75 sigma) already speckled with no held-out gain.
+    This rule returns 2.0 M for Scan_1510 at 0.22 mm and scales with the
+    specimen's volume instead of carrying a per-scan number.
+
+    HOW. With sampling weight w_i per voxel of volume dV, the expected count
+    in voxel i is ``n w_i / sum(w)`` and the local spacing
+    ``(dV sum(w) / (n w_i))^(1/3)``. The spacing is pinned at the
+    MASS-WEIGHTED MEDIAN voxel (half the seed lands in voxels denser than
+    it, half in sparser ones) of the voxels inside ``roi_box_mm`` (or all
+    voxels without a box): ``n = dV sum(w) / (w_med spacing^3)``. The bed and
+    the periphery keep their share through ``roi_weight`` exactly as in the
+    draw itself; they are seeded coarser, which is what they need.
+    """
+    vol = np.asarray(volume, dtype=np.float32)
+    dx = float(geometry['dx'])
+    dz = float(geometry['dz'])
+    origin = tuple(float(v) for v in geometry.get('vol_origin',
+                                                  (0.0, 0.0, 0.0)))
+    floor = float(np.quantile(vol[::3, ::3, ::3].ravel(),
+                              noise_floor_quantile))
+    weight = np.maximum(vol - floor, 0.0)
+    inside = None
+    if roi_box_mm is not None:
+        inside = _inside_box(vol.shape, roi_box_mm, dx=dx, dz=dz,
+                             origin=origin)
+        if float(roi_weight) != 1.0:
+            weight = np.where(inside, weight * float(roi_weight), weight)
+    n, _ = _count_for_spacing(weight, inside, dx=dx, dz=dz,
+                              spacing_mm=float(spacing_mm))
+    return n
+
+
+def _count_for_spacing(weight, inside, *, dx, dz, spacing_mm):
+    """`seed_count_for_spacing` on a weight map already built; returns the
+    count and a note for the seeding line."""
+    w = weight[inside] if inside is not None else weight
+    w = w[w > 0]
+    total = float(weight.sum())
+    if w.size == 0 or total <= 0 or spacing_mm <= 0:
+        raise ValueError("seed count for spacing: no mass inside the box")
+    order = np.argsort(w)
+    cum = np.cumsum(w[order])
+    w_med = float(w[order][np.searchsorted(cum, 0.5 * cum[-1])])
+    n = int(round(dx * dx * dz * total / (w_med * spacing_mm ** 3)))
+    n = max(n, 1)
+    return n, (f"; count {n:,d} = auto for a mass-weighted median spacing "
+               f"of {spacing_mm:g} mm"
+               + (" inside the ROI" if inside is not None else ""))
 
 
 def _inside_box(shape, box_mm, *, dx, dz, origin):
@@ -186,40 +234,6 @@ def _draw(weight, n, *, rng, block, dx, dz, origin):
     ], axis=-1)
     pos_mm += (rng.random(pos_mm.shape) - 0.5) * np.array([dx, dx, dz])
     return pos_mm
-
-
-def _edge_weight(vol, *, above, inside, dx, dz, sigma_vox, quantile):
-    """Edge-strength sampling weight, or None when nothing clears the floor.
-
-    |grad| of the Gaussian-smoothed reference (mm^-1 per mm, anisotropic
-    voxels honoured) where it clears its ``quantile`` over the
-    ``above``-floor voxels (the specimen, not the air: a floor taken over
-    the whole domain is the air noise gradient, which the tissue noise
-    gradient beats everywhere — see `seed_from_volume`), zero elsewhere and
-    outside ``inside`` when given. Returns the weight and a note for the seeding line.
-    """
-    from scipy import ndimage
-    sm = ndimage.gaussian_filter(vol, sigma_vox) if sigma_vox > 0 else vol
-    g = np.zeros_like(vol)
-    for axis, h in enumerate((dx, dx, dz)):
-        d = np.gradient(sm, h, axis=axis)
-        g += d * d
-    g = np.sqrt(g, out=g)
-    ref = g[above][::5] if bool(above.any()) else g.ravel()[::5]
-    gfloor = float(np.quantile(ref, quantile)) if ref.size else 0.0
-    # Weight = |grad| where it clears the floor, zero elsewhere (a threshold,
-    # not a subtraction: on a plateau of equal edge values the quantile IS
-    # the maximum and subtraction would leave nothing).
-    edge = np.where((g >= gfloor) & (g > 0.0), g, 0.0)
-    if inside is not None:
-        edge = np.where(inside, edge, 0.0)
-    if float(edge.sum()) <= 0.0:
-        return None, ' (edge extras: nothing above the floor, none added)'
-    share = (100.0 * float(edge[above].sum()) / float(edge.sum())
-             if bool(above.any()) else 100.0)
-    return edge, (f' + edge-only extras (|grad| floor q{quantile:g} = '
-                  f'{gfloor:.4g} mm^-2, sigma {sigma_vox:g} vox, '
-                  f'{share:.0f} % of the weight above the mass floor)')
 
 
 def seed_uniform(*, domain, world_scale, n_points, rng=None,
