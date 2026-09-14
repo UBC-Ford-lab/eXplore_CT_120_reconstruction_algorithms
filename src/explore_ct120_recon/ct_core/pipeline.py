@@ -18,7 +18,7 @@ The algorithm-independent stages live here, once:
   * ``resolve_detector_psi`` — the scan-keyed detector-psi calibration JSON
                                (written by muNeRF's half-scan self-calibration
                                or scripts/detector_psi_from_conjugates.py)
-  * ``save_outputs``         — HU calibration + bilateral filter + VFF export
+  * ``save_outputs``         — HU calibration + VFF export
 
 A reconstruction backend only has to honour the volume contract to be a
 drop-in replacement: take ``ctx.projections`` (raw counts, (N_angles, N_b,
@@ -161,26 +161,6 @@ def add_common_args(parser):
              '(default: %(default)s). Reduces GPU memory usage. Factor 2 halves each '
              'detector dimension (detector pixel size and central-pixel '
              'indices are converted consistently).'
-    )
-    parser.add_argument(
-        '--bilateral-filter',
-        action='store_true',
-        help='Apply bilateral filter to calibrated volume '
-             '(edge-preserving denoising)'
-    )
-    parser.add_argument(
-        '--bilateral-sigma-spatial',
-        type=float,
-        default=1.5,
-        help='Bilateral filter spatial sigma in mm (default: 1.5). '
-             'Converted to voxels using --voxel-xy.'
-    )
-    parser.add_argument(
-        '--bilateral-sigma-range',
-        type=float,
-        default=50.0,
-        help='Bilateral filter intensity sigma in HU (default: 50.0). '
-             'Controls edge-preservation threshold.'
     )
     parser.add_argument(
         '--cor-mode',
@@ -986,10 +966,6 @@ def save_outputs(volume, ctx: ScanContext, args, output_path: str,
         volume_mu=volume,
         geometry=ctx.geometry,
         output_path=output_path,
-        bilateral_filter=args.bilateral_filter,
-        bilateral_sigma_spatial=args.bilateral_sigma_spatial,
-        bilateral_sigma_range=args.bilateral_sigma_range,
-        voxel_xy=args.voxel_xy,
         hu_calibration=getattr(args, 'hu_calibration', 'auto'),
         mu_water=getattr(args, 'mu_water', None),
         tissue_hu=getattr(args, 'tissue_hu', None),

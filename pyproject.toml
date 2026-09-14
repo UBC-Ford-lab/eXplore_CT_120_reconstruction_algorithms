@@ -33,7 +33,6 @@ dependencies = [
     "xmltodict",
     "imageio",
     "matplotlib",
-    "opencv-python-headless",
     "tqdm",
     "platformdirs>=3.0",
 ]
@@ -53,6 +52,7 @@ ct120-fdk = "explore_ct120_recon.run_fdk_recon:cli"
 ct120-iterative = "explore_ct120_recon.run_iterative_recon:cli"
 ct120-learned = "explore_ct120_recon.run_learned_recon:cli"
 ct120-volume-report = "explore_ct120_recon.run_volume_report:cli"
+ct120-bilateral-filter = "explore_ct120_recon.run_bilateral_filter:cli"
 ct120-projection-report = "explore_ct120_recon.run_projection_report:cli"
 ct120-geometry-calibration = "explore_ct120_recon.run_geometry_calibration:cli"
 ct120-noise-calibration = "explore_ct120_recon.run_noise_calibration:cli"

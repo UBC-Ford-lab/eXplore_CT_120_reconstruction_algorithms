@@ -53,7 +53,7 @@ Python 3.10+ and PyTorch 2.0+. The import name is `explore_ct120_recon`.
 
 ## Usage
 
-Six commands are installed:
+Eight commands are installed:
 
 ```bash
 ct120-fdk data/scans/Scan_1988
@@ -62,6 +62,7 @@ ct120-iterative data/scans/Scan_1988 --backend tigre --algorithm ossart --tv-lam
 ct120-learned data/scans/Scan_1988 --downsample 3
 ct120-learned data/scans/Scan_1988 --algorithm gaussian
 ct120-volume-report VOLUME.vff
+ct120-bilateral-filter VOLUME.vff [SD]
 ct120-projection-report data/scans/Scan_1988 --volume a.vff --volume b.vff
 ct120-geometry-calibration data/scans/Scan_1988
 ct120-noise-calibration data/scans/Scan_1988
@@ -145,7 +146,12 @@ loop.
 ## Report tools
 
 `ct120-volume-report` draws slices, the HU histogram and the fitted anchors
-for any finished volume, including the vendor's. `ct120-projection-report`
+for any finished volume, including the vendor's. `ct120-bilateral-filter`
+is the lab's MATLAB `filter_vff.m`: every axial slice through `imbilatfilt`
+with its defaults (spatial sigma 1 voxel, 5 x 5, replicate padding) and
+`degreeOfSmoothing = 2*SD^2`, SD measured from the fixed patch
+`im(20:40,160:180,100)` when not given; writes `<volume>_imbilatfilt.vff`.
+`ct120-projection-report`
 forward-projects one or more volumes and scores them against the measured
 projections on the same angles and detector window.
 `ct120-geometry-calibration` pre-measures the detector rotation, for

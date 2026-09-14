@@ -258,7 +258,7 @@ def main():
                     visits=1.0, sampling=SWEEP),
         note="single backprojection pass over every measurement")
 
-    # Shared back half: HU calibration + bilateral filter + VFF export.
+    # Shared back half: HU calibration + VFF export.
     _, anchors, volume_hu = save_outputs(reconstructor.reconstructed_volume,
                                          ctx, args, output_path, logger=logger,
                                          algorithm='fdk')

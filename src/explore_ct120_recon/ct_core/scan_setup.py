@@ -8,11 +8,9 @@ used by both FDK and iterative reconstruction pipelines.
 import json
 import os
 import re
-import time
 from datetime import date
 from pathlib import Path
 
-import cv2
 import numpy as np
 import xmltodict
 
@@ -499,13 +497,13 @@ def _hist_mode(values, bins=256, clip_pct=(0.5, 99.5)):
 
 
 def postprocess_and_save(volume_mu, geometry, output_path,
-                         bilateral_filter=False,
-                         bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
-                         voxel_xy=0.075,
                          hu_calibration='auto', mu_water=None,
                          tissue_hu=None, save_mu=False, anchors=None,
                          metadata=None):
-    """Calibrate a reconstructed volume to HU, optionally filter it, write VFF.
+    """Calibrate a reconstructed volume to HU and write it as VFF.
+
+    Denoising is not done here: ``run_bilateral_filter`` (the lab's MATLAB
+    ``filter_vff``) filters the written file.
 
     ``volume_mu`` is linear attenuation (mm^-1) straight out of a backend:
     unclipped, unconverted. Every backend now returns exactly that, so this is
@@ -536,10 +534,6 @@ def postprocess_and_save(volume_mu, geometry, output_path,
         volume_mu: (x, y, z) attenuation array (numpy or torch).
         geometry: geometry dict; 'dx'/'dz' set the VFF voxel size.
         output_path: base path, no extension.
-        bilateral_filter: apply an edge-preserving denoise after calibration.
-        bilateral_sigma_spatial: bilateral spatial sigma in mm.
-        bilateral_sigma_range: bilateral intensity sigma in HU.
-        voxel_xy: voxel size in mm, for the bilateral sigma conversion.
         hu_calibration: 'auto' fits both anchors from this volume's histogram;
             'fixed' pins the gain to ``mu_water`` and air to zero attenuation,
             reproducing the classical one-point map through the same code path.
@@ -578,32 +572,6 @@ def postprocess_and_save(volume_mu, geometry, output_path,
     print(format_calibration(anchors))
     vol_calibrated = anchors.apply(vol_np)
 
-    # Optional bilateral filter (edge-preserving denoising)
-    if bilateral_filter:
-        print("\n" + "=" * 60)
-        print("Applying bilateral filter (edge-preserving denoising)")
-        print("=" * 60)
-
-        sigma_spatial_vox = bilateral_sigma_spatial / voxel_xy
-        print(f"  Spatial sigma: {bilateral_sigma_spatial:.2f} mm "
-              f"= {sigma_spatial_vox:.1f} voxels")
-        print(f"  Range sigma: {bilateral_sigma_range:.1f} HU")
-
-        t_bf = time.time()
-        Nz_slices = vol_calibrated.shape[2]
-        for z in range(Nz_slices):
-            vol_calibrated[:, :, z] = cv2.bilateralFilter(
-                vol_calibrated[:, :, z],
-                d=-1,
-                sigmaColor=bilateral_sigma_range,
-                sigmaSpace=sigma_spatial_vox,
-            )
-        t_bf_end = time.time()
-
-        print(f"  Filtered range: [{vol_calibrated.min():.0f}, {vol_calibrated.max():.0f}] HU")
-        print(f"  Bilateral filter applied in {t_bf_end - t_bf:.1f}s "
-              f"({Nz_slices} slices)")
-
     # elementsize is the GE `ncaa` scalar voxel size (mm); spacing is kept for
     # the anisotropy warning in write_vff (dz != dx cannot be expressed).
     vff_meta = {
@@ -632,19 +600,19 @@ def postprocess_and_save(volume_mu, geometry, output_path,
     # the air floor) and clips to the full int16 range with a warning, rather
     # than wrapping. Pre-casting here with .astype(np.int16), as this used to,
     # bypassed both protections.
-    cal_path = base + ('_bilateral.vff' if bilateral_filter else '.vff')
+    cal_path = base + '.vff'
     vol_vff = vol_calibrated.transpose(2, 1, 0)[:, ::-1, :]
     write_vff(cal_path, vff_meta, vol_vff)
     print(f"Calibrated VFF saved to: {cal_path}")
 
     write_sidecar(cal_path, geometry, anchors, shape=vol_calibrated.shape,
-                  bilateral_filter=bilateral_filter, metadata=metadata)
+                  metadata=metadata)
 
     return cal_path, anchors, vol_calibrated
 
 
 def write_sidecar(vff_path, geometry, anchors, *, shape=None,
-                  bilateral_filter=False, metadata=None):
+                  metadata=None):
     """Write the ``<volume>.json`` companion describing a saved volume.
 
     A GE ncaa header carries one scalar voxel size and an ``origin`` in the
@@ -676,7 +644,6 @@ def write_sidecar(vff_path, geometry, anchors, *, shape=None,
         # returns, NOT the (z, y, x) order of the VFF payload.
         'volume_shape': [Nx, Ny, Nz],
         'vol_origin_mm': [ox, oy, oz],
-        'bilateral_filter': bool(bilateral_filter),
         'hu_calibration': {k.split('/', 1)[-1]: v
                            for k, v in calibration_scalars(anchors).items()},
     }

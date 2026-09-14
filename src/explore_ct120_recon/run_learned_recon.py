@@ -1062,7 +1062,7 @@ def main(argv=None):
     vol_export, ctx.geometry = crop_to_export_roi(
         reconstructor.reconstructed_volume, ctx.geometry)
 
-    # Shared back half: HU calibration + bilateral filter + VFF export.
+    # Shared back half: HU calibration + VFF export.
     _, anchors, volume_hu = save_outputs(vol_export, ctx, args, output_path,
                                          logger=logger, algorithm=algorithm.name)
 

@@ -27,8 +27,10 @@ from .preprocessing import (
     downsample_projections,
 )
 from .utils import query_gpu_memory
+from . import bilateral
+from .bilateral import filter_vff, imbilatfilt
 
-# Optional modules with heavier dependencies (xmltodict, cv2, imageio)
+# Optional modules with heavier dependencies (xmltodict, imageio)
 # Wrapped so consumers that only need vff_io aren't blocked.
 try:
     from . import calibration
@@ -134,6 +136,10 @@ __all__ = [
     # System utilities
     'utils',
     'query_gpu_memory',
+    # Post-hoc denoising (MATLAB filter_vff.m)
+    'bilateral',
+    'filter_vff',
+    'imbilatfilt',
     # Scan setup utilities
     'auto_detect_scan_folder',
     'load_scan_data',
