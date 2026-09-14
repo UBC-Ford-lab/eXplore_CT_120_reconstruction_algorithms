@@ -16,9 +16,17 @@ What each MATLAB step becomes here, and where the behaviour is pinned:
     whitespace, form feed included, so the form-feed line comes out as a bare
     newline; ``fprintf(fid2, '\\f\\n')`` then ends the header. The output header
     is therefore the input's lines, one blank line, then ``\\f\\n``.
-    ``fprintf`` also treats each line as a FORMAT string; a header line
-    containing ``%`` or ``\\`` would be rewritten by MATLAB in ways this does
-    not emulate, so such a header is refused rather than silently copied.
+    ``fprintf`` also treats each line as a FORMAT string, with no data: escape
+    sequences are translated, ``%%`` prints ``%``, and output stops at any
+    other ``%`` (a conversion with nothing to convert, or an invalid operator,
+    which MathWorks documents as "prints all text up to the invalid operator
+    ... and discards the rest"). Everything after it on that line is lost,
+    INCLUDING the ``\\n`` strcat appended, so the next line's text follows
+    directly. The vendor's volumes hit this: their last header line is
+    ``cmdLine="... -i .../uwarp-00-%04d.vff ..."``, which MATLAB writes as
+    ``cmdLine="... -i .../uwarp-00-`` with no newline, the form-feed line's
+    newline then closing it. Octal and hex escapes are not emulated and are
+    refused.
   * DATA. ``fread(fid, [A, B], 'int16')`` on a big-endian handle, C times,
     starting right after the last header line. ``im(:, :, i)`` is (x, y);
     the payload slice here is (y, x). The filter below is symmetric under
@@ -121,6 +129,40 @@ def _strip_trailing_whitespace(line: bytes) -> bytes:
     return line.rstrip(b' \t\v\n\r\f')
 
 
+_ESCAPES = {b'n': b'\n', b't': b'\t', b'r': b'\r', b'f': b'\f', b'b': b'\b',
+            b'a': b'\a', b'v': b'\v', b'\\': b'\\'}
+
+
+def matlab_fprintf_no_data(fmt: bytes) -> bytes:
+    """What ``fprintf(fid, fmt)`` writes when ``fmt`` is given no data.
+
+    Escapes are translated and ``%%`` is a literal ``%``; any other ``%``, or
+    an unknown escape, ends the output there.
+    """
+    out, i, n = bytearray(), 0, len(fmt)
+    while i < n:
+        c = fmt[i:i + 1]
+        if c == b'%':
+            if fmt[i + 1:i + 2] == b'%':
+                out += b'%'
+                i += 2
+                continue
+            break
+        if c == b'\\':
+            e = fmt[i + 1:i + 2]
+            if e in _ESCAPES:
+                out += _ESCAPES[e]
+                i += 2
+                continue
+            if e == b'x' or e.isdigit():
+                raise VFFFilterError(f"octal/hex escape in header text {fmt!r}; "
+                                     f"not emulated")
+            break
+        out += c
+        i += 1
+    return bytes(out)
+
+
 def read_header_like_matlab(raw: bytes):
     """The header loop of filter_vff.m.
 
@@ -136,11 +178,7 @@ def read_header_like_matlab(raw: bytes):
                                  "(no form-feed line)")
         line = raw[pos:nl]              # fgetl: the line without its newline
         pos = nl + 1
-        if b'%' in line or b'\\' in line:
-            raise VFFFilterError(f"header line {line!r} contains '%' or '\\', "
-                                 f"which MATLAB's fprintf would rewrite; not "
-                                 f"emulated")
-        out += _strip_trailing_whitespace(line) + b'\n'
+        out += matlab_fprintf_no_data(_strip_trailing_whitespace(line) + b'\\n')
         if line.startswith(b'size='):
             tokens = line[len(b'size='):].replace(b';', b' ').split()
             if len(tokens) < 3:
