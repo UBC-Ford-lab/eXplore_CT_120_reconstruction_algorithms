@@ -56,10 +56,26 @@ If you ever build a patched extension with the threshold lowered (~1e-9 in BOTH
 ``forward.cu`` and ``backward.cu`` — the backward pass carries the same 1e-5 and
 therefore the same bias in the gradients), set ``--gauss-signal-scale 1`` and
 this becomes a no-op.
+
+PROVENANCE — which build is this?
+---------------------------------
+Upstream ships the extension with no version (``setup.py`` says 0.0.0) and no
+release tags, so a plain ``pip install`` of a fresh clone records nothing about
+the source it came from. Every number above was measured against one commit,
+``UPSTREAM_COMMIT``; the rasteriser subtree had not changed since 2024-12-26
+(72c8517), so any commit between that and the pin is source-identical.
+``install_rasteriser.sh`` at the repository root checks the pin out and stamps
+the build's version as ``0.0.0+g<commit>`` (``.signed`` appended when the
+signed-density patch is applied), which is what `build_info` reads back. The
+two-line signed-density patch (``fabsf(alpha)`` at the cutoff in both kernels)
+is REQUIRED for ``--gauss-signed-density``: the stock kernel skips every
+negative contribution in the forward pass and gives it no gradient, so negative
+amplitudes would be dead weight. `require_signed_density_build` enforces that.
 """
 from __future__ import annotations
 
 import math
+from importlib import metadata as _metadata
 
 import torch
 
@@ -86,6 +102,20 @@ def available() -> bool:
     return _xgrv is not None
 
 
+#: Where the extension comes from and the commit every measurement in this
+#: package was made against. The rasteriser subtree last changed at 72c8517
+#: (2024-12-26); the pin is the repository HEAD of 2026-09-14. Change it only
+#: together with a re-measurement of the alpha-cutoff table above.
+UPSTREAM_REPO = "https://github.com/Ruyi-Zha/r2_gaussian"
+UPSTREAM_COMMIT = "f2579bfddd9aac009cb797c8503bef8119bbd022"
+UPSTREAM_SUBDIR = "r2_gaussian/submodules/xray-gaussian-rasterization-voxelization"
+#: The installer's name, quoted in error messages; lives at the repository root.
+INSTALL_SCRIPT = "install_rasteriser.sh"
+#: Version-string tag the installer appends when the signed-density patch is in.
+SIGNED_TAG = "signed"
+DIST_NAME = "xray_gaussian_rasterization_voxelization"
+
+
 def _check_rasterizer_available():
     """Raise ImportError if the X-ray Gaussian rasteriser is not installed."""
     if _xgrv is None:
@@ -93,11 +123,72 @@ def _check_rasterizer_available():
             "The X-ray Gaussian rasteriser is required for --algorithm "
             "gaussian. It is a compiled extension, not vendored here (Inria/"
             "MPII gaussian-splatting research licence), and is not on PyPI. "
-            "Build from source: git clone --recursive "
-            "https://github.com/Ruyi-Zha/r2_gaussian && pip install "
-            "--no-build-isolation "
-            "./r2_gaussian/r2_gaussian/submodules/"
-            "xray-gaussian-rasterization-voxelization")
+            f"Run {INSTALL_SCRIPT} from the repository root (it clones "
+            f"{UPSTREAM_REPO} at the pinned commit {UPSTREAM_COMMIT[:7]} and "
+            "builds it into the active environment), or by hand: git clone "
+            f"{UPSTREAM_REPO} && git -C r2_gaussian checkout {UPSTREAM_COMMIT} "
+            "&& git -C r2_gaussian submodule update --init "
+            f"{UPSTREAM_SUBDIR}/third_party/glm && pip install "
+            f"--no-build-isolation ./r2_gaussian/{UPSTREAM_SUBDIR}")
+
+
+def build_info() -> dict:
+    """What is installed, as far as the environment can tell.
+
+    Keys: ``installed`` (the extension imports), ``version`` (the distribution's
+    version string or None), ``commit`` (the hash the installer stamped into it,
+    None for a plain upstream build), ``pinned`` (that hash matches
+    `UPSTREAM_COMMIT`; None when unknown), ``signed_density`` (the patch is in;
+    None when unknown). Never raises and never touches CUDA."""
+    info = {'installed': _xgrv is not None, 'version': None, 'commit': None,
+            'pinned': None, 'signed_density': None}
+    try:
+        version = _metadata.version(DIST_NAME)
+    except Exception:            # not installed, or installed without metadata
+        return info
+    info['version'] = str(version)
+    local = version.split('+', 1)[1] if '+' in version else ''
+    parts = [p for p in local.split('.') if p]
+    if parts and parts[0].startswith('g') and len(parts[0]) > 1:
+        commit = parts[0][1:].lower()
+        info['commit'] = commit
+        info['pinned'] = UPSTREAM_COMMIT.startswith(commit)
+        info['signed_density'] = SIGNED_TAG in parts[1:]
+    return info
+
+
+def describe_build() -> str:
+    """One line for the run log: which rasteriser build this run used."""
+    info = build_info()
+    if not info['installed']:
+        return f"{DIST_NAME}: NOT installed"
+    if info['commit'] is None:
+        return (f"{DIST_NAME} {info['version']} — build provenance unknown "
+                f"(not installed by {INSTALL_SCRIPT}; pin is "
+                f"{UPSTREAM_COMMIT[:7]})")
+    return (f"{DIST_NAME} {info['version']} — upstream {info['commit'][:7]} "
+            f"({'the pinned commit' if info['pinned'] else 'NOT the pin ' + UPSTREAM_COMMIT[:7]})"
+            f"{', signed-density patch' if info['signed_density'] else ''}")
+
+
+def require_signed_density_build() -> str | None:
+    """Gate for ``--gauss-signed-density``: the stock kernel never renders a
+    negative contribution, so the option needs the patched build. Raises when
+    the build is KNOWN to be unpatched; returns a warning string when it cannot
+    tell (a build not made by the installer); returns None when it is in."""
+    info = build_info()
+    if info['signed_density'] is True:
+        return None
+    if info['signed_density'] is False:
+        raise RuntimeError(
+            "--gauss-signed-density needs the signed-density patch in the "
+            f"rasteriser, and this build ({info['version']}) was installed "
+            f"without it: negative amplitudes would never render. Re-run "
+            f"{INSTALL_SCRIPT} --signed-density, or drop the flag.")
+    return (f"cannot tell whether this rasteriser build carries the "
+            f"signed-density patch ({describe_build()}); a stock kernel "
+            f"silently drops every negative contribution — install with "
+            f"{INSTALL_SCRIPT} --signed-density to make this checkable")
 
 
 def extension():

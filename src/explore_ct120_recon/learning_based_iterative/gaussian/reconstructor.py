@@ -236,6 +236,8 @@ class GaussianReconstructor(LearnedReconstructor):
               f"(domain {(domain.aabb_max - domain.aabb_min).tolist()} mm)")
         print(f"    signal scale {self.signal_scale:.1f}x  — keeps the "
               f"rasteriser's 1e-5 alpha cutoff off the signal; see kernel.py")
+        self.cfg['rasteriser_build'] = kernel.describe_build()
+        print(f"    rasteriser: {self.cfg['rasteriser_build']}")
 
         cameras = cam_mod.build_cameras(
             self.angles, geometry=self.geometry, n_b=n_b, n_a=n_a,
@@ -1045,6 +1047,12 @@ class GaussianReconstructor(LearnedReconstructor):
         so the run's own setting always wins over the checkpoint's; zero is
         the strictly positive cloud."""
         frac = float(self.cfg['signed_density'])
+        if frac > 0:
+            # The stock kernel drops every negative contribution; only the
+            # installer's patched build renders them. Known-unpatched raises.
+            warning = kernel.require_signed_density_build()
+            if warning:
+                print(f"    WARNING: {warning}")
         with torch.no_grad():
             floor = frac * float(cloud.density.median()) if frac > 0 else 0.0
         if not math.isclose(float(cloud.density_floor), floor, rel_tol=1e-6,

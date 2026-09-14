@@ -37,9 +37,17 @@ pip install astra-toolbox                                            # ASTRA
 pip install "git+https://github.com/CERN/TIGRE.git#subdirectory=Python"   # TIGRE (not on PyPI)
 pip install wandb                                                    # experiment logging
 # --algorithm gaussian: the X-ray Gaussian rasteriser (research licence, not on PyPI)
-git clone --recursive https://github.com/Ruyi-Zha/r2_gaussian
-pip install --no-build-isolation ./r2_gaussian/r2_gaussian/submodules/xray-gaussian-rasterization-voxelization
+./install_rasteriser.sh            # clones Ruyi-Zha/r2_gaussian at the pinned commit and builds it
 ```
+
+The rasteriser is pinned to one upstream commit (`kernel.UPSTREAM_COMMIT`, the
+hash in `install_rasteriser.sh`) because upstream carries no version or tags
+and every calibration in the Gaussian backend was measured against that
+source. The script stamps the build with the commit so a run's log states which
+build it used; `--signed-density` applies the two-line kernel patch that
+`--gauss-signed-density` needs, `--wheel DIR` builds for a cluster node, and
+`--help` lists the rest. Building by hand is the same three commands the
+script runs; the pipeline then reports the build's provenance as unknown.
 
 Python 3.10+ and PyTorch 2.0+. The import name is `explore_ct120_recon`.
 
