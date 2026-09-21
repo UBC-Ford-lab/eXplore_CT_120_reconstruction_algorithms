@@ -56,6 +56,7 @@ ct120-bilateral-filter = "explore_ct120_recon.run_bilateral_filter:cli"
 ct120-projection-report = "explore_ct120_recon.run_projection_report:cli"
 ct120-geometry-calibration = "explore_ct120_recon.run_geometry_calibration:cli"
 ct120-noise-calibration = "explore_ct120_recon.run_noise_calibration:cli"
+ct120-simulate-scan = "explore_ct120_recon.run_simulate_scan:cli"
 
 [tool.setuptools.dynamic]
 version = {attr = "explore_ct120_recon.__version__"}

@@ -66,6 +66,7 @@ ct120-bilateral-filter VOLUME.vff [SD]
 ct120-projection-report data/scans/Scan_1988 --volume a.vff --volume b.vff
 ct120-geometry-calibration data/scans/Scan_1988
 ct120-noise-calibration data/scans/Scan_1988
+ct120-simulate-scan VOLUME.vff --template data/scans/Scan_1988 --output data/scans/Sim_1988
 ```
 
 (`python -m explore_ct120_recon.run_fdk_recon ...` is the same thing.)
