@@ -5,22 +5,23 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
 Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner.
-Point it at a scan folder and get a calibrated HU volume back.
+Input is a scan folder as the scanner writes it, output is an HU-calibrated
+`.vff` volume.
 
 ![Cone-beam reconstruction: a ray from the source through the volume to a detector pixel](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/assets/voxel_model.png)
 
 *Each detector pixel measures a line integral of the attenuation μ along a
-ray from the source. Reconstruction recovers the volume, here a dense voxel
-grid, from those measurements.*
+ray from the source. Reconstruction recovers the volume from those
+measurements.*
 
 | Family | Algorithms | Needs |
 |---|---|---|
-| Analytic (`fdk/`) | FDK with ramp / Shepp-Logan / cosine / Hamming windows, Parker weighting | PyTorch |
-| Classical iterative (`iterative/`) | ASTRA: SIRT, CGLS, SART. TIGRE: OS-SART, SART, SIRT, MLEM, +TV | CUDA + ASTRA or TIGRE |
-| Learning-based (`learning_based_iterative/`) | Differentiable projector + gradient descent. `--algorithm voxel` (dense grid, the default), `--algorithm gaussian` (anisotropic 3-D Gaussian splatting through an X-ray rasteriser) or `--algorithm gaussian_dynamic` (the same cloud with a per-projection state and a deformation field, for gated live-animal scans: delivers the breathing sequence and a ventilation map); other representations pluggable | CUDA (+ the rasteriser for the Gaussian backends) |
+| Analytic (`fdk/`) | FDK with ramp, Shepp-Logan, cosine or Hamming window, Parker weighting | PyTorch |
+| Classical iterative (`iterative/`) | ASTRA: SIRT, CGLS, SART. TIGRE: OS-SART, SART, SIRT, MLEM, optionally with TV | CUDA, ASTRA or TIGRE |
+| Learning-based (`learning_based_iterative/`) | Differentiable projector and gradient descent. `--algorithm voxel` (dense grid, default), `--algorithm gaussian` (3-D Gaussian splatting), `--algorithm gaussian_dynamic` (Gaussian splatting with a deformation field, for gated scans of breathing animals) | CUDA, plus the rasteriser for the two Gaussian algorithms |
 
-All three share the same loading, preprocessing, geometry calibration, HU
-calibration and output format, so their volumes are directly comparable.
+The three families share scan loading, preprocessing, geometry calibration,
+HU calibration and output format, so their volumes can be compared directly.
 
 ## Install
 
@@ -30,30 +31,27 @@ pip install eXplore_CT_120_reconstruction_algorithms
 pip install git+https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms.git
 ```
 
-Optional backends and logging:
+Optional:
 
 ```bash
-pip install astra-toolbox                                            # ASTRA
-pip install "git+https://github.com/CERN/TIGRE.git#subdirectory=Python"   # TIGRE (not on PyPI)
-pip install wandb                                                    # experiment logging
-# --algorithm gaussian: the X-ray Gaussian rasteriser (research licence, not on PyPI)
-./install_rasteriser.sh            # clones Ruyi-Zha/r2_gaussian at the pinned commit and builds it
+pip install astra-toolbox                                               # ASTRA
+pip install "git+https://github.com/CERN/TIGRE.git#subdirectory=Python"  # TIGRE, not on PyPI
+pip install wandb                                                       # run logging
+./install_rasteriser.sh                                                 # X-ray Gaussian rasteriser for the Gaussian algorithms
 ```
 
-The rasteriser is pinned to one upstream commit (`kernel.UPSTREAM_COMMIT`, the
-hash in `install_rasteriser.sh`) because upstream carries no version or tags
-and every calibration in the Gaussian backend was measured against that
-source. The script stamps the build with the commit so a run's log states which
-build it used; `--signed-density` applies the two-line kernel patch that
-`--gauss-signed-density` needs, `--wheel DIR` builds for a cluster node, and
-`--help` lists the rest. Building by hand is the same three commands the
-script runs; the pipeline then reports the build's provenance as unknown.
+The rasteriser is the one from [r2_gaussian](https://github.com/Ruyi-Zha/r2_gaussian)
+(research licence, not on PyPI). The install script clones it at a pinned
+commit, builds it and stamps the build with the commit hash so a run's log
+records which build it used. Upstream has no releases, and the calibrations
+in the Gaussian backend were measured against that commit, so keep the pin.
+`./install_rasteriser.sh --help` lists the options, including `--wheel DIR`
+for building on a cluster node.
 
-Python 3.10+ and PyTorch 2.0+. The import name is `explore_ct120_recon`.
+Requires Python 3.10 or newer and PyTorch 2.0 or newer. The import name is
+`explore_ct120_recon`.
 
 ## Usage
-
-Fourteen commands are installed:
 
 ```bash
 ct120-fdk data/scans/Scan_1988
@@ -61,26 +59,27 @@ ct120-iterative data/scans/Scan_1988 --backend astra --algorithm SIRT3D_CUDA --i
 ct120-iterative data/scans/Scan_1988 --backend tigre --algorithm ossart --tv-lambda 10
 ct120-learned data/scans/Scan_1988 --downsample 3
 ct120-learned data/scans/Scan_1988 --algorithm gaussian
-ct120-learned data/scans/Scan_1510 --algorithm gaussian_dynamic      # gated scan, every phase
+ct120-learned data/scans/Scan_1510 --algorithm gaussian_dynamic
 ct120-volume-report VOLUME.vff
 ct120-bilateral-filter VOLUME.vff [SD]
 ct120-projection-report data/scans/Scan_1988 --volume a.vff --volume b.vff
 ct120-geometry-calibration data/scans/Scan_1988
 ct120-noise-calibration data/scans/Scan_1988
 ct120-simulate-scan VOLUME.vff --template data/scans/Scan_1988 --output data/scans/Sim_1988
-ct120-motion-show RESULT_DIR                     # gate states, field and breathing GIF of a dynamic run
+ct120-motion-show RESULT_DIR
 ct120-export-4d RESULT_DIR/recon_4d.nrrd --format nrrd-slicer
-ct120-ventilation RESULT_DIR                     # re-export the ventilation map at another pitch
+ct120-ventilation RESULT_DIR
 ct120-breathing-phantom build REST.vff --template data/scans/Scan_1510 --output data/scans/Phantom_1510
 ```
 
-(`python -m explore_ct120_recon.run_fdk_recon ...` is the same thing.)
+`python -m explore_ct120_recon.run_fdk_recon ...` does the same as the
+console script. `--help` on any command lists its flags.
 
-A scan folder holds the projection `.vff` files, `scan.xml`, and the
-`bright.vff` / `dark.vff` flat-field frames. Each run writes a `.vff`
-volume next to the scan folder, a `.json` sidecar with the grid and the
-fitted HU map, and a `_plots/` folder with slices, histogram and projection
-diagnostics. `--help` lists every flag.
+A scan folder holds the projection `.vff` files, `scan.xml` and the
+`bright.vff` / `dark.vff` flat-field frames. Each run writes a `.vff` volume
+next to the scan folder, a `.json` sidecar with the grid and the fitted HU
+map, and a `_plots/` folder with slices, histogram and projection
+diagnostics.
 
 ## Pipeline
 
@@ -91,125 +90,115 @@ raw projections → flat-field + log → air normalization + ring correction
   → μ (mm⁻¹) → HU calibration → .vff + .json + plots
 ```
 
-Defaults that matter, each with a `--no-...` or explicit override:
+Defaults worth knowing about. Each has an override flag.
 
-- **Field of view and ROI are `auto`**: the grid is what the detector
-  subtends, tightened to the object; the export region is the scanner's own
+- Field of view and ROI are `auto`. The grid is what the detector subtends,
+  tightened to the object. The export region is the scanner's own
   `SubVolumeCoordinates.xml` box, so results line up with the vendor volume.
-- **Model domain `auto`** (iterative and learned): backends that fit the
-  projections cover everything a ray crosses, bed included, otherwise the
-  missing attenuation becomes a smooth HU bias. `--roi` then only crops the
-  output.
-- **HU calibration** fits two anchors from the volume's own histogram: air
-  at −1000 HU and bulk soft tissue at `--tissue-hu` (default +120, use 0 for
-  a water phantom). No phantom or scanner constant needed.
-- **Preflight** estimates VRAM and RAM before allocating anything.
-  `--preflight-only` just prints the report.
-- **Weights & Biases** logging is on when `--wandb-project` or
-  `$WANDB_PROJECT` names a project; nothing is hardcoded and nothing is
-  uploaded otherwise.
+- The model domain is `auto` for the iterative and learned families. They
+  reconstruct everything a ray crosses, bed included. Otherwise the missing
+  attenuation shows up as a smooth HU bias. `--roi` only crops the output.
+- HU calibration fits two anchors from the volume's own histogram: air at
+  −1000 HU and bulk soft tissue at `--tissue-hu` (default +120, use 0 for a
+  water phantom). No phantom scan is needed.
+- Preflight estimates VRAM and RAM before allocating anything.
+  `--preflight-only` prints the estimate and exits.
+- Weights & Biases logging is on when `--wandb-project` or `$WANDB_PROJECT`
+  names a project. Nothing is uploaded otherwise.
 
 ## Learning-based reconstruction
 
 Fits a volume model to the line integrals through a differentiable ray
-tracer, with Adam, non-negativity, LR warmup and plateau reduction, and a
-held-out projection for early stopping. Main flags: `--loss` (`wls` — the
-default for every algorithm — `mse`, `huber`, `ssim`, `msssim`, `sart`,
-`l1_dssim`, ...), `--iterations`, `--rays-per-batch` (sized from free VRAM
-by default), `--emulate-sart`, `--compile`.
+tracer, using Adam with non-negativity, LR warmup, plateau reduction and a
+held-out projection for early stopping. Main flags: `--loss`, `--iterations`,
+`--rays-per-batch` (sized from free VRAM by default), `--emulate-sart`,
+`--compile`.
 
-The data term is ONE registry shared by every representation
-(`learning_based_iterative/losses`): the same function scores a voxel grid,
-a network or a Gaussian cloud, so a loss value means the same thing across
-backends. The default `wls` weights every ray by the inverse variance of its
-own measured counts, `Var(p) = A/count + (sigma_r/ds)^2/count^2`
-(`ct_core/noise_model.py`), so its value is the reduced chi-square and its
-gradient the maximum-likelihood one for the detector's noise. The Poisson
-slope `A` is measured from the scan's own consecutive views at the run's
-binning on every run; the read noise `sigma_r` (per raw pixel) is measured
-when the scan's count range allows it, else inherited from the detector's
-calibration file (below), else a loud package default. `--wls-slope` /
-`--wls-read-noise` pin either; `wls/*` in the run log says what was used.
-`--loss mse` is the objective classical SIRT descends, the like-for-like
-comparison against the classical solvers.
+All representations use the same loss registry
+(`learning_based_iterative/losses`), so a loss value means the same thing for
+a voxel grid, a network or a Gaussian cloud. The default loss `wls` weights
+each ray by the inverse variance of its measured counts,
+`Var(p) = A/count + (sigma_r/ds)^2/count^2` (`ct_core/noise_model.py`). The
+Poisson slope `A` is measured from consecutive views of the scan on every
+run. The read noise `sigma_r` is measured when the scan's count range allows
+it, otherwise taken from the detector calibration file, otherwise from a
+package default. `--wls-slope` and `--wls-read-noise` pin either value, and
+the run log records what was used under `wls/*`. `--loss mse` is the
+objective classical SIRT minimises and is the right choice when comparing
+against the classical solvers.
 
-A new representation only has to answer three hooks in a
-`LearnedReconstructor` subclass: `build_model`, `build_domain`,
-`export_volume`. Register it with a `LearnedAlgorithm` descriptor and it
-becomes an `--algorithm` choice; `voxel/` is the 100-line example and
-`gaussian/` the full-size one (its own per-view training loop, seeding from
-an FDK of the scan, shape constraints — but the same data term). A descriptor
-may also re-default the shared flags for its representation
-(`driver_defaults`: binning, iteration cap, stopping metric — `gaussian` runs
-at `--downsample 3` with an SSIM stopper unless told otherwise). A
-representation in another package works the same way via
+To add a representation, subclass `LearnedReconstructor` and implement
+`build_model`, `build_domain` and `export_volume`, then register a
+`LearnedAlgorithm` descriptor. `voxel/` is the short example, `gaussian/` the
+full one with its own training loop, FDK seeding and shape constraints. A
+descriptor can change the shared defaults for its representation through
+`driver_defaults`; `gaussian` for instance runs at `--downsample 3` with an
+SSIM stopper. A representation in another package is loaded with
 `--algorithm-module my_package.algorithms`, and may subclass
-`GaussianReconstructor` through its seams (`_render_train`, `_render_eval`,
-`_param_groups`, `_regularise`, `_state` / `_restore_state`,
-`_checkpoint_payload`) to change what is rasterised without touching the
-loop.
+`GaussianReconstructor` through its hooks (`_render_train`, `_render_eval`,
+`_param_groups`, `_regularise`, `_state`, `_restore_state`,
+`_checkpoint_payload`).
 
-### Time-aware Gaussian splatting (`--algorithm gaussian_dynamic`)
+### Dynamic Gaussian splatting (`--algorithm gaussian_dynamic`)
 
-A gated step-and-shoot scan of a breathing animal has a different state in
-every projection, and the two gates differ by a whole breath. `gaussian_dynamic`
-(`learning_based_iterative/dynamic_gaussian/`) keeps the static cloud as the
-mean anatomy and gives every projection a state: a fixed column that names
-its gate plus a small learned code, read through a low-rank displacement
-basis on a control grid (1 mm by default). The displacement transports each
-primitive's shape by the deformation gradient and divides its amplitude by
-|det F|, so mass is conserved and a compressing region gets denser; the
-field's divergence is gated by the air content of each cell read from the
-model's own rest state, so solid tissue slides but keeps its volume; and
-three motion parts with a learned per-primitive membership let the lung
-slide along the chest wall. All of it is estimated from the projections
-together with the volume; nothing is registered afterwards.
+In a gated step-and-shoot scan of a breathing animal every projection sees a
+slightly different state, and the two gates differ by a full breath.
+`gaussian_dynamic` (`learning_based_iterative/dynamic_gaussian/`) keeps the
+static cloud as the mean anatomy and gives every projection its own state:
+a fixed column for the gate plus a small learned code, decoded through a
+low-rank displacement basis on a control grid (1 mm by default). The
+displacement transports each primitive's shape by the deformation gradient
+and divides its amplitude by |det F|, so mass is conserved and compressed
+tissue gets denser. The divergence of the field is restricted to cells
+containing air, read from the model's own rest state, so solid tissue can
+move but keeps its volume. Three motion parts with learned per-primitive
+membership let the lung slide along the chest wall. Everything is estimated
+from the projections together with the volume. No image registration is
+involved.
 
-The run loads every gated phase (`--phase all` is the algorithm's default,
-with a 32000-iteration cap under the same held-out stopper) and delivers,
-beside the gate-0 mean state in `recon.vff`:
+The run loads all gated phases (`--phase all` is the default for this
+algorithm, with a 32000-iteration cap under the usual held-out stopper) and
+writes, besides the gate-0 mean state in `recon.vff`:
 
-- `recon_4d.nrrd` + `.json` — the breathing sequence, nine states from gate 0
-  to gate 1 on the delivered grid (`--dyn-export-4d`, `--dyn-export-4d-format
-  nrrd|nrrd-slicer|nifti`; `ct120-export-4d` converts between the NRRD layouts);
-- `recon_ventilation.nrrd`, `_J.nrrd`, `.json`, `.npz`, `.png` — the regional
+- `recon_4d.nrrd` and `.json`: the breathing sequence, nine states from
+  gate 0 to gate 1 on the output grid. `--dyn-export-4d-format` selects
+  `nrrd`, `nrrd-slicer` or `nifti`; `ct120-export-4d` converts between them.
+- `recon_ventilation.nrrd`, `_J.nrrd`, `.json`, `.npz`, `.png`: regional
   specific ventilation (J − 1)/f_air per voxel at 0.5 mm in the expiration
-  frame, with the field's volume change checked against the rendered
-  states' own air change (`--dyn-export-ventilation`, `ct120-ventilation`);
-- `motion/*` panels in the plots folder and W&B: codes, field, parts, gates,
-  the breathing GIF (`ct120-motion-show` redraws them from the checkpoint).
+  frame. The sidecar compares the field's volume change against the air
+  change in the rendered states. `ct120-ventilation` re-exports at another
+  pitch.
+- `motion/*` panels in the plots folder and in W&B: codes, field, parts,
+  gates and a breathing GIF. `ct120-motion-show` redraws them from the
+  checkpoint.
 
-`--help` under `--algorithm gaussian_dynamic` lists the `--dyn-*` flags with
-the measured reason for each default. `ct120-breathing-phantom` builds a
-gated scan of a breathing digital phantom from any volume this package wrote
-(a known field, a known ventilation, the scanner's own ray geometry and
-noise model through `ct120-simulate-scan`'s machinery) and scores a run
-against its truth.
+`ct120-learned --algorithm gaussian_dynamic --help` lists the `--dyn-*`
+flags. `ct120-breathing-phantom` builds a gated scan of a breathing digital
+phantom from any volume written by this package, with a known displacement
+field and ventilation, using the scanner's ray geometry and noise model via
+`ct120-simulate-scan`, and scores a reconstruction against that truth.
 
 ## Report tools
 
 `ct120-volume-report` draws slices, the HU histogram and the fitted anchors
-for any finished volume, including the vendor's. `ct120-bilateral-filter`
-is the lab's MATLAB `filter_vff.m`: every axial slice through `imbilatfilt`
-with its defaults (spatial sigma 1 voxel, 5 x 5, replicate padding) and
-`degreeOfSmoothing = 2*SD^2`, SD measured from the fixed patch
-`im(20:40,160:180,100)` when not given; writes `<volume>_imbilatfilt.vff`.
-`ct120-projection-report`
-forward-projects one or more volumes and scores them against the measured
-projections on the same angles and detector window.
-`ct120-geometry-calibration` pre-measures the detector rotation, for
-example on a GPU node before submitting long jobs. `ct120-noise-calibration`
-measures the detector's noise model (Poisson slope + read noise) from a
-scan's own consecutive views and files the read noise per detector, so that
-scans which cannot determine it themselves — anything that attenuates too
-little to separate the `1/count^2` read-noise term from the `1/count`
-Poisson term, i.e. a mouse — inherit it from one that could, i.e. a dense
-phantom. Run it once per detector on the densest object you have; the
-`wls` data term (every learned algorithm's default) reads the result. Use `--vendor` with the
-report tools for a GE volume; it applies the vendor's axis conventions and
-locates the ROI from the scan.
+for a finished volume, including vendor volumes. `ct120-bilateral-filter` is
+a port of the lab's MATLAB `filter_vff.m`: `imbilatfilt` on every axial slice
+with its defaults (spatial sigma 1 voxel, 5 x 5 window, replicate padding)
+and `degreeOfSmoothing = 2*SD^2`, with SD measured from the patch
+`im(20:40,160:180,100)` when not given. It writes `<volume>_imbilatfilt.vff`.
+`ct120-projection-report` forward-projects one or more volumes and scores
+them against the measured projections on the same angles and detector window.
+`ct120-geometry-calibration` measures the detector rotation ahead of time,
+for example on a GPU node before submitting long jobs.
+`ct120-noise-calibration` measures the detector's Poisson slope and read
+noise from consecutive views of a scan and stores the read noise per
+detector. A low-attenuation scan such as a mouse cannot separate the read
+noise term from the Poisson term, so run it once per detector on a dense
+phantom and the `wls` loss will pick the value up from there. Use `--vendor`
+with the report tools for a GE volume; it applies the vendor's axis
+conventions and locates the ROI from the scan.
 
-Everything is importable too:
+Everything is importable:
 
 ```python
 from explore_ct120_recon.ct_core.vff_io import read_vff, write_vff
@@ -220,18 +209,22 @@ from explore_ct120_recon.learning_based_iterative import LearnedReconstructor
 
 ```
 src/explore_ct120_recon/
-  run_*.py                    drivers, one per family plus the report tools
-  ct_core/                    shared: scan loading, preprocessing, geometry
-                              calibration, HU calibration, preflight, VFF I/O
-  fdk/                        filtered backprojection
-  iterative/{astra,tigre}/    toolbox wrappers
-  learning_based_iterative/   trainer, ray sampler, renderer, losses, voxel/
+  run_*.py                      drivers, one per family plus the report tools
+  ct_core/                      scan loading, preprocessing, geometry and HU
+                                calibration, noise model, preflight, VFF I/O
+  fdk/                          filtered backprojection
+  iterative/{astra,tigre}/      toolbox wrappers
+  simulate/                     forward projection of a volume into a scan folder
+  learning_based_iterative/     trainer, ray sampler, renderer, losses
+    voxel/                      dense grid
+    gaussian/                   Gaussian splatting
+    dynamic_gaussian/           Gaussian splatting with a deformation field
 ```
 
 Detector calibrations measured from a scan are cached in `data/calibration/`
-of the checkout when running from source, in the per-user data directory
+when running from a checkout, in the per-user data directory
 (`~/.local/share/explore_ct120_recon/calibration` on Linux) for an installed
-copy, or wherever `$CT_CALIBRATION_DIR` points.
+copy, or in `$CT_CALIBRATION_DIR` if set.
 
 ## License
 
