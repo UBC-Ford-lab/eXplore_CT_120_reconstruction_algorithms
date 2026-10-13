@@ -8,15 +8,18 @@ preprocessing, geometry and HU calibration, VFF export):
 * ``learning_based_iterative``   differentiable projector + gradient descent
 
 Command-line drivers are installed as ``ct120-fdk``, ``ct120-iterative``,
-``ct120-learned``, ``ct120-volume-report``, ``ct120-projection-report`` and
-``ct120-geometry-calibration``; the same entry points are importable as
-``explore_ct120_recon.run_*``.
+``ct120-learned``, ``ct120-volume-report``, ``ct120-projection-report``,
+``ct120-geometry-calibration``, ``ct120-noise-calibration``,
+``ct120-bilateral-filter`` and ``ct120-simulate-scan``; the same entry points
+are importable as ``explore_ct120_recon.run_*``. The time-aware Gaussian
+backend adds ``ct120-motion-show``, ``ct120-export-4d``, ``ct120-ventilation``
+and ``ct120-breathing-phantom`` (``learning_based_iterative.dynamic_gaussian``).
 
 Importing this package pulls in only ``ct_core`` (VFF I/O, preprocessing,
 calibration). The backends import their optional toolboxes lazily.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from . import ct_core
 from .ct_core import vff_io

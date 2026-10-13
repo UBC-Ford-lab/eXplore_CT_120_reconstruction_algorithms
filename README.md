@@ -17,7 +17,7 @@ grid, from those measurements.*
 |---|---|---|
 | Analytic (`fdk/`) | FDK with ramp / Shepp-Logan / cosine / Hamming windows, Parker weighting | PyTorch |
 | Classical iterative (`iterative/`) | ASTRA: SIRT, CGLS, SART. TIGRE: OS-SART, SART, SIRT, MLEM, +TV | CUDA + ASTRA or TIGRE |
-| Learning-based (`learning_based_iterative/`) | Differentiable projector + gradient descent. `--algorithm voxel` (dense grid, the default) or `--algorithm gaussian` (anisotropic 3-D Gaussian splatting through an X-ray rasteriser); other representations pluggable | CUDA (+ the rasteriser for `gaussian`) |
+| Learning-based (`learning_based_iterative/`) | Differentiable projector + gradient descent. `--algorithm voxel` (dense grid, the default), `--algorithm gaussian` (anisotropic 3-D Gaussian splatting through an X-ray rasteriser) or `--algorithm gaussian_dynamic` (the same cloud with a per-projection state and a deformation field, for gated live-animal scans: delivers the breathing sequence and a ventilation map); other representations pluggable | CUDA (+ the rasteriser for the Gaussian backends) |
 
 All three share the same loading, preprocessing, geometry calibration, HU
 calibration and output format, so their volumes are directly comparable.
@@ -53,7 +53,7 @@ Python 3.10+ and PyTorch 2.0+. The import name is `explore_ct120_recon`.
 
 ## Usage
 
-Eight commands are installed:
+Fourteen commands are installed:
 
 ```bash
 ct120-fdk data/scans/Scan_1988
@@ -61,12 +61,17 @@ ct120-iterative data/scans/Scan_1988 --backend astra --algorithm SIRT3D_CUDA --i
 ct120-iterative data/scans/Scan_1988 --backend tigre --algorithm ossart --tv-lambda 10
 ct120-learned data/scans/Scan_1988 --downsample 3
 ct120-learned data/scans/Scan_1988 --algorithm gaussian
+ct120-learned data/scans/Scan_1510 --algorithm gaussian_dynamic      # gated scan, every phase
 ct120-volume-report VOLUME.vff
 ct120-bilateral-filter VOLUME.vff [SD]
 ct120-projection-report data/scans/Scan_1988 --volume a.vff --volume b.vff
 ct120-geometry-calibration data/scans/Scan_1988
 ct120-noise-calibration data/scans/Scan_1988
 ct120-simulate-scan VOLUME.vff --template data/scans/Scan_1988 --output data/scans/Sim_1988
+ct120-motion-show RESULT_DIR                     # gate states, field and breathing GIF of a dynamic run
+ct120-export-4d RESULT_DIR/recon_4d.nrrd --format nrrd-slicer
+ct120-ventilation RESULT_DIR                     # re-export the ventilation map at another pitch
+ct120-breathing-phantom build REST.vff --template data/scans/Scan_1510 --output data/scans/Phantom_1510
 ```
 
 (`python -m explore_ct120_recon.run_fdk_recon ...` is the same thing.)
@@ -143,6 +148,43 @@ representation in another package works the same way via
 `_param_groups`, `_regularise`, `_state` / `_restore_state`,
 `_checkpoint_payload`) to change what is rasterised without touching the
 loop.
+
+### Time-aware Gaussian splatting (`--algorithm gaussian_dynamic`)
+
+A gated step-and-shoot scan of a breathing animal has a different state in
+every projection, and the two gates differ by a whole breath. `gaussian_dynamic`
+(`learning_based_iterative/dynamic_gaussian/`) keeps the static cloud as the
+mean anatomy and gives every projection a state: a fixed column that names
+its gate plus a small learned code, read through a low-rank displacement
+basis on a control grid (1 mm by default). The displacement transports each
+primitive's shape by the deformation gradient and divides its amplitude by
+|det F|, so mass is conserved and a compressing region gets denser; the
+field's divergence is gated by the air content of each cell read from the
+model's own rest state, so solid tissue slides but keeps its volume; and
+three motion parts with a learned per-primitive membership let the lung
+slide along the chest wall. All of it is estimated from the projections
+together with the volume; nothing is registered afterwards.
+
+The run loads every gated phase (`--phase all` is the algorithm's default,
+with a 32000-iteration cap under the same held-out stopper) and delivers,
+beside the gate-0 mean state in `recon.vff`:
+
+- `recon_4d.nrrd` + `.json` — the breathing sequence, nine states from gate 0
+  to gate 1 on the delivered grid (`--dyn-export-4d`, `--dyn-export-4d-format
+  nrrd|nrrd-slicer|nifti`; `ct120-export-4d` converts between the NRRD layouts);
+- `recon_ventilation.nrrd`, `_J.nrrd`, `.json`, `.npz`, `.png` — the regional
+  specific ventilation (J − 1)/f_air per voxel at 0.5 mm in the expiration
+  frame, with the field's volume change checked against the rendered
+  states' own air change (`--dyn-export-ventilation`, `ct120-ventilation`);
+- `motion/*` panels in the plots folder and W&B: codes, field, parts, gates,
+  the breathing GIF (`ct120-motion-show` redraws them from the checkpoint).
+
+`--help` under `--algorithm gaussian_dynamic` lists the `--dyn-*` flags with
+the measured reason for each default. `ct120-breathing-phantom` builds a
+gated scan of a breathing digital phantom from any volume this package wrote
+(a known field, a known ventilation, the scanner's own ray geometry and
+noise model through `ct120-simulate-scan`'s machinery) and scores a run
+against its truth.
 
 ## Report tools
 

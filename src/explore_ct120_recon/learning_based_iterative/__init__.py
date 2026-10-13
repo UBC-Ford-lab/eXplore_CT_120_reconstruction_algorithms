@@ -24,6 +24,11 @@ integration domain is, and how a volume comes out:
 * ``gaussian``       — anisotropic 3-D Gaussian splatting through the
                        X-ray radiative rasteriser (optional native extension;
                        importing never needs it, reconstructing does).
+* ``dynamic_gaussian`` — the same cloud with a per-view state: a latent
+                       code per projection and a low-rank deformation
+                       basis, for gated live-animal scans. Delivers the
+                       breathing sequence and a ventilation map beside
+                       the volume.
 
 Each also ships a ``LearnedAlgorithm`` descriptor (``registry``) carrying the
 three things the DRIVER cannot guess either — the flags it adds to the CLI,
@@ -86,6 +91,8 @@ from .voxel import ALGORITHM as VOXEL_ALGORITHM
 from .gaussian import ALGORITHM as GAUSSIAN_ALGORITHM
 from .gaussian.model import GaussianCloud
 from .gaussian.reconstructor import GaussianReconstructor
+from .dynamic_gaussian import ALGORITHM as DYNAMIC_GAUSSIAN_ALGORITHM
+from .dynamic_gaussian import DynamicGaussianReconstructor, MotionModel
 
 # ---------------------------------------------------------- registration --
 # Importing this package is what makes an algorithm selectable, and every
@@ -94,6 +101,7 @@ from .gaussian.reconstructor import GaussianReconstructor
 # calls `register_algorithm` from its own module instead.
 register_algorithm(VOXEL_ALGORITHM)
 register_algorithm(GAUSSIAN_ALGORITHM)
+register_algorithm(DYNAMIC_GAUSSIAN_ALGORITHM)
 
 __all__ = [
     "DOMAIN_SPECS", "ModelDomain", "Scene", "model_domain_from_bounds",
@@ -115,5 +123,6 @@ __all__ = [
     "algorithm_names", "algorithms", "describe_algorithms",
     "VoxelGrid", "voxel_grid_shape", "VoxelReconstructor", "VOXEL_ALGORITHM",
     "GaussianCloud", "GaussianReconstructor", "GAUSSIAN_ALGORITHM",
+    "DynamicGaussianReconstructor", "MotionModel", "DYNAMIC_GAUSSIAN_ALGORITHM",
     "resolve_export_grid", "resolve_export_roi",
 ]

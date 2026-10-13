@@ -9,8 +9,9 @@ the synthetic one copies. The output loads in every driver with no flag —
 ``ct120-fdk data/scans/Sim_1988`` — and the reconstruction can then be
 scored against the very volume it was made from.
 
-For a MOVING object see ``inr_pipeline.dynamic_gaussian.phantom`` in muNeRF,
-which feeds ``simulate.simulate_scan`` a volume per view.
+For a MOVING object see ``ct120-breathing-phantom``
+(``learning_based_iterative.dynamic_gaussian.phantom``), which feeds
+``simulate.simulate_scan`` a volume per view.
 """
 import argparse
 import sys

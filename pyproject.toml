@@ -32,6 +32,7 @@ dependencies = [
     "torch>=2.0",
     "xmltodict",
     "imageio",
+    "pillow",
     "matplotlib",
     "tqdm",
     "platformdirs>=3.0",
@@ -57,6 +58,11 @@ ct120-projection-report = "explore_ct120_recon.run_projection_report:cli"
 ct120-geometry-calibration = "explore_ct120_recon.run_geometry_calibration:cli"
 ct120-noise-calibration = "explore_ct120_recon.run_noise_calibration:cli"
 ct120-simulate-scan = "explore_ct120_recon.run_simulate_scan:cli"
+# --algorithm gaussian_dynamic: the finished run's motion, its 4-D file, its ventilation map, the phantom
+ct120-motion-show = "explore_ct120_recon.learning_based_iterative.dynamic_gaussian.show:main"
+ct120-export-4d = "explore_ct120_recon.learning_based_iterative.dynamic_gaussian.export4d:main"
+ct120-ventilation = "explore_ct120_recon.learning_based_iterative.dynamic_gaussian.ventilation:main"
+ct120-breathing-phantom = "explore_ct120_recon.learning_based_iterative.dynamic_gaussian.phantom:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "explore_ct120_recon.__version__"}
