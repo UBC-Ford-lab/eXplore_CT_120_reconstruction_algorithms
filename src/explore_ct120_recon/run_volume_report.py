@@ -415,6 +415,7 @@ def main():
     )
 
     output_path = args.output or str(volume_path.with_suffix('')) + '_report'
+    print(f"\nOutput path: {output_path}")
     logger = ReconLogger(args, ctx, args.algorithm, output_path, params={
         'source_format': volume_path.suffix.lstrip('.').lower(),
         'hu_from_header': bool(args.hu_from_header),

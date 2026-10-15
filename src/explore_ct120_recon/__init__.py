@@ -14,6 +14,8 @@ Command-line drivers are installed as ``ct120-fdk``, ``ct120-iterative``,
 are importable as ``explore_ct120_recon.run_*``. The time-aware Gaussian
 backend adds ``ct120-motion-show``, ``ct120-export-4d``, ``ct120-ventilation``
 and ``ct120-breathing-phantom`` (``learning_based_iterative.dynamic_gaussian``).
+``ct120-gui`` (the ``gui`` extra) serves a web page that runs any of them
+as jobs on the machine it is started on.
 
 Importing this package pulls in only ``ct_core`` (VFF I/O, preprocessing,
 calibration). The backends import their optional toolboxes lazily.

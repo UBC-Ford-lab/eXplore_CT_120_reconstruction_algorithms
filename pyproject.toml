@@ -42,6 +42,7 @@ dependencies = [
 # ASTRA iterative backend (CUDA). TIGRE is not on PyPI; see the README.
 astra = ["astra-toolbox"]
 wandb = ["wandb>=0.16"]
+gui = ["fastapi>=0.100", "uvicorn[standard]>=0.23", "tomli>=2.0; python_version < '3.11'"]
 dev = ["pytest>=8.0", "build", "twine"]
 
 [project.urls]
@@ -63,12 +64,17 @@ ct120-motion-show = "explore_ct120_recon.learning_based_iterative.dynamic_gaussi
 ct120-export-4d = "explore_ct120_recon.learning_based_iterative.dynamic_gaussian.export4d:main"
 ct120-ventilation = "explore_ct120_recon.learning_based_iterative.dynamic_gaussian.ventilation:main"
 ct120-breathing-phantom = "explore_ct120_recon.learning_based_iterative.dynamic_gaussian.phantom:main"
+# the web page (pip install ".[gui]")
+ct120-gui = "explore_ct120_recon.gui.cli:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "explore_ct120_recon.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"explore_ct120_recon.gui" = ["static/*", "static/assets/*", "templates/*", "icons/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
