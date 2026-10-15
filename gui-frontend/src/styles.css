@@ -253,6 +253,7 @@ label.block { margin: 0.6rem 0; }
 .sbatch .chip .x { border: none; background: none; padding: 0 0 0 0.15rem; margin: 0; font-size: 0.85rem; line-height: 1; color: var(--ink-3); cursor: pointer; }
 .sbatch .chip .x:hover { color: var(--bad); }
 .rail-foot { display: flex; justify-content: space-between; align-items: center; gap: 0.4rem; }
+.rail-foot > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .rail-foot button { font-size: 0.72rem; padding: 0 0.3rem; }
 .stopped { max-width: 36rem; margin: 18vh auto; padding: 0 1.4rem; color: var(--ink-2); }
 .stopped h1 { color: var(--ink); margin-bottom: 0.6rem; }
@@ -289,3 +290,23 @@ button.browse:hover { color: var(--accent); border-color: var(--accent); }
 .browser-foot .ctl input { width: 100%; }
 .browser-current { flex: 1 1 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .browser-foot .right { display: flex; gap: 0.4rem; margin-left: auto; }
+
+/* ---- volume viewer ------------------------------------------------------ */
+.ctl.grow { flex: 1 1 30rem; min-width: 0; }
+.ctl.grow .with-browse { width: 100%; }
+.ctl.grow .with-browse input { flex: 1 1 auto; width: 100%; min-width: 20rem; }
+.viewer { display: flex; flex-direction: column; gap: 0.5rem; }
+.viewer-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 1.2rem; padding: 0.3rem 0; border-top: 1px solid var(--hair); border-bottom: 1px solid var(--hair); font-size: 0.85rem; }
+.viewer-window { display: flex; gap: 0.7rem; align-items: center; }
+.viewer-window label { display: flex; gap: 0.3rem; align-items: center; color: var(--ink-2); }
+.viewer-window input[type=number] { width: 5.5rem; font-size: 0.85rem; padding: 0.1rem 0.3rem; }
+.viewer-readout { margin-left: auto; min-width: 16rem; text-align: right; }
+.viewer-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.8rem; }
+.view { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
+.view-head { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; }
+.view-head input[type=range] { flex: 1 1 auto; min-width: 0; }
+.view-box { position: relative; background: #000; border: 1px solid var(--hair); border-radius: 3px; display: flex; align-items: center; justify-content: center; min-height: 10rem; }
+.view-box canvas { max-width: 100%; max-height: calc(100vh - 15rem); width: auto; height: auto; display: block; image-rendering: auto; cursor: crosshair; }
+.view-box .muted { position: absolute; }
+a.sans { font-family: var(--sans); }
+@media (max-width: 1050px) { .viewer-grid { grid-template-columns: 1fr; } }

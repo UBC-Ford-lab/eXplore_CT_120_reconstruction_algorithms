@@ -58,7 +58,7 @@ export default function JobDetail() {
         {job.remote_id && <><div>Remote id</div><div>{job.remote_id}{job.remote_state ? ` · ${job.remote_state}` : ''}</div></>}
         {job.resources && <><div>sbatch</div><div className="mono">{job.resources}</div></>}
         {job.package_version && <><div>Package</div><div>{job.package_version}</div></>}
-        {job.output_path && <><div>Output</div><div className="mono span">{job.output_path}</div></>}
+        {job.output_path && <><div>Output</div><div className="mono span">{job.output_path}{job.output_path.endsWith('.vff') && job.status === 'finished' && <> · <Link to={`/view?machine=${encodeURIComponent(job.executor)}&path=${encodeURIComponent(job.output_path)}`} className="sans">view volume</Link></>}</div></>}
         {job.wandb_url && <><div>W&amp;B</div><div className="span"><a href={job.wandb_url} target="_blank" rel="noreferrer">{job.wandb_url}</a></div></>}
         {job.note && <><div>Note</div><div className="span">{job.note}</div></>}
         {job.error && <><div>Error</div><div className="error span">{job.error}</div></>}

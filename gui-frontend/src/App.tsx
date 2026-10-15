@@ -5,6 +5,7 @@ import Machines from './pages/Machines'
 import NewJob from './pages/NewJob'
 import Jobs from './pages/Jobs'
 import JobDetail from './pages/JobDetail'
+import Viewer from './pages/Viewer'
 
 export default function App() {
   const [info, setInfo] = useState<Info | null>(null)
@@ -45,6 +46,7 @@ export default function App() {
         <nav>
           <NavLink to="/new">New job</NavLink>
           <NavLink to="/jobs">Jobs {active > 0 && <span className="count">{active} active</span>}</NavLink>
+          <NavLink to="/view">Volume</NavLink>
           <NavLink to="/" end>Machines {info && <span className="count">{info.executors.length}</span>}</NavLink>
         </nav>
         <div className="rail-machines">
@@ -68,6 +70,7 @@ export default function App() {
           <Route path="/new" element={<NewJob info={info} />} />
           <Route path="/jobs" element={<Jobs />} />
           <Route path="/jobs/:id" element={<JobDetail />} />
+          <Route path="/view" element={<Viewer info={info} />} />
         </Routes>
       </main>
     </div>

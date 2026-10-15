@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -88,6 +88,11 @@ class ChecksRequest(OutputRequest):
 class BrowseRequest(BaseModel):
     path: Optional[str] = None     # directory (or a file / not-yet-existing path: its nearest folder)
     hidden: bool = False
+
+
+class VolumeRequest(BaseModel):
+    path: str
+    executor: str = 'local'
 
 
 class MachineRequest(BaseModel):
@@ -297,6 +302,48 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
             raise
         except Exception as e:
             raise HTTPException(502, f'could not list on {name}: {e}')
+
+    # -- volumes: slices for the viewer -----------------------------------------
+    from .volumes import SliceCache, volume_info, volume_slice
+    slices = SliceCache()
+
+    def _volume_machine(name: str):
+        ex = executors.get(name)
+        if ex is None:
+            raise HTTPException(404, f'unknown machine {name!r}')
+        if isinstance(ex, RemoteExecutor):
+            if ex.conn.status() != 'connected':
+                raise HTTPException(409, f'{name} is not connected')
+            return dict(cwd=ex.machine.workdir, conn=ex.conn, python=ex.machine.python)
+        return dict(cwd=str(settings.cwd or Path.cwd()))
+
+    @app.post('/api/volumes/info')
+    def volume_header(req: VolumeRequest):
+        """Dimensions, voxel size and a sample of the values of a .vff, read where it lives."""
+        try:
+            return volume_info(req.path, **_volume_machine(req.executor))
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f'cannot read {req.path} on {req.executor}: {e}')
+
+    @app.get('/api/volumes/slice')
+    def volume_plane(path: str, axis: str, index: int, executor: str = 'local', mtime: float = 0):
+        """One slice as little-endian int16 bytes; header X-Shape = rows,cols.
+        ``mtime`` (from the info call) keys the cache so a rewritten volume is re-read."""
+        key = (executor, path, axis, index, mtime)
+        hit = slices.get(key)
+        if hit is None:
+            try:
+                hit = volume_slice(path, axis, index, **_volume_machine(executor))
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(400, f'cannot read {path} on {executor}: {e}')
+            slices.put(key, hit)
+        (rows, cols), data = hit
+        return Response(content=data, media_type='application/octet-stream',
+                        headers={'X-Shape': f'{rows},{cols}', 'Cache-Control': 'private, max-age=3600'})
 
     @app.get('/api/machines/{name}/scans')
     def machine_scans(name: str):

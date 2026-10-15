@@ -37,6 +37,7 @@ export interface Preview { command: string; cwd: string; script: string | null; 
 export interface ServerInfo { pid: number; url: string | null; started: number; version: string; data_dir: string; active: number; stoppable: boolean }
 export interface DirEntry { name: string; dir: boolean; size: number | null; mtime: number | null; broken?: boolean }
 export interface DirListing { path: string; parent: string | null; entries: DirEntry[]; error: string | null; places: [string, string][] }
+export interface VolumeInfo { path: string; size: [number, number, number]; bits: number; spacing: [number, number, number] | null; units: string | null; sidecar: boolean; bytes: number; mtime: number; sample: [number, number] }
 export interface Schema { driver: string; script: string; algorithm: string | null; description: string; fields: Field[] }
 export interface Scan { name: string; path: string }
 export interface Job {
@@ -68,6 +69,14 @@ export const api = {
     request<Schema>(`/api/drivers/${driver}/schema${algorithm ? `?algorithm=${encodeURIComponent(algorithm)}` : ''}`),
   output: (driver: string, algorithm: string | null, values: Record<string, any>) =>
     request<{ dest?: string | null; path?: string; writes?: string[]; explicit?: boolean }>(`/api/drivers/${driver}/output`, { method: 'POST', body: JSON.stringify({ algorithm, values }) }),
+  volumeInfo: (machine: string, path: string) => request<VolumeInfo>('/api/volumes/info', { method: 'POST', body: JSON.stringify({ path, executor: machine }) }),
+  volumeSlice: async (machine: string, path: string, axis: 'x' | 'y' | 'z', index: number, mtime: number) => {
+    const q = new URLSearchParams({ path, axis, index: String(index), executor: machine, mtime: String(mtime) })
+    const r = await fetch(`/api/volumes/slice?${q}`)
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail ?? r.statusText)
+    const [rows, cols] = (r.headers.get('X-Shape') ?? '0,0').split(',').map(Number)
+    return { rows, cols, data: new Int16Array(await r.arrayBuffer()) }
+  },
   browse: (machine: string, path: string | null, hidden = false) =>
     request<DirListing>(`/api/machines/${encodeURIComponent(machine)}/browse`, { method: 'POST', body: JSON.stringify({ path, hidden }) }),
   scans: (machine = 'local') => request<Scan[]>(`/api/machines/${encodeURIComponent(machine)}/scans`),

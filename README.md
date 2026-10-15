@@ -151,7 +151,8 @@ calibrations; for a volume its header, size and sidecar; for the output
 whether the folder is writable and the name free. Every path field has a
 folder button that browses that machine's file system. The form can be
 pre-filled from the address bar
-(`/new?driver=learned&algorithm=gaussian&input=…&all=1`).
+(`/new?driver=learned&algorithm=gaussian&input=…&all=1`; the viewer takes
+`/view?machine=&path=&window=`).
 
 ![New job on a cluster: the sbatch directives as editable chips](docs/gui/new_job_cluster.png)
 
@@ -172,6 +173,15 @@ belong in the machine's own copy.
 tailed from wherever it runs. A running job can be cancelled; a finished one
 deleted with or without the files it wrote, which are listed by the run's own
 naming rule and shown with their sizes first.
+
+![Volume: three orthogonal slices of a reconstruction with a linked crosshair](docs/gui/volume.png)
+
+*Volume.* Any `.vff` on any connected machine, reached from a job's output or
+by path; here the scanner's own reconstruction of a mouse, shown in the
+vendor's axis convention. Only the slices on view are read, where the volume
+lives, so a 2 GB reconstruction on the cluster opens at once; the window is
+applied in the browser (lung, soft tissue, bone presets or free), with the
+value under the cursor and a crosshair linking the three planes.
 
 ![Machines: the local machine and a cluster with its queue](docs/gui/machines.png)
 
