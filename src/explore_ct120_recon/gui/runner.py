@@ -26,8 +26,16 @@ def main(argv=None) -> int:
         except ProcessLookupError:
             pass
 
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, forward)
+    # the child is in the same process group, so a group signal (or Ctrl-Break
+    # on Windows) already reaches it; forwarding covers a signal sent to the
+    # wrapper alone. SIGHUP and SIGBREAK each exist on one platform only.
+    for name in ('SIGTERM', 'SIGINT', 'SIGHUP', 'SIGBREAK'):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, forward)
+            except (OSError, ValueError):
+                pass
     rc = proc.wait()
     tmp = exit_file + '.tmp'
     with open(tmp, 'w') as f:

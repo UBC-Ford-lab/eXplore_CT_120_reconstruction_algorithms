@@ -61,12 +61,54 @@ def gpu_inventory() -> list[dict]:
 
 
 def host_memory() -> dict:
+    none = {'total_gib': None, 'available_gib': None}
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            class _Status(ctypes.Structure):
+                _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                            ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                            ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                            ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                            ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+            st = _Status(); st.dwLength = ctypes.sizeof(_Status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return {'total_gib': st.ullTotalPhys / 2**30, 'available_gib': st.ullAvailPhys / 2**30}
+        except Exception:
+            pass
+        return none
     try:
         page = os.sysconf('SC_PAGE_SIZE')
-        return {'total_gib': os.sysconf('SC_PHYS_PAGES') * page / 2**30,
-                'available_gib': os.sysconf('SC_AVPHYS_PAGES') * page / 2**30}
+        total = os.sysconf('SC_PHYS_PAGES') * page / 2**30
     except (ValueError, OSError, AttributeError):
-        return {'total_gib': None, 'available_gib': None}
+        return none
+    if sys.platform == 'darwin':
+        # no SC_AVPHYS_PAGES on macOS; vm_stat gives the page counts instead
+        try:
+            import subprocess
+            out = subprocess.run(['vm_stat'], capture_output=True, text=True, timeout=5).stdout
+            counts = {}
+            for line in out.splitlines():
+                key, _, value = line.partition(':')
+                value = value.strip().rstrip('.')
+                if value.isdigit():
+                    counts[key.strip()] = int(value)
+            free = sum(counts.get(k, 0) for k in ('Pages free', 'Pages inactive', 'Pages speculative'))
+            return {'total_gib': total, 'available_gib': free * page / 2**30 if counts else None}
+        except Exception:
+            return {'total_gib': total, 'available_gib': None}
+    try:
+        # MemAvailable counts reclaimable cache; SC_AVPHYS_PAGES is free pages only
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return {'total_gib': total, 'available_gib': int(line.split()[1]) / 2**20}
+    except OSError:
+        pass
+    try:
+        return {'total_gib': total, 'available_gib': os.sysconf('SC_AVPHYS_PAGES') * page / 2**30}
+    except (ValueError, OSError, AttributeError):
+        return {'total_gib': total, 'available_gib': None}
 
 
 def package_provenance() -> dict:
@@ -83,7 +125,45 @@ def package_provenance() -> dict:
     return info
 
 
+def _detached() -> dict:
+    """Popen options that put the job in its own process group (so a cancel
+    reaches the driver and its children, and a server restart does not)."""
+    if sys.platform == 'win32':
+        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, 'CREATE_NO_WINDOW', 0)}
+    return {'start_new_session': True}
+
+
+def _interrupt_group(pid: int) -> None:
+    """Ask the job's whole process group to stop (SIGTERM; Ctrl-Break on Windows)."""
+    if sys.platform == 'win32':
+        os.kill(pid, signal.CTRL_BREAK_EVENT)      # pid is the group id (CREATE_NEW_PROCESS_GROUP)
+    else:
+        os.killpg(pid, signal.SIGTERM)
+
+
+def _kill_group(pid: int) -> None:
+    if sys.platform == 'win32':
+        subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True)
+    else:
+        os.killpg(pid, signal.SIGKILL)
+
+
 def _pid_alive(pid: int) -> bool:
+    if sys.platform == 'win32':
+        # os.kill(pid, 0) would TERMINATE the process on Windows; ask the kernel instead
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, int(pid))        # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return False
+            return code.value == 259                        # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -193,7 +273,7 @@ class LocalExecutor(Executor):
             proc = subprocess.Popen([sys.executable, '-m', 'explore_ct120_recon.gui.runner', str(exit_file), '--', *job.command],
                                     cwd=job.cwd or self.cwd, env=env,
                                     stdout=log, stderr=subprocess.STDOUT,
-                                    stdin=subprocess.DEVNULL, start_new_session=True)
+                                    stdin=subprocess.DEVNULL, **_detached())
         except OSError as e:
             log.close()
             store.update(job.id, status='failed', error=str(e), finished=time.time(),
@@ -310,8 +390,8 @@ class LocalExecutor(Executor):
             return False
         store.update(job.id, status='cancelled')
         try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
+            _interrupt_group(pid)
+        except (ProcessLookupError, OSError):
             return True
         threading.Thread(target=self._kill_after, args=(pid, 20.0), daemon=True).start()
         return True
@@ -324,8 +404,8 @@ class LocalExecutor(Executor):
                 return
             time.sleep(0.5)
         try:
-            os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
+            _kill_group(pid)
+        except (ProcessLookupError, OSError):
             pass
 
     def tick(self, store: JobStore) -> None:

@@ -5,7 +5,7 @@ import LoginTerminal from '../components/LoginTerminal'
 
 function gib(x: number | null | undefined) { return x == null ? '?' : x.toFixed(1) }
 
-const EMPTY: MachineConfig = { name: '', type: 'ssh', host: '', python: 'python', workdir: '~', scans_root: '', slots: 1, env: {}, sbatch_template: null }
+const EMPTY: MachineConfig = { name: '', type: 'ssh', host: '', python: 'python', workdir: '~', scans_root: '', slots: 1, env: {}, sbatch_template: null, connection: 'auto' }
 
 function MachineForm({ initial, onSaved, onCancel }: { initial: MachineConfig; onSaved: () => void; onCancel: () => void }) {
   const [m, setM] = useState<MachineConfig>(initial)
@@ -36,6 +36,13 @@ function MachineForm({ initial, onSaved, onCancel }: { initial: MachineConfig; o
         <label>Working directory <input type="text" {...f('workdir')} placeholder="~/scratch/ct_recon" /></label>
         <label>Scans root <input type="text" {...f('scans_root')} placeholder="~/scratch/scans" /></label>
         {m.type === 'ssh' && <label>Concurrent jobs <input type="number" min={1} {...f('slots')} /></label>}
+        <label>Connection
+          <select value={m.connection ?? 'auto'} onChange={e => setM({ ...m, connection: e.target.value as MachineConfig['connection'] })}>
+            <option value="auto">automatic (OpenSSH; the library on Windows)</option>
+            <option value="openssh">OpenSSH client, multiplexed</option>
+            <option value="library">library (paramiko), no ssh client needed</option>
+          </select>
+        </label>
         <label>Environment (NAME=value per line)<textarea rows={3} value={envText} onChange={e => setEnvText(e.target.value)} placeholder={'WANDB_PROJECT=my-project'} /></label>
       </div>
       {m.type === 'slurm' && (

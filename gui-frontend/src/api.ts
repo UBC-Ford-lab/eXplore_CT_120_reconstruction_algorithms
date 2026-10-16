@@ -8,7 +8,7 @@ export interface QueueRow {
 }
 export interface MachineConfig {
   name: string; type: 'local' | 'ssh' | 'slurm'; host: string; python: string; workdir: string; scans_root: string
-  slots: number; env: Record<string, string>; sbatch_template: string | null; template_is_default?: boolean
+  slots: number; env: Record<string, string>; sbatch_template: string | null; template_is_default?: boolean; connection?: 'auto' | 'openssh' | 'library'
 }
 export interface Machine {
   name: string; kind: string; status: 'connected' | 'needs_login' | 'unreachable' | 'logged_out'; host?: string; error?: string

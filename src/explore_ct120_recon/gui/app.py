@@ -104,6 +104,7 @@ class MachineRequest(BaseModel):
     slots: int = 1
     env: dict[str, str] = {}
     sbatch_template: Optional[str] = None
+    connection: str = 'auto'
 
 
 class Executors:
@@ -294,8 +295,8 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
             if isinstance(ex, RemoteExecutor):
                 if ex.conn.status() != 'connected':
                     raise HTTPException(409, f'{name} is not connected')
-                return list_dir(req.path, cwd=ex.machine.workdir, scans_root=ex.machine.scans_root or None,
-                                conn=ex.conn, python=ex.machine.python, hidden=req.hidden)
+                return list_dir(req.path, cwd=ex.workdir, scans_root=ex.scans_root or None,
+                                conn=ex.conn, python=ex.python, hidden=req.hidden)
             return list_dir(req.path, cwd=str(settings.cwd or Path.cwd()),
                             scans_root=str(settings.scans_root) if settings.scans_root else None, hidden=req.hidden)
         except HTTPException:
@@ -314,7 +315,7 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
         if isinstance(ex, RemoteExecutor):
             if ex.conn.status() != 'connected':
                 raise HTTPException(409, f'{name} is not connected')
-            return dict(cwd=ex.machine.workdir, conn=ex.conn, python=ex.machine.python)
+            return dict(cwd=ex.workdir, conn=ex.conn, python=ex.python)
         return dict(cwd=str(settings.cwd or Path.cwd()))
 
     @app.post('/api/volumes/info')
@@ -359,7 +360,6 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
     async def login(ws: WebSocket, name: str):
         """Terminal relay: text frames both ways; a JSON frame {"resize":[rows,cols]} from the page;
         a final JSON frame {"exit": code, "status": ...} from the server."""
-        from .terminal import LoginSession
         ex = executors.get(name)
         await ws.accept()
         if not isinstance(ex, RemoteExecutor):
@@ -368,9 +368,9 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
             return
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
-        session = LoginSession(ex.conn,
-                               on_output=lambda b: loop.call_soon_threadsafe(queue.put_nowait, ('out', b)),
-                               on_exit=lambda rc: loop.call_soon_threadsafe(queue.put_nowait, ('exit', rc)))
+        session = ex.conn.login_session(
+            on_output=lambda b: loop.call_soon_threadsafe(queue.put_nowait, ('out', b)),
+            on_exit=lambda rc: loop.call_soon_threadsafe(queue.put_nowait, ('exit', rc)))
         await ws.send_text(f'$ {session.command}\r\n')
 
         async def pump():
@@ -456,7 +456,7 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
                     return {'groups': [{'title': ex.name, 'path': '', 'items': [
                         {'label': 'connection', 'status': 'info',
                          'detail': 'connect the machine on the Machines page to check its files'}]}]}
-                groups = run_checks(plan, cwd=ex.machine.workdir, conn=ex.conn, python=ex.machine.python)
+                groups = run_checks(plan, cwd=ex.workdir, conn=ex.conn, python=ex.python)
             else:
                 groups = run_checks(plan, cwd=str(settings.cwd or Path.cwd()), python=ex.python)
         except Exception as e:
@@ -555,8 +555,8 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
         base = j.output_path
         if isinstance(ex, RemoteExecutor):
             if not os.path.isabs(base) and not base.startswith('~'):
-                base = f'{ex.machine.workdir.rstrip("/")}/{base}'
-            return run_snippet(base, action, conn=ex.conn, python=ex.machine.python)
+                base = f'{ex.workdir.rstrip("/")}/{base}'
+            return run_snippet(base, action, conn=ex.conn, python=ex.python)
         if not os.path.isabs(base):
             base = os.path.join(j.cwd or str(settings.cwd or Path.cwd()), base)
         return run_snippet(base, action)

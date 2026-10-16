@@ -191,13 +191,19 @@ or Slurm cluster added on the page (SSH destination, Python interpreter with
 this package, working directory, scans folder, Slurm template), each with a
 health check. For a cluster the user's whole queue is shown; rows submitted
 from the page link to their job, and any row can be cancelled. SSH uses the
-user's own setup, one multiplexed connection per machine, never storing
-passwords or keys; when a host asks for a second factor, Connect opens the
-login in a terminal panel on the page. Log out drops the connection.
+user's own setup (`~/.ssh/config`, keys, agent), never storing passwords or
+keys; when a host asks for a password or a second factor, Connect opens the
+login in a terminal panel on the page. Log out drops the connection. On
+Linux and macOS the connection is one multiplexed OpenSSH master per
+machine; on Windows, whose OpenSSH cannot multiplex, it is a library session
+(paramiko) with the same login panel. Either can be chosen per machine.
 
 Job records, logs and `machines.toml` live in the per-user data directory
 (`~/.local/share/explore_ct120_recon/gui` on Linux) or `--data-dir`; relative
-paths resolve against `--cwd`. The page is a React application in
+paths resolve against `--cwd`. The page runs on Linux, macOS and Windows; to
+serve a lab from one machine start it with `--host 0.0.0.0` and open the port
+(8120) in that machine's firewall. There is no login on the page itself, so
+keep it to a trusted network. The page is a React application in
 `gui-frontend/`, built into `src/explore_ct120_recon/gui/static/` (committed,
 so `pip install` ships it); rebuild with `npm install && npm run build`.
 

@@ -242,8 +242,9 @@ def _launch_command(args) -> list[str]:
         cmd += ['--wandb-project', args.wandb_project]
     if args.data_dir:
         cmd += ['--data-dir', str(Path(args.data_dir).resolve())]
-    if args.cwd:
-        cmd += ['--cwd', str(Path(args.cwd).resolve())]
+    # an icon starts with no useful working directory (Finder and the Start
+    # menu launch at / or system32), so jobs run in the home unless told otherwise
+    cmd += ['--cwd', str(Path(args.cwd).resolve() if args.cwd else Path.home())]
     if args.slots:
         cmd += ['--slots', str(args.slots)]
     return cmd

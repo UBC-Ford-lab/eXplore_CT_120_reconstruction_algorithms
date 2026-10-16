@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.2 (2026-10-16)
+
+- Windows: the page runs jobs locally (job wrapper, cancel and memory probe
+  have Windows branches) and reaches remote machines through a library SSH
+  session (paramiko), since Windows' OpenSSH cannot multiplex. The login
+  panel relays password and second-factor prompts as before. The backend is
+  chosen by platform, or per machine (`connection = "library"`).
+- Machine entries written with a tilde (`~/venv/bin/python`, `~/ct_recon`)
+  work: the remote home is resolved once and substituted everywhere the
+  path is used (shell commands, `sbatch --output`, log reads).
+- Machines page: memory is reported on macOS, and the local figure is the
+  available memory (reclaimable cache included), as on remote machines.
+- `ct120-gui shortcut` without `--cwd` runs jobs in the home directory
+  instead of wherever the desktop launched the icon (`/` on macOS).
+
 ## 0.2.1 (2026-10-16)
 
 - `import explore_ct120_recon` no longer imports torch or matplotlib: the

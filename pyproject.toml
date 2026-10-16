@@ -42,7 +42,7 @@ dependencies = [
 # ASTRA iterative backend (CUDA). TIGRE is not on PyPI; see the README.
 astra = ["astra-toolbox"]
 wandb = ["wandb>=0.16"]
-gui = ["fastapi>=0.100", "uvicorn[standard]>=0.23", "tomli>=2.0; python_version < '3.11'"]
+gui = ["fastapi>=0.100", "uvicorn[standard]>=0.23", "paramiko>=3.4", "tomli>=2.0; python_version < '3.11'"]
 dev = ["pytest>=8.0", "build", "twine"]
 
 [project.urls]

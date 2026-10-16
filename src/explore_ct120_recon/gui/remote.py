@@ -18,6 +18,7 @@ import os
 import shlex
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -69,7 +70,7 @@ print(json.dumps(out))
 def control_dir() -> Path:
     """Where the multiplexing sockets live: short (a Unix socket path is limited
     to about 100 characters) and private to the user."""
-    base = os.environ.get('XDG_RUNTIME_DIR') or f'/tmp/ct120-gui-{os.getuid()}'
+    base = os.environ.get('XDG_RUNTIME_DIR') or f'/tmp/ct120-gui-{os.getuid() if hasattr(os, "getuid") else os.getpid()}'
     d = Path(base) / 'ct120-gui'
     d.mkdir(parents=True, exist_ok=True)
     try:
@@ -187,12 +188,29 @@ class SshConnection:
         out = self.check(f'{shlex.quote(python)} - <<\'PY\'\n{_PROBE}\nPY', timeout=40)
         return json.loads(out.strip().splitlines()[-1])
 
+    def login_session(self, on_output, on_exit):
+        """The interactive login the page's terminal drives (see ``terminal``)."""
+        from .terminal import LoginSession
+        return LoginSession(self, on_output, on_exit)
+
+
+def connection_backend(machine: Machine) -> str:
+    """``openssh`` or ``library`` for this machine: its own setting, else by
+    platform (Windows' OpenSSH cannot multiplex, so the library is used)."""
+    choice = getattr(machine, 'connection', 'auto') or 'auto'
+    if choice == 'auto':
+        choice = os.environ.get('CT120_GUI_SSH', '') or ('library' if sys.platform == 'win32' else 'openssh')
+    return choice if choice in ('openssh', 'library') else 'openssh'
+
 
 def make_connection(machine: Machine, control_dir: Optional[Path] = None) -> SshConnection:
     """Factory, replaced in tests by a connection that runs commands locally.
 
     ``control_dir`` is accepted for the tests; real sockets always go to the
     short runtime directory (see ``control_dir()``)."""
+    if connection_backend(machine) == 'library':
+        from .sshlib import LibraryConnection
+        return LibraryConnection(machine.host, machine.name)
     return SshConnection(machine.host, socket_for(machine.name))
 
 
@@ -204,8 +222,8 @@ class RemoteExecutor(Executor):
     def __init__(self, machine: Machine, control_dir: Path, log_dir: Path, env: Optional[dict] = None):
         self.machine = machine
         self.name = machine.name
-        self.python = machine.python
         self.conn = make_connection(machine, control_dir)
+        self._home: Optional[str] = None     # the remote $HOME, fetched once
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.env = {**(env or {}), **machine.env}
@@ -214,10 +232,44 @@ class RemoteExecutor(Executor):
         self._lock = threading.Lock()
         self._watching: set[str] = set()
 
+    # -- the machine's paths ----------------------------------------------------
+    def expand(self, path: str) -> str:
+        """``~`` and ``~/x`` resolved against the remote home.
+
+        The machine's python, workdir and scans_root are written the way one
+        types them (``~/venv/bin/python``), but they reach the remote shell
+        quoted, in ``sbatch --output`` and in ``tail`` paths, none of which
+        expand a tilde. So the home is asked once and substituted here.
+        Until the connection is up the path is returned as written."""
+        if not path or not path.startswith('~') or (len(path) > 1 and path[1] != '/'):
+            return path
+        if self._home is None:
+            if self.conn.status() != 'connected':     # never block on a dead link
+                return path
+            try:
+                self._home = self.conn.check('echo ~', timeout=30).strip().splitlines()[-1] or None
+            except Exception:
+                return path
+            if not self._home:
+                return path
+        return self._home + path[1:]
+
+    @property
+    def python(self) -> str:
+        return self.expand(self.machine.python)
+
+    @property
+    def workdir(self) -> str:
+        return self.expand(self.machine.workdir)
+
+    @property
+    def scans_root(self) -> str:
+        return self.expand(self.machine.scans_root) if self.machine.scans_root else ''
+
     # -- what the machine is --------------------------------------------------
     def describe(self, fresh: bool = False) -> dict:
         base = {'name': self.name, 'kind': self.kind, 'host': self.machine.host,
-                'cwd': self.machine.workdir, 'slots': self.slots, 'running': [],
+                'cwd': self.workdir, 'slots': self.slots, 'running': [],
                 'hostname': self.machine.host, 'platform': '', 'cpus': None,
                 'memory': {'total_gib': None, 'available_gib': None}, 'gpus': [],
                 'package': {'version': None, 'commit': None, 'python': None},
@@ -237,7 +289,7 @@ class RemoteExecutor(Executor):
         if cached and age < 60 and not fresh:
             return {**base, **cached}
         try:
-            info = self.conn.probe(self.machine.python)
+            info = self.conn.probe(self.python)
         except Exception as e:
             return {**base, 'status': 'connected', 'error': f'probe failed: {e}'}
         with self._lock:
@@ -253,14 +305,14 @@ class RemoteExecutor(Executor):
                        f'{status}; run in a terminal: {self.conn.login_command()}'})
         if status != 'connected':
             return checks
-        for label, cmd in (('workdir', f'test -d {shlex.quote(self.machine.workdir)}'),
-                           ('scans_root', f'test -d {shlex.quote(self.machine.scans_root)}' if self.machine.scans_root else 'true'),
-                           ('python', f'{shlex.quote(self.machine.python)} --version')):
+        for label, cmd in (('workdir', f'test -d {shlex.quote(self.workdir)}'),
+                           ('scans_root', f'test -d {shlex.quote(self.scans_root)}' if self.scans_root else 'true'),
+                           ('python', f'{shlex.quote(self.python)} --version')):
             r = self.conn.run(f'cd ~ && {cmd}', timeout=60)
             checks.append({'name': label, 'ok': r.returncode == 0,
                            'detail': (r.stdout or r.stderr).strip() or ('ok' if r.returncode == 0 else 'not found')})
         try:
-            info = self.conn.probe(self.machine.python)
+            info = self.conn.probe(self.python)
             pkg = info.get('package') or {}
             checks.append({'name': 'package', 'ok': bool(pkg.get('version')),
                            'detail': f"explore_ct120_recon {pkg.get('version')} at {pkg.get('path')}" if pkg.get('version') else pkg.get('error', 'not importable')})
@@ -272,16 +324,16 @@ class RemoteExecutor(Executor):
         return checks
 
     def list_scans(self) -> list[dict]:
-        if not self.machine.scans_root:
+        if not self.scans_root:
             return []
-        root = self.machine.scans_root
+        root = self.scans_root
         r = self.conn.run(f'cd {shlex.quote(root)} 2>/dev/null && ls -d */scan.xml 2>/dev/null | sed "s#/scan.xml##"', timeout=60)
         names = [n for n in r.stdout.split() if n]
         return [{'name': n, 'path': f'{root.rstrip("/")}/{n}'} for n in sorted(names)]
 
     # -- running ---------------------------------------------------------------
     def _remote_dir(self) -> str:
-        return f'{self.machine.workdir.rstrip("/")}/.ct120-gui'
+        return f'{self.workdir.rstrip("/")}/.ct120-gui'
 
     def _env_exports(self, job: Job) -> str:
         env = {**self.env, 'PYTHONUNBUFFERED': '1'}
@@ -290,7 +342,7 @@ class RemoteExecutor(Executor):
     def start(self, job: Job, store: JobStore) -> None:
         remote_log = f'{self._remote_dir()}/logs/{job.id}.log'
         exit_file = f'{self._remote_dir()}/logs/{job.id}.exit'
-        script = (f'#!/bin/bash\ncd {shlex.quote(self.machine.workdir)}\n{self._env_exports(job)}\n'
+        script = (f'#!/bin/bash\ncd {shlex.quote(self.workdir)}\n{self._env_exports(job)}\n'
                   f'{shlex.join(job.command)}\necho $? > {shlex.quote(exit_file)}\n')
         script_path = f'{self._remote_dir()}/jobs/{job.id}.sh'
         local_log = self.log_dir / f'{job.id}.log'
@@ -306,7 +358,7 @@ class RemoteExecutor(Executor):
             store.update(job.id, status='failed', error=str(e)[:500], finished=time.time(), log_path=str(local_log))
             return
         store.update(job.id, status='running', started=time.time(), remote_id=pid,
-                     hostname=self.machine.host, log_path=str(local_log), cwd=self.machine.workdir)
+                     hostname=self.machine.host, log_path=str(local_log), cwd=self.workdir)
         self._watch_in_thread(job.id, store, remote_log, exit_file)
 
     def _watch_in_thread(self, job_id, store, remote_log, exit_file):
@@ -431,9 +483,9 @@ class SlurmExecutor(RemoteExecutor):
     def render(self, job: Job) -> str:
         remote_log = f'{self._remote_dir()}/logs/{job.id}.log'
         fields = {'job_name': f'ct120_{job.driver}_{Path(job.input).name or job.id}'[:60],
-                  'job_id': job.id, 'log': remote_log, 'workdir': self.machine.workdir,
+                  'job_id': job.id, 'log': remote_log, 'workdir': self.workdir,
                   'env': self._env_exports(job), 'command': shlex.join(job.command),
-                  'python': self.machine.python, 'input': job.input}
+                  'python': self.python, 'input': job.input}
         try:
             return self.machine.template_text().format_map(fields)
         except KeyError as e:
@@ -484,7 +536,7 @@ class SlurmExecutor(RemoteExecutor):
             self.conn.check(f'mkdir -p {shlex.quote(self._remote_dir())}/logs {shlex.quote(self._remote_dir())}/jobs')
             self.conn.write_file(script_path, script)
             extra = shlex.split(job.resources or '')
-            out = self.conn.check(f'cd {shlex.quote(self.machine.workdir)} && sbatch --parsable {shlex.join(extra)} {shlex.quote(script_path)}', timeout=120)
+            out = self.conn.check(f'cd {shlex.quote(self.workdir)} && sbatch --parsable {shlex.join(extra)} {shlex.quote(script_path)}', timeout=120)
             slurm_id = out.strip().split(';')[0].splitlines()[-1]
             int(slurm_id)
         except Exception as e:
@@ -493,7 +545,7 @@ class SlurmExecutor(RemoteExecutor):
             return
         local_log.write_text(self._submitted_line(slurm_id))
         store.update(job.id, status='pending', started=time.time(), remote_id=slurm_id, remote_state='PENDING',
-                     hostname=self.machine.host, log_path=str(local_log), cwd=self.machine.workdir)
+                     hostname=self.machine.host, log_path=str(local_log), cwd=self.workdir)
         self._watch_in_thread(job.id, store, f'{self._remote_dir()}/logs/{job.id}.log', '')
 
     def _submitted_line(self, slurm_id: str) -> str:

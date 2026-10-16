@@ -15,6 +15,7 @@ Example::
     workdir = "~/ct_recon"
     scans_root = "~/ct_recon/data/scans"
     slots = 1
+    # connection = "library"      # paramiko instead of the OpenSSH client; the default on Windows
 
     [machines.cluster]
     type = "slurm"
@@ -42,6 +43,7 @@ else:  # pragma: no cover
 
 TYPES = ('local', 'ssh', 'slurm')
 DEFAULT_TEMPLATE = Path(__file__).with_name('templates') / 'slurm_default.sbatch'
+CONNECTIONS = ('auto', 'openssh', 'library')
 
 
 @dataclass
@@ -55,6 +57,7 @@ class Machine:
     slots: int = 1                 # concurrent jobs (ssh); ignored for slurm
     env: dict = field(default_factory=dict)   # exported into every job
     sbatch_template: Optional[str] = None     # slurm only; None = package default
+    connection: str = 'auto'       # 'openssh' (multiplexed master), 'library' (paramiko), 'auto' = by platform
 
     def validate(self) -> None:
         if not self.name or not self.name.replace('-', '').replace('_', '').isalnum():
@@ -66,6 +69,8 @@ class Machine:
         if self.type == 'local' and self.name != 'local':
             raise ValueError("only the implicit machine is of type 'local'")
         self.slots = max(1, int(self.slots))
+        if self.connection not in CONNECTIONS:
+            raise ValueError(f'connection must be one of {CONNECTIONS}')
         if not all(isinstance(k, str) and isinstance(v, str) for k, v in self.env.items()):
             raise ValueError('env must map names to strings')
 
@@ -118,6 +123,8 @@ class MachineRegistry:
             for k in ('type', 'host', 'python', 'workdir', 'scans_root'):
                 lines.append(f'{k} = {_toml_str(getattr(m, k))}')
             lines.append(f'slots = {int(m.slots)}')
+            if m.connection != 'auto':
+                lines.append(f'connection = {_toml_str(m.connection)}')
             if m.env:
                 lines.append(f'[machines.{m.name}.env]')
                 for k, v in m.env.items():
