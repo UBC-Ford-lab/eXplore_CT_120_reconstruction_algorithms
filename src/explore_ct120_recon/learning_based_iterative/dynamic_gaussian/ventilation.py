@@ -453,8 +453,10 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
     share = {g_: np.clip(np.where(unit_all[g_] > 1e-9, unit_lung[g_] / np.where(unit_all[g_] > 1e-9, unit_all[g_], 1.0), 0.0), 0.0, 1.0)
              for g_ in (ref, insp)}
     frac = np.where(valid, share[ref], 0.0)
-    lung_parcel_mm3 = float(frac.sum() * dV)
-    air_parcels = {g_: float((share[g_] * air_fraction(hu[g_])).sum() * dV) for g_ in (ref, insp)}
+    # float64 sums: the shares are float32 renders, and a float32 accumulation
+    # over a lung-sized block drifts past the covered volume it is a share of
+    lung_parcel_mm3 = float(frac.sum(dtype=np.float64) * dV)
+    air_parcels = {g_: float((share[g_] * air_fraction(hu[g_])).sum(dtype=np.float64) * dV) for g_ in (ref, insp)}
     dv_parcels = air_parcels[insp] - air_parcels[ref]
     dv_field = float(np.nansum((J_map[covered] - 1.0) * frac[covered]) * dV)
     dv_image = float(air[insp] - air[ref])

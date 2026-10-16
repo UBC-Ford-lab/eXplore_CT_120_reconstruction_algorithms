@@ -4,3 +4,4 @@ prune assets
 exclude .gitignore
 prune gui-frontend
 prune docs
+include CHANGELOG.md

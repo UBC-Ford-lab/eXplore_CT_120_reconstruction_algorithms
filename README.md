@@ -1,6 +1,7 @@
 # eXplore CT 120 Reconstruction
 
 [![PyPI](https://img.shields.io/pypi/v/eXplore_CT_120_reconstruction_algorithms.svg)](https://pypi.org/project/eXplore-CT-120-reconstruction-algorithms/)
+[![CI](https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/actions/workflows/ci.yml/badge.svg)](https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
@@ -140,7 +141,7 @@ ones run in their own sessions, remote ones on their machines, and the next
 server picks them up. The page has no login, so serve it on the lab network
 only.
 
-![New job: the FDK form with the input checklist and the run bar](docs/gui/new_job.png)
+![New job: the FDK form with the input checklist and the run bar](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/docs/gui/new_job.png)
 
 *New job.* One row per flag, generated from the driver's own argparse parser,
 with the ones changed from the defaults marked; only those are passed, so the
@@ -154,7 +155,7 @@ pre-filled from the address bar
 (`/new?driver=learned&algorithm=gaussian&input=…&all=1`; the viewer takes
 `/view?machine=&path=&window=`).
 
-![New job on a cluster: the sbatch directives as editable chips](docs/gui/new_job_cluster.png)
+![New job on a cluster: the sbatch directives as editable chips](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/docs/gui/new_job_cluster.png)
 
 *The same form aimed at a Slurm cluster.* The `#SBATCH` directives appear as
 chips: the teal ones are per-job overrides and can be edited in place, the
@@ -163,18 +164,18 @@ file. A Slurm job is the machine's template with `{job_name}`, `{log}`,
 `{workdir}`, `{env}` and `{command}` filled in; module loads and the account
 belong in the machine's own copy.
 
-![Jobs: every run with status, machine, duration and output](docs/gui/jobs.png)
+![Jobs: every run with status, machine, duration and output](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/docs/gui/jobs.png)
 
 *Jobs.* Every run, filterable by status, machine, driver and text.
 
-![A job: the record and the live log](docs/gui/job.png)
+![A job: the record and the live log](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/docs/gui/job.png)
 
 *One job.* Command line, machine, GPU or node, output, W&B link, and the log
 tailed from wherever it runs. A running job can be cancelled; a finished one
 deleted with or without the files it wrote, which are listed by the run's own
 naming rule and shown with their sizes first.
 
-![Volume: three orthogonal slices of a reconstruction with a linked crosshair](docs/gui/volume.png)
+![Volume: three orthogonal slices of a reconstruction with a linked crosshair](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/docs/gui/volume.png)
 
 *Volume.* Any `.vff` on any connected machine, reached from a job's output or
 by path; here the scanner's own reconstruction of a mouse, shown in the
@@ -183,7 +184,7 @@ lives, so a 2 GB reconstruction on the cluster opens at once; the window is
 applied in the browser (lung, soft tissue, bone presets or free), with the
 value under the cursor and a crosshair linking the three planes.
 
-![Machines: the local machine and a cluster with its queue](docs/gui/machines.png)
+![Machines: the local machine and a cluster with its queue](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/docs/gui/machines.png)
 
 *Machines.* The machine serving the page, plus any GPU workstation over SSH
 or Slurm cluster added on the page (SSH destination, Python interpreter with

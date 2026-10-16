@@ -24,16 +24,36 @@ jobs:
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install package
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,gui]"
 
       - name: Console scripts resolve
         run: |
-          ct120-fdk --help > /dev/null
-          ct120-iterative --help > /dev/null
-          ct120-learned --help > /dev/null
-          ct120-volume-report --help > /dev/null
-          ct120-projection-report --help > /dev/null
-          ct120-geometry-calibration --help > /dev/null
+          python -c "import explore_ct120_recon as m; print(m.__version__)"
+          for cmd in ct120-fdk ct120-iterative ct120-learned ct120-volume-report \
+                     ct120-bilateral-filter ct120-projection-report \
+                     ct120-geometry-calibration ct120-noise-calibration \
+                     ct120-simulate-scan ct120-motion-show ct120-export-4d \
+                     ct120-ventilation ct120-breathing-phantom ct120-gui; do
+            $cmd --help > /dev/null
+          done
+
+  frontend:
+    # the built page under src/explore_ct120_recon/gui/static is committed;
+    # this checks that it is the build of the committed sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: gui-frontend/package-lock.json
+      - run: npm ci
+        working-directory: gui-frontend
+      - run: npm run build
+        working-directory: gui-frontend
+      - name: Committed page is up to date
+        run: git diff --exit-code --stat -- src/explore_ct120_recon/gui/static
 
   build:
     runs-on: ubuntu-latest
