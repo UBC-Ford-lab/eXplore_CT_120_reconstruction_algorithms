@@ -62,27 +62,40 @@ try:
 except ImportError:
     pass
 
-# Shared driver-level pipeline (depends on scan_setup's heavier deps)
-try:
-    from . import pipeline
-    from .pipeline import (
-        ScanContext,
-        add_common_args,
-        prepare_scan,
-        resolve_detector_psi,
-        measure_detector_psi,
-        resolve_or_measure_detector_psi,
-        save_outputs,
-    )
-except ImportError:
-    pass
+# The driver-level pipeline and the half-scan self-calibration import torch
+# (and, through wandb_logging, matplotlib) at module scope, which costs seconds
+# on a cold network file system. They are resolved on first use instead, so
+# ``import explore_ct120_recon`` stays numpy-only: the GUI launcher, a --help,
+# and anything that reads VFF files never pay for it. Access is unchanged:
+# ``ct_core.pipeline``, ``from ct_core import ScanContext`` and the submodule
+# imports all still work (PEP 562).
+_LAZY = {
+    'pipeline': 'pipeline',
+    'ScanContext': 'pipeline',
+    'add_common_args': 'pipeline',
+    'prepare_scan': 'pipeline',
+    'resolve_detector_psi': 'pipeline',
+    'measure_detector_psi': 'pipeline',
+    'resolve_or_measure_detector_psi': 'pipeline',
+    'save_outputs': 'pipeline',
+    'geometry_selfcal': 'geometry_selfcal',
+    'estimate_psi_halfncc': 'geometry_selfcal',
+}
 
-# Half-scan geometry self-calibration (needs torch)
-try:
-    from . import geometry_selfcal
-    from .geometry_selfcal import estimate_psi_halfncc
-except ImportError:
-    pass
+
+def __getattr__(name):
+    module_name = _LAZY.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    module = importlib.import_module(f'.{module_name}', __name__)
+    value = module if name == module_name else getattr(module, name)
+    globals()[name] = value           # resolve once
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY))
 
 # Stopping rules, shared by every iterative and learning-based backend.
 from . import early_stop

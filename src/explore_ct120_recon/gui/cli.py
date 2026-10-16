@@ -77,8 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     sc = sub.add_parser('shortcut', help='Install (or remove) the desktop icon.')
     sc.add_argument('--remove', action='store_true')
     sc.add_argument('--port', type=int, default=None, help='Port the icon starts the server on (default 8120).')
+    sc.add_argument('--host', default=None, help='Interface baked into the icon: 0.0.0.0 serves the lab network (default this machine only).')
     sc.add_argument('--scans-root', type=Path, default=None, help='Scans folder baked into the icon.')
     sc.add_argument('--wandb-project', default=None)
+    sc.add_argument('--data-dir', type=Path, default=None, help='Job table and logs folder baked into the icon.')
+    sc.add_argument('--cwd', type=Path, default=None, help='Working directory for jobs baked into the icon (default: the home directory).')
+    sc.add_argument('--slots', type=int, default=None, help='Concurrent local jobs baked into the icon.')
     sc.add_argument('--desktop', action='store_true', help='Also put the icon on the Desktop.')
     return p
 
@@ -228,12 +232,20 @@ def _launch_command(args) -> list[str]:
         if pythonw.exists():
             exe = str(pythonw)
     cmd = [exe, '-m', 'explore_ct120_recon.gui.cli']
+    if args.host:
+        cmd += ['--host', args.host]
     if args.port:
         cmd += ['--port', str(args.port)]
     if args.scans_root:
         cmd += ['--scans-root', str(Path(args.scans_root).resolve())]
     if args.wandb_project:
         cmd += ['--wandb-project', args.wandb_project]
+    if args.data_dir:
+        cmd += ['--data-dir', str(Path(args.data_dir).resolve())]
+    if args.cwd:
+        cmd += ['--cwd', str(Path(args.cwd).resolve())]
+    if args.slots:
+        cmd += ['--slots', str(args.slots)]
     return cmd
 
 

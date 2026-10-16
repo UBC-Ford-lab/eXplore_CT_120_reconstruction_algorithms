@@ -6,7 +6,6 @@ import os
 import tempfile
 from pathlib import Path
 import xmltodict
-import torch
 
 # key insights into what a vff file looks like came from https://imagej.net/ij/plugins/download/Multi_VFF_Opener.java
 
@@ -278,6 +277,11 @@ class VFFDataset:
             # numpy 2.0 dropped ndarray.newbyteorder(), use view with new dtype
             new_dtype = self.projections.dtype.newbyteorder()
             self.projections = self.projections.byteswap().view(new_dtype)
+
+        # torch is imported here, not at module scope: reading a header or a
+        # volume needs numpy only, and a torch import costs seconds on a cold
+        # network file system (the GUI launcher pays it for a --help otherwise)
+        import torch
 
         # Convert projections to float32 tensor if requested
         if tensor_projections:

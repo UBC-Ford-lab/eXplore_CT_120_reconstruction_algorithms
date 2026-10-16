@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 (2026-10-16)
+
+- `import explore_ct120_recon` no longer imports torch or matplotlib: the
+  driver pipeline and the self-calibration load on first use, and VFF reading
+  is numpy-only. `ct120-gui` starts in about a second instead of paying a
+  cold torch import, which runs to minutes on a network file system.
+- `ct120-gui shortcut` bakes in every server option (`--host`, `--data-dir`,
+  `--cwd`, `--slots` added).
+
 ## 0.2.0 (2026-10-15)
 
 - Dynamic Gaussian splatting (`ct120-learned --algorithm gaussian_dynamic`):

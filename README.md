@@ -131,7 +131,7 @@ against it.
 
 ```bash
 ct120-gui              # starts the server in the background if needed and opens the page
-ct120-gui shortcut     # an icon in the application menu (Start menu, ~/Applications); --desktop, --remove
+ct120-gui shortcut     # an icon in the application menu (Start menu, ~/Applications); --desktop, --remove; the server options are baked into the icon
 ct120-gui serve --host 0.0.0.0 --scans-root data/scans --wandb-project my-project   # a lab server, foreground
 ```
 
