@@ -42,7 +42,7 @@ export default function App() {
   return (
     <div className="app">
       <aside className="rail">
-        <div className="brand"><b>eXplore CT 120</b><span>reconstruction</span></div>
+        <div className="brand"><b>eXplore CT 120</b><span>reconstruction{info ? <em>v{info.version}</em> : null}</span></div>
         <nav>
           <NavLink to="/new">New job</NavLink>
           <NavLink to="/jobs">Jobs {active > 0 && <span className="count">{active} active</span>}</NavLink>
@@ -60,7 +60,7 @@ export default function App() {
           {!info && <span className="error small">server unreachable</span>}
         </div>
         <div className="rail-foot">
-          <span>{local ? `${local.hostname} · v${info!.version}` : ''}</span>
+          <span>{local ? local.hostname : ''}</span>
           {server?.stoppable && <button className="quiet" onClick={stopServer} title={`stop the server (pid ${server.pid}); jobs keep running`}>stop server</button>}
         </div>
       </aside>

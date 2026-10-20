@@ -21,7 +21,7 @@ Importing this package pulls in only ``ct_core`` (VFF I/O, preprocessing,
 calibration). The backends import their optional toolboxes lazily.
 """
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 from . import ct_core
 from .ct_core import vff_io

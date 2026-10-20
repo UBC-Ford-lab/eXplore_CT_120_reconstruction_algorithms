@@ -264,7 +264,11 @@ class LocalExecutor(Executor):
     def start(self, job: Job, store: JobStore) -> None:
         gpu = self._free_gpu(store)
         log_path = self.log_dir / f'{job.id}.log'
-        env = {**os.environ, **self.env, 'PYTHONUNBUFFERED': '1', 'CUDA_VISIBLE_DEVICES': str(gpu)}
+        # PYTHONUTF8: the log is a file, and on Windows a file stdout defaults
+        # to the ANSI code page, which cannot encode the drivers' units (mm⁻¹);
+        # the server reads the log as UTF-8 anyway.
+        env = {**os.environ, **self.env, 'PYTHONUNBUFFERED': '1', 'PYTHONUTF8': '1',
+               'CUDA_VISIBLE_DEVICES': str(gpu)}
         gpus = gpu_inventory()
         gpu_name = gpus[gpu]['name'] if gpu < len(gpus) else None
         exit_file = self.log_dir / f'{job.id}.exit'

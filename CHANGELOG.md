@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 (unreleased)
+
+- Windows: a local job died with `UnicodeEncodeError: 'charmap' codec` at the
+  first unit symbol it printed, since stdout to the log file used the ANSI
+  code page; jobs now run with `PYTHONUTF8=1`.
+- The package version is shown under the page title.
+
 ## 0.2.3 (2026-10-19)
 
 - Windows: the probes the server runs (nvidia-smi, git, taskkill, ssh) no
