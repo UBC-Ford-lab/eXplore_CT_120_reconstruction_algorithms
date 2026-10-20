@@ -18,6 +18,8 @@ import signal
 import socket
 import subprocess
 import sys
+
+from . import proc
 import threading
 import time
 from pathlib import Path
@@ -46,7 +48,7 @@ def gpu_inventory() -> list[dict]:
     except Exception:
         pass
     try:
-        out = subprocess.run(['nvidia-smi', '--query-gpu=index,utilization.gpu,memory.used',
+        out = proc.run(['nvidia-smi', '--query-gpu=index,utilization.gpu,memory.used',
                               '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=5)
         if out.returncode == 0:
             for line in out.stdout.strip().splitlines():
@@ -86,7 +88,7 @@ def host_memory() -> dict:
         # no SC_AVPHYS_PAGES on macOS; vm_stat gives the page counts instead
         try:
             import subprocess
-            out = subprocess.run(['vm_stat'], capture_output=True, text=True, timeout=5).stdout
+            out = proc.run(['vm_stat'], capture_output=True, text=True, timeout=5).stdout
             counts = {}
             for line in out.splitlines():
                 key, _, value = line.partition(':')
@@ -118,7 +120,7 @@ def package_provenance() -> dict:
     root = Path(__file__).resolve().parents[3]
     if (root / '.git').exists():
         try:
-            info['commit'] = subprocess.run(['git', '-C', str(root), 'describe', '--always', '--dirty', '--tags'],
+            info['commit'] = proc.run(['git', '-C', str(root), 'describe', '--always', '--dirty', '--tags'],
                                             capture_output=True, text=True, timeout=5).stdout.strip() or None
         except Exception:
             pass
@@ -143,7 +145,7 @@ def _interrupt_group(pid: int) -> None:
 
 def _kill_group(pid: int) -> None:
     if sys.platform == 'win32':
-        subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True)
+        proc.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True)
     else:
         os.killpg(pid, signal.SIGKILL)
 

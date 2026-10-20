@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+
+from . import proc
 import sys
 
 from .schema import Driver, predict_output
@@ -321,7 +323,7 @@ def run_checks(checks: list[dict], *, cwd: str | None, conn=None, python: str | 
         return []
     spec = json.dumps({'checks': checks, 'cwd': cwd})
     if conn is None:
-        r = subprocess.run([python or sys.executable, '-c', SNIPPET, spec],
+        r = proc.run([python or sys.executable, '-c', SNIPPET, spec],
                            capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip()[:500])

@@ -9,6 +9,8 @@ import json
 import os
 import shlex
 import subprocess
+
+from . import proc
 import sys
 import threading
 from collections import OrderedDict
@@ -86,7 +88,7 @@ else:
 def _run(spec: dict, *, conn=None, python: Optional[str] = None, timeout: float = 60) -> dict:
     text = json.dumps(spec)
     if conn is None:
-        r = subprocess.run([python or sys.executable, '-c', SNIPPET, text], capture_output=True, text=True, timeout=timeout)
+        r = proc.run([python or sys.executable, '-c', SNIPPET, text], capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip().splitlines()[-1][:400] if r.stderr.strip() else f'exit {r.returncode}')
         return json.loads(r.stdout.strip().splitlines()[-1])

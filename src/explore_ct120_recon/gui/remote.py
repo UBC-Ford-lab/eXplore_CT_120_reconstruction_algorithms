@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import proc
 from .executors import Executor
 from .jobs import Job, JobStore
 from .machines import Machine
@@ -121,7 +122,7 @@ class SshConnection:
     def master_alive(self) -> bool:
         if not self.socket.exists():
             return False
-        r = subprocess.run(['ssh', '-O', 'check', '-o', f'ControlPath={self.socket}', self.host],
+        r = proc.run(['ssh', '-O', 'check', '-o', f'ControlPath={self.socket}', self.host],
                            capture_output=True, text=True, timeout=15)
         return r.returncode == 0
 
@@ -130,7 +131,7 @@ class SshConnection:
         ``reopen`` (the Connect button or a login) is called."""
         self.closed = True
         if self.socket.exists():
-            subprocess.run(['ssh', '-O', 'exit', '-o', f'ControlPath={self.socket}', self.host],
+            proc.run(['ssh', '-O', 'exit', '-o', f'ControlPath={self.socket}', self.host],
                            capture_output=True, text=True, timeout=15)
         try:
             self.socket.unlink()
@@ -164,7 +165,7 @@ class SshConnection:
     def run(self, command: str, *, timeout: float = 120, input: Optional[str] = None) -> subprocess.CompletedProcess:
         if self.closed:
             raise LoggedOut(f'{self.host}: logged out')
-        return subprocess.run(self._base() + [command], capture_output=True, text=True,
+        return proc.run(self._base() + [command], capture_output=True, text=True,
                               timeout=timeout, input=input)
 
     def check(self, command: str, **kw) -> str:
@@ -180,7 +181,7 @@ class SshConnection:
     def read_from(self, path: str, offset: int) -> bytes:
         if self.closed:
             raise LoggedOut(f'{self.host}: logged out')
-        r = subprocess.run(self._base() + [f'tail -c +{offset + 1} {shlex.quote(path)} 2>/dev/null'],
+        r = proc.run(self._base() + [f'tail -c +{offset + 1} {shlex.quote(path)} 2>/dev/null'],
                            capture_output=True, timeout=60)
         return r.stdout if r.returncode == 0 else b''
 

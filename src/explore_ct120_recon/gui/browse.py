@@ -6,6 +6,8 @@ import json
 import os
 import shlex
 import subprocess
+
+from . import proc
 import sys
 
 # stdlib only: runs under whatever python the machine has
@@ -43,7 +45,9 @@ entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
 print(json.dumps({"path": p, "parent": os.path.dirname(p) if os.path.dirname(p) != p else None,
                   "entries": entries, "error": error,
                   "places": [x for x in [("working dir", cwd), ("home", os.path.expanduser("~")),
-                                         ("scans", spec.get("scans_root"))] if x[1]]}))
+                                         ("scans", spec.get("scans_root"))] if x[1]]
+                            + ([(c + ":", c + ":\\") for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                if os.path.exists(c + ":\\")] if sys.platform == "win32" else [])}))
 '''
 
 
@@ -51,7 +55,7 @@ def list_dir(path: str | None, *, cwd: str | None, scans_root: str | None = None
              conn=None, python: str | None = None, hidden: bool = False) -> dict:
     spec = json.dumps({'path': path, 'cwd': cwd, 'scans_root': scans_root, 'hidden': hidden})
     if conn is None:
-        r = subprocess.run([python or sys.executable, '-c', SNIPPET, spec], capture_output=True, text=True, timeout=30)
+        r = proc.run([python or sys.executable, '-c', SNIPPET, spec], capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip()[:500])
         return json.loads(r.stdout.strip().splitlines()[-1])

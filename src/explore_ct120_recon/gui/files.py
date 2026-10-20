@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+
+from . import proc
 import sys
 
 SNIPPET = r'''
@@ -57,7 +59,7 @@ def run_snippet(base: str, action: str, *, conn=None, python: str | None = None)
     """``action`` is ``list`` or ``delete``. With ``conn`` the snippet runs on
     the remote machine through its connection."""
     if conn is None:
-        r = subprocess.run([python or sys.executable, '-c', SNIPPET, base, action],
+        r = proc.run([python or sys.executable, '-c', SNIPPET, base, action],
                            capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip()[:500])

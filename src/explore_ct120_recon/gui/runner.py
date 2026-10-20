@@ -18,7 +18,11 @@ def main(argv=None) -> int:
     if len(argv) < 3 or argv[1] != '--':
         raise SystemExit('usage: runner EXIT_FILE -- COMMAND...')
     exit_file, command = argv[0], argv[2:]
-    proc = subprocess.Popen(command)
+    # explicit handles: on Windows a child started without redirection does
+    # not inherit the wrapper's redirected stdout (the log file) but attaches
+    # to the hidden console, and the log stays empty.
+    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                            stdout=sys.stdout, stderr=sys.stderr)
 
     def forward(signum, _frame):
         try:

@@ -196,6 +196,13 @@ def write_vff(filename, header, data, verbose=True):
         arr_be.tofile(f)
 
 
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 class VFFDataset:
     def __init__(self, folder: str, xml_file: str, save_headers: bool = False, tensor_projections: bool = False,
                  paths_str: str = "acq*", exclude_pred_paths: bool = False, projection_spacing = None,
@@ -266,17 +273,18 @@ class VFFDataset:
             if save_headers:
                 self.headers.append(hdr)
 
-        # Projections are now fully loaded into the memmap; the backing file
-        # itself is scratch and can be removed immediately (the OS keeps the
-        # already-mmap'd data accessible via the existing file descriptor
-        # until this process exits or self.projections is released).
-        os.remove(self._memmap_path)
-
-        # Convert memmap to native byte order so torch can load it
+        # Convert memmap to native byte order so torch can load it. byteswap()
+        # returns a copy, so for VFF (big-endian) the data is in RAM from here
+        # and the memmap is dropped with the old reference.
         if self.projections.dtype.byteorder not in ('=', '<'):  # not native little endian
             # numpy 2.0 dropped ndarray.newbyteorder(), use view with new dtype
             new_dtype = self.projections.dtype.newbyteorder()
             self.projections = self.projections.byteswap().view(new_dtype)
+
+        # The backing file is scratch. POSIX lets a mapped file be unlinked
+        # (the mapping stays valid); Windows refuses with "being used by
+        # another process" while any mapping is open, so retry at exit.
+        self._discard_memmap_file()
 
         # torch is imported here, not at module scope: reading a header or a
         # volume needs numpy only, and a torch import costs seconds on a cold
@@ -302,6 +310,19 @@ class VFFDataset:
                           + self.starting_angle_offset) % 360
             print(f"Gantry angles unavailable, using synthetic arange (step={step:.4f}°)")
         self.angles_rad = torch.deg2rad(angles_deg)
+
+    def _discard_memmap_file(self):
+        path = getattr(self, '_memmap_path', None)
+        if not path:
+            return
+        try:
+            os.remove(path)
+            self._memmap_path = None
+        except FileNotFoundError:
+            self._memmap_path = None
+        except PermissionError:
+            import atexit
+            atexit.register(_remove_quietly, path)
 
     def _read_vff(self, path: Path):
         # Use same header parsing as standalone functions

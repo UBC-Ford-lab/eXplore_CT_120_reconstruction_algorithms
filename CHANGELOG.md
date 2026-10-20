@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.3 (2026-10-19)
+
+- Windows: the probes the server runs (nvidia-smi, git, taskkill, ssh) no
+  longer flash a console window every few seconds.
+- Windows: job logs were empty, the driver's output went to the wrapper's
+  hidden console instead of the log file.
+- Windows: reading a scan failed with "the process cannot access the file
+  because it is being used by another process": the projection memmap's
+  scratch file was unlinked while still mapped, which only POSIX allows.
+- Windows: the file browser lists the drive letters (`Z:` for a network
+  share) under Places; `C:\` has no parent to climb to otherwise.
+
 ## 0.2.2 (2026-10-16)
 
 - Windows: the page runs jobs locally (job wrapper, cancel and memory probe

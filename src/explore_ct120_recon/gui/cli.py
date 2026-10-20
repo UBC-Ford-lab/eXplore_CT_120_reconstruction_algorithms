@@ -18,6 +18,8 @@ import os
 import platform
 import shlex
 import subprocess
+
+from . import proc
 import sys
 import time
 import urllib.error
@@ -203,7 +205,7 @@ def stop(args) -> int:
         return 1
     try:
         if sys.platform == 'win32':
-            subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
+            proc.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
         else:
             import signal
             os.kill(pid, signal.SIGTERM)
@@ -285,7 +287,7 @@ def install_shortcut(args) -> int:
             t.parent.mkdir(parents=True, exist_ok=True)
             t.write_text(entry)
             t.chmod(0o755)
-        subprocess.run(['update-desktop-database', str(paths['menu'].parent)], capture_output=True)
+        proc.run(['update-desktop-database', str(paths['menu'].parent)], capture_output=True)
     for t in targets:
         print(f'ct120-gui: installed {t}')
     print(f'  runs: {shlex.join(cmd)}')
@@ -326,7 +328,7 @@ def _write_lnk(target: Path, cmd: list[str]) -> None:
     tmp = target.with_suffix('.vbs')
     tmp.write_text(vbs)
     try:
-        subprocess.run(['cscript', '//nologo', str(tmp)], check=True, capture_output=True)
+        proc.run(['cscript', '//nologo', str(tmp)], check=True, capture_output=True)
     finally:
         tmp.unlink()
 
@@ -363,9 +365,9 @@ def _png_to_icns(png: Path, icns: Path) -> None:
         iconset = Path(d) / 'icon.iconset'
         iconset.mkdir()
         for n in (16, 32, 128, 256, 512):
-            subprocess.run(['sips', '-z', str(n), str(n), str(png), '--out', str(iconset / f'icon_{n}x{n}.png')], capture_output=True)
-            subprocess.run(['sips', '-z', str(2 * n), str(2 * n), str(png), '--out', str(iconset / f'icon_{n}x{n}@2x.png')], capture_output=True)
-        subprocess.run(['iconutil', '-c', 'icns', str(iconset), '-o', str(icns)], capture_output=True)
+            proc.run(['sips', '-z', str(n), str(n), str(png), '--out', str(iconset / f'icon_{n}x{n}.png')], capture_output=True)
+            proc.run(['sips', '-z', str(2 * n), str(2 * n), str(png), '--out', str(iconset / f'icon_{n}x{n}@2x.png')], capture_output=True)
+        proc.run(['iconutil', '-c', 'icns', str(iconset), '-o', str(icns)], capture_output=True)
 
 
 def main_rc(argv=None) -> int:
