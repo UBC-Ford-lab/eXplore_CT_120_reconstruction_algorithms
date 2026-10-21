@@ -1,46 +1,27 @@
 # Changelog
 
-## 0.2.4 (unreleased)
+## 0.3.0 (2026-10-21)
 
-- Detector unwarp for every backend (`--detector-warp`, default `auto`).
-  Scans taken since the scanner's 2024 recalibration carry a +-20 px
-  detector distortion in their raw `acq-*` frames that the vendor removes
-  before reconstructing (its `Corrected/uwarp-*` frames); the scan.xml
-  geometry describes the detector after that step. Reconstructed raw, every
-  off-axis structure in a short scan split into two offset halves, and no
-  centre-of-rotation value fixed it at more than one height. The field is
-  measured once per detector epoch from paired acq/uwarp frames (noise
-  registration, bicubic fit; `data/calibration/detector_warp_<serial>_cor<xml
-  centre>.npz`, publish with `python -m explore_ct120_recon.ct_core.detector_warp
-  export`; the UBC scanner's 2024-epoch field ships inside the package under
-  `explore_ct120_recon/calibration/`) and `prepare_scan` resamples the projections and flat fields with
-  it at load time, so FDK, ASTRA, TIGRE, the learned backends, the psi
-  self-calibration and the support measurement all see corrected frames. The
-  unit of knowledge is a detector epoch (serial + the scan.xml
-  CentreOfRotation the vendor rewrites at every recalibration, e.g. a source
-  change): an epoch with a measured field gets it; an epoch recorded as
-  needing none (the 2022 scans) is left alone; an unknown epoch whose scan
-  carries `Corrected/uwarp-*` frames is measured from them on the spot and
-  stored; an unknown epoch without them, on a detector that has records,
-  stops with instructions rather than reconstructing split. Another
-  epoch's non-affine part is an opt-in (`nonaffine`). With the
-  full same-epoch field applied the frames sit on the vendor's ideal grid,
-  so psi is 0 and the self-calibration is skipped; otherwise the psi cache
-  records which unwarp the frames carried and re-measures on a mismatch.
-  The learned driver's own `--detector-warp` (ray domain) is replaced by the
-  shared flag; the ray-domain path remains for config-driven runs.
-
-- Windows: a local job died with `UnicodeEncodeError: 'charmap' codec` at the
-  first unit symbol it printed, since stdout to the log file used the ANSI
-  code page; jobs now run with `PYTHONUTF8=1`.
+- Detector unwarp. Raw `acq-*` frames carry the detector's geometric
+  distortion (up to ~20 px); the vendor removes it with the `transform1`
+  table in each scan folder before reconstructing, and the scan.xml
+  geometry refers to the corrected frames. The loader now applies that
+  table at load time for every backend (`--detector-warp`, default `auto`),
+  so the rotation axis is the vendor's CentreOfRotation/CentralSlice and no
+  psi self-calibration is needed (`--cor-mode vendor`, chosen by the new
+  `auto` default after an unwarp). This affects all scans, including the
+  2022 ones: reconstructions were previously off by about 0.7 % in scale and
+  several pixels in the axis position. When `transform1` is missing the
+  loader falls back to a stored field for the same detector epoch (two ship
+  with the package), measures one from `Corrected/uwarp-*` frames if the
+  scan has them, or stops with instructions. The GUI scan check shows this
+  as a "detector unwarp" line.
+- Windows: jobs now run with `PYTHONUTF8=1`; the log file's code page
+  caused a `UnicodeEncodeError` at the first unit symbol.
 - The package version is shown under the page title.
-- One progress bar for the whole job, with a time estimate, on the job page
-  (and a percentage in the job list). Each driver declares its phases and
-  their rough share of the run (`progress-plan: ...`) and prints
-  `progress: <phase> <done>/<total>` from its loops (FDK preprocess, filter
-  and backprojection passes, iterations, rendered slabs, the save); the
-  server maps them onto a single cumulative fraction that never goes back
-  and measures its pace over the last five minutes for the estimate.
+- One progress bar with a time estimate for the whole job on the job page,
+  and a percentage in the job list. Drivers declare their phases and print
+  `progress: <phase> <done>/<total>` from their loops.
 
 ## 0.2.3 (2026-10-19)
 

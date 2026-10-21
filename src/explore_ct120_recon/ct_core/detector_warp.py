@@ -170,9 +170,63 @@ class DetectorWarp:
         self.coefs = (strip_affine(coefs, self.deg) if mode == "nonaffine"
                       else self.full_coefs)
 
+        #: optional dense field (2, H, W) float32 in raw px, (d_row, d_col):
+        #: when present the projection-domain unwarp samples it directly
+        #: (exact, no polynomial residual); the polynomial is still what the
+        #: ray-domain inverse and the stored calibrations use.
+        self.dense = None
+
     @property
     def is_null(self) -> bool:
         return self.mode == "none"
+
+    @classmethod
+    def from_vendor_table(cls, scan_folder, *, deg: int = 3,
+                          detector_serial: str | None = None,
+                          cor_xml: float | None = None, rfan: float | None = None,
+                          raw_shape=None) -> "DetectorWarp":
+        """The field the vendor itself applied, from the scan's ``transform1``.
+
+        Every scan folder carries ``transform1``: a VTK grid transform,
+        little-endian float32 (rows, cols, 3) over the detector, rows stored
+        bottom-up (VTK's y-up), channel 0 the column displacement, channel 1
+        the row displacement, channel 2 zero. Decoded against the field
+        measured from paired acq/uwarp frames of the same epoch it agrees to
+        R^2 0.998 / 0.986 with 0.4 / 0.6 px residuals (the measurement's own
+        noise), and its MD5 is the ``transform_checksum`` the vendor stamps
+        into its uwarp frames. It is therefore the exact per-epoch
+        calibration, present for epochs that never archived Corrected frames.
+        """
+        scan_folder = Path(scan_folder)
+        path = scan_folder / 'transform1'
+        if raw_shape is None:
+            from .vff_io import read_vff_header
+            frame = next(iter(sorted(scan_folder.glob('acq-*.vff'))), None)
+            if frame is None:
+                raise FileNotFoundError(f"no acq-*.vff in {scan_folder}")
+            h = read_vff_header(str(frame), verbose=False)
+            W, H = (int(v) for v in h['size'].split()[:2])
+        else:
+            H, W = (int(v) for v in raw_shape)
+        n = path.stat().st_size
+        if n != H * W * 3 * 4:
+            raise ValueError(f"{path} is {n} bytes, not a {H}x{W}x3 float32 table")
+        t = np.fromfile(str(path), dtype='<f4').reshape(H, W, 3)[::-1]
+        dense = np.ascontiguousarray(np.stack([t[..., 1], t[..., 0]]), dtype=np.float32)
+        # a compact polynomial for storage / the ray-domain inverse
+        rr, cc = np.meshgrid(np.linspace(0, H - 1, min(H, 144)), np.linspace(0, W - 1, min(W, 220)), indexing='ij')
+        rr, cc = rr.astype(int), cc.astype(int)
+        rn = (rr - (H - 1) / 2) / ((H - 1) / 2); cn = (cc - (W - 1) / 2) / ((W - 1) / 2)
+        A = _basis(rn.ravel(), cn.ravel(), deg)
+        coefs = np.array([np.linalg.lstsq(A, f[rr, cc].ravel(), rcond=None)[0] for f in dense])
+        import hashlib
+        md5 = hashlib.md5(path.read_bytes()).hexdigest()
+        w = cls(coefs, deg, (H, W), mode='full', detector_serial=detector_serial,
+                source=str(path), cor_xml=cor_xml, rfan=rfan, scans=(scan_folder.name,),
+                note=f"vendor transform1 table (md5 {md5[:8]})")
+        w.dense = dense
+        w.md5 = md5
+        return w
 
     # -- construction ----------------------------------------------------
     @classmethod
@@ -272,12 +326,17 @@ class DetectorWarp:
 
     def sampling_grid(self, device=None, dtype=torch.float32) -> torch.Tensor:
         """``grid_sample`` coordinates that read ``raw(p + d(p))`` at every
-        raw pixel ``p`` — the projection-domain unwarp, (1, H, W, 2)."""
+        raw pixel ``p`` — the projection-domain unwarp, (1, H, W, 2). Uses
+        the dense vendor table when the field came from one."""
         H, W = self.raw_shape
         rr, cc = torch.meshgrid(
             torch.arange(H, dtype=torch.float64, device=device),
             torch.arange(W, dtype=torch.float64, device=device), indexing="ij")
-        d_r, d_c = self._displacement_raw(rr, cc)
+        if self.dense is not None and self.mode == 'full':
+            d = torch.as_tensor(self.dense, dtype=torch.float64, device=device)
+            d_r, d_c = d[0], d[1]
+        else:
+            d_r, d_c = self._displacement_raw(rr, cc)
         gy = 2.0 * (rr + d_r) / (H - 1) - 1.0
         gx = 2.0 * (cc + d_c) / (W - 1) - 1.0
         return torch.stack([gx, gy], -1).unsqueeze(0).to(dtype)
@@ -309,6 +368,8 @@ class DetectorWarp:
 
     def tag(self) -> str:
         """Short provenance string for sidecars and the psi cache."""
+        if self.dense is not None:
+            return f"{self.mode}:transform1:{getattr(self, 'md5', '')[:8]}"
         src = Path(self.source).name if self.source else 'in-memory'
         return f"{self.mode}:{src}"
 
@@ -349,6 +410,27 @@ def find_calibrations(serial: str, calib_dir=None) -> list[DetectorWarp]:
     return out
 
 
+def vendor_table_checksum_ok(scan_folder) -> bool | None:
+    """Whether ``transform1``'s MD5 matches the ``transform_checksum`` the
+    vendor wrote into this scan's uwarp frames. None when there is nothing
+    to compare against (no Corrected frames, or no checksum in them)."""
+    scan_folder = Path(scan_folder)
+    u = next(iter(sorted((scan_folder / 'Corrected').glob('uwarp-*.vff'))), None)
+    if u is None or not (scan_folder / 'transform1').exists():
+        return None
+    head = u.open('rb').read(4096).decode('latin-1')
+    m = re.search(r'transform_checksum=([0-9a-f]{32})', head)
+    if not m:
+        return None
+    import hashlib
+    return hashlib.md5((scan_folder / 'transform1').read_bytes()).hexdigest() == m.group(1)
+
+
+def has_vendor_table(scan_folder, raw_shape) -> bool:
+    p = Path(scan_folder) / 'transform1'
+    return p.exists() and p.stat().st_size == int(raw_shape[0]) * int(raw_shape[1]) * 12
+
+
 def has_paired_frames(scan_folder) -> bool:
     """True when the scan carries the vendor's unwarped frames next to the
     raw ones, i.e. the field can be measured from this scan itself."""
@@ -370,6 +452,10 @@ def select_projection_warp(scan_folder, xml_header, raw_detector_shape, *,
     "none" (raw frames verified to reconstruct round), or nothing.
 
     ``auto``
+        scan carries the vendor's own ``transform1`` table
+                                  -> apply it (exact, per-epoch by construction;
+                                     checked against the uwarp checksum when
+                                     Corrected frames are present).
         known epoch with a field  -> apply the full field.
         known epoch, "none"       -> raw frames as-is.
         unknown epoch, scan has ``Corrected/uwarp-*`` frames
@@ -424,6 +510,22 @@ def select_projection_warp(scan_folder, xml_header, raw_detector_shape, *,
         src = ([w for w in same if not w.is_null] or fields)[0].source
         warp = _check_shape(DetectorWarp.load(src, mode='nonaffine'))
     else:  # auto
+        if has_vendor_table(scan_folder, shape):
+            warp = DetectorWarp.from_vendor_table(
+                scan_folder, detector_serial=serial, cor_xml=cor, raw_shape=shape)
+            ok = vendor_table_checksum_ok(scan_folder)
+            if verbose:
+                print(f"  Detector warp: {warp.summary()}")
+                print(f"                 from the scan's own vendor table "
+                      f"(transform1, md5 {warp.md5[:8]}"
+                      f"{'' if ok is None else ', matches the uwarp frames' if ok else ', DOES NOT MATCH the uwarp frames checksum'})")
+            if ok is False:
+                raise RuntimeError(
+                    f"{Path(scan_folder).name}: transform1 (md5 {warp.md5}) is not "
+                    f"the table the vendor applied to this scan's Corrected "
+                    f"frames; refusing to use it. Pass --detector-warp off, or "
+                    f"remove the file so the stored epoch calibration is used.")
+            return warp
         if same and same[0].is_null:
             if verbose:
                 print(f"  Detector warp: none — epoch CoR {cor} of detector "

@@ -368,6 +368,9 @@ def reconstructible_fov(xml_header, n_b: int, n_a: int,
     if cor_mode == 'xml':
         ca = _xml_field(xml_header, 'CentreOfRotation')
         cb = _xml_field(xml_header, 'CentralSlice')
+    elif cor_mode == 'vendor':
+        ca = (n_a - 1) - _xml_field(xml_header, 'CentreOfRotation')
+        cb = (n_b - 1) - _xml_field(xml_header, 'CentralSlice')
     else:
         ca, cb = (n_a - 1) / 2.0, (n_b - 1) / 2.0
 

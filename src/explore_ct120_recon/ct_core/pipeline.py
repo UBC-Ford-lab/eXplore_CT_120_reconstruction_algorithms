@@ -179,15 +179,18 @@ def add_common_args(parser):
     )
     parser.add_argument(
         '--cor-mode',
-        default='center',
-        choices=('center', 'xml'),
-        help='Detector centre-of-rotation policy (default: center). '
-             '"center" places the rotation axis at the detector geometric '
-             'centre — the validated configuration: with the detector-psi '
-             'calibration applied, adding the scan.xml CentreOfRotation '
-             'offset on top over-corrects (decisive split-tube experiment, '
-             '2026-08-13). "xml" restores the legacy scan.xml '
-             'CentreOfRotation/CentralSlice values.'
+        default='auto',
+        choices=('auto', 'vendor', 'center', 'xml'),
+        help='Detector centre-of-rotation policy (default: auto). "vendor": '
+             'the scan.xml CentreOfRotation/CentralSlice in the convention '
+             'the vendor means them — mirrored across the detector '
+             '((N-1) - value) — which is where the axis sits once the frames '
+             'are unwarped (round tube at every height on both epochs, '
+             'vendor-volume NCC 0.939 -> 0.965 on Scan_1510). "center": the '
+             'detector geometric centre + the psi self-calibration, the '
+             'policy for RAW frames. "auto" = vendor when a detector unwarp '
+             'was applied, center otherwise. "xml" is the legacy unmirrored '
+             'reading, kept for comparison; it over-corrects.'
     )
     parser.add_argument(
         '--geometry-autocal',
@@ -513,7 +516,7 @@ def resolve_fov(args, xml_header, projections, *, bright_field=None,
 
     n_b, n_a = int(projections.shape[1]), int(projections.shape[2])
     reach = reconstructible_fov(xml_header, n_b, n_a,
-                                cor_mode=getattr(args, 'cor_mode', 'center'))
+                                cor_mode=('center' if getattr(args, 'cor_mode', 'center') in ('auto', 'vendor') else getattr(args, 'cor_mode', 'center')))
     fov_xy = reach['fov_xy'] if want_xy is None else want_xy
     fov_z = reach['fov_z'] if want_z is None else want_z
     print(f"\nField of view 'auto': the detector subtends "
@@ -585,7 +588,21 @@ def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
     """
     geometry['central_pixel_a_xml'] = geometry['central_pixel_a']
     geometry['central_pixel_b_xml'] = geometry['central_pixel_b']
-    if cor_mode == 'center':
+    if cor_mode == 'auto':
+        raise ValueError("apply_cor_policy needs a resolved mode (vendor/center/xml)")
+    if cor_mode == 'vendor':
+        # The vendor's numbers index the detector from the other edge: the
+        # unwarped Scan_2005 tube is round at (N_a-1)-1744.96 and split at
+        # 1744.96; the 2022 Scan_1510 likewise at (N_a-1)-1758.48. The row
+        # mirror puts the vendor volume's z offset at 0.01 mm (0.52 unmirrored).
+        geometry['central_pixel_a'] = (n_a - 1) - geometry['central_pixel_a_xml']
+        geometry['central_pixel_b'] = (n_b - 1) - geometry['central_pixel_b_xml']
+        if verbose:
+            print(f"\n  Centre of rotation: vendor values, mirrored "
+                  f"(a={geometry['central_pixel_a']:.2f}, "
+                  f"b={geometry['central_pixel_b']:.2f}) — the axis of the "
+                  f"unwarped detector grid; psi not applied.")
+    elif cor_mode == 'center':
         geometry['central_pixel_a'] = (n_a - 1) / 2.0
         geometry['central_pixel_b'] = (n_b - 1) / 2.0
         if verbose:
@@ -707,10 +724,15 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         projections, bright_field, dark_field = warp_projections(
             projections, bright_field, dark_field, warp)
         mean_px, max_px = warp.magnitude()
-        warp_info = {'mode': warp.mode, 'calibration': Path(warp.source).name,
+        warp_info = {'mode': warp.mode, 'calibration': ('transform1' if warp.dense is not None else Path(warp.source).name),
                      'detector_serial': warp.detector_serial,
                      'cor_xml': warp.cor_xml, 'mean_px': mean_px,
                      'max_px': max_px, 'tag': warp.tag()}
+
+    cor_mode = str(getattr(args, 'cor_mode', 'auto') or 'auto')
+    if cor_mode == 'auto':
+        cor_mode = 'vendor' if warp is not None and warp.mode == 'full' else 'center'
+    args.cor_mode = cor_mode          # downstream readers see the resolved mode
 
     factor = int(getattr(args, 'downsample', 1) or 1)
     # Grid + CoR policy + the pitch rescale, in one shared call — so muNeRF,
@@ -722,7 +744,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         fov_xy=fov_xy, fov_z=fov_z,
         voxel_xy=args.voxel_xy, voxel_z=args.voxel_z,
         roi_bounds=None if use_domain else roi_bounds,
-        cor_mode=getattr(args, 'cor_mode', 'center'),
+        cor_mode=cor_mode,
         downsample=factor,
         # Under a model domain this grid is provisional — it exists only to
         # carry the detector parameters into the support measurement, and is
@@ -1030,6 +1052,11 @@ def save_outputs(volume, ctx: ScanContext, args, output_path: str,
     psi = ctx.geometry.get('det_psi_rad')
     if psi:
         metadata['detector_psi_deg'] = float(np.degrees(psi))
+    metadata['cor_mode'] = str(getattr(args, 'cor_mode', 'center'))
+    if ctx.detector_warp:
+        metadata['detector_warp'] = {k: ctx.detector_warp[k] for k in
+                                     ('mode', 'calibration', 'tag', 'mean_px', 'max_px')
+                                     if k in ctx.detector_warp}
     report('save', 0, 1)
     path, anchors, volume_hu = postprocess_and_save(
         volume_mu=volume,

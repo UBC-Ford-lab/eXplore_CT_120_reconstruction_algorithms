@@ -76,6 +76,60 @@ def serial_of(path):
     h = vff_header(path) or {}
     return h.get('serialNumber')
 
+def unwarp_item(scan_dir, proj_dir, serial, header):
+    """The detector unwarp the loader will apply, judged the way it judges it.
+
+    The vendor's own table (transform1) is the normal case. Without it the
+    package falls back to a stored record for the detector epoch, or measures
+    the field from Corrected/uwarp frames; with neither it stops. Every case
+    without the table is at least a warning, since that is the state the
+    user asked to be told about.
+    """
+    try:
+        W, H = (int(v) for v in header.get('size', '0 0').split()[:2])
+    except ValueError:
+        W = H = 0
+    if (serial or '').upper().startswith('SIMULATED') or glob.glob(os.path.join(proj_dir, 'proj-*.vff')):
+        return item('detector unwarp', 'info', 'simulated projections carry no detector warp; none applied')
+    table = os.path.join(scan_dir, 'transform1')
+    size_ok = os.path.isfile(table) and os.path.getsize(table) == H * W * 12
+    paired = bool(glob.glob(os.path.join(scan_dir, 'Corrected', 'uwarp-*.vff'))) and bool(glob.glob(os.path.join(scan_dir, 'acq-*.vff')))
+    cor = None
+    try:
+        cor = float(xml_field(open(os.path.join(scan_dir, 'scan.xml'), errors='replace').read(), 'CentreOfRotation'))
+    except Exception:
+        pass
+    if size_ok:
+        try:
+            from explore_ct120_recon.ct_core.detector_warp import vendor_table_checksum_ok
+            ok = vendor_table_checksum_ok(scan_dir)
+        except Exception:
+            ok = None
+        if ok is False:
+            return item('detector unwarp', 'fail', 'transform1 does not match the checksum in the Corrected frames; the job stops (use --detector-warp off to run uncorrected)')
+        return item('detector unwarp', 'ok', "vendor table transform1" + (' (checksum matches the Corrected frames)' if ok else ''))
+    if os.path.isfile(table):
+        return item('detector unwarp', 'fail', f'transform1 is {human(os.path.getsize(table))}, not a {H}x{W} table; the job stops unless --detector-warp off')
+    # no table: what the loader falls back to
+    try:
+        from explore_ct120_recon.ct_core.detector_warp import find_calibrations
+        recs = find_calibrations(serial) if serial else []
+    except Exception:
+        recs = None
+    if recs is None:
+        return item('detector unwarp', 'warn', 'transform1 missing; package not importable here, cannot tell what the loader will do')
+    same = [r for r in recs if r.same_epoch(cor)]
+    if same and not same[0].is_null:
+        return item('detector unwarp', 'warn', f'transform1 missing; the stored record for this detector epoch will be used ({os.path.basename(same[0].source)})')
+    if same:
+        return item('detector unwarp', 'warn', 'transform1 missing; this detector epoch is on record as needing no unwarp')
+    if paired:
+        return item('detector unwarp', 'warn', 'transform1 missing; the field will be measured from the Corrected/uwarp frames on first use and stored for this epoch')
+    if recs:
+        return item('detector unwarp', 'fail', f'transform1 missing and no record for this detector epoch (CentreOfRotation {cor}); the job stops. Archive the scan with its transform1 or Corrected/ frames, or pass --detector-warp off to run uncorrected')
+    return item('detector unwarp', 'warn', 'transform1 missing and nothing known about this detector; raw frames are used uncorrected (off-axis structures may come out doubled)')
+
+
 def scan_group(path, title, scan_folder=None, want_calibration=True):
     items = []
     p = full(path)
@@ -152,6 +206,8 @@ def scan_group(path, title, scan_folder=None, want_calibration=True):
         else:
             items.append(item('projection header', 'ok',
                               f"{h.get('size', '?')} px, {h.get('bits', '?')} bit" + (f', detector {serial}' if serial else '')))
+    if proj and (h := vff_header(proj[0])):
+        items.append(unwarp_item(cal or p, p, serial, h))
     if want_calibration and serial:
         cdir = calibration_dir()
         tag = os.path.basename(p.rstrip('/'))
