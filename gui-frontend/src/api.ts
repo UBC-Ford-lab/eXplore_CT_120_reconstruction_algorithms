@@ -48,7 +48,9 @@ export interface Job {
   remote_id: string | null; remote_state: string | null; node: string | null; resources: string
   pid: number | null; returncode: number | null; log_path: string | null; output_path: string | null
   wandb_url: string | null; package_version: string | null; error: string | null; shell?: string
+  progress: Progress | null
 }
+export interface Progress { phase: string; done: number; total: number; fraction: number | null; phase_fraction: number | null; rate: number | null; eta: number | null; updated: number }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...init })
@@ -107,6 +109,15 @@ export function fmtDuration(s: number | null): string {
   if (s < 90) return `${Math.round(s)} s`
   if (s < 5400) return `${(s / 60).toFixed(1)} min`
   return `${(s / 3600).toFixed(2)} h`
+}
+/** 'filter · 42 % · about 3.1 min left', or without the estimate while the rate is unknown */
+export function fmtProgress(p: Progress | null, finished = false): string {
+  if (!p) return ''
+  const step = `${p.phase} ${p.done}/${p.total}`
+  const pct = p.fraction != null ? `${Math.round(p.fraction * 100)} %` : ''
+  if (finished) return `${step}${pct ? ` · ${pct}` : ''}`
+  if (p.eta === 0) return `${step} · done`
+  return `${step}${pct ? ` · ${pct}` : ''}${p.eta != null ? ` · about ${fmtDuration(p.eta)} left` : ' · estimating…'}`
 }
 export function fmtTime(t: number | null): string {
   return t ? new Date(t * 1000).toLocaleString() : ''

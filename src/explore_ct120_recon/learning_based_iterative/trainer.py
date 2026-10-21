@@ -79,6 +79,7 @@ import time
 import numpy as np
 import torch
 
+from ..ct_core.progress import plan, report
 from ..ct_core.data_budget import RANDOM, data_budget, measurement_count
 from ..ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
                                   LCurve, StoppingRules, metrics_dict,
@@ -508,7 +509,8 @@ class LearnedReconstructor:
         """
         if self._export_fn is not None:
             return self._export_fn(model, self.geometry, domain, device)
-        return render_volume(model, self.geometry, domain, device=device)
+        return render_volume(model, self.geometry, domain, device=device,
+                             report_progress=getattr(self, "_final_export", False))
 
     def _lr_stage(self, model, domain, device, it, stage, lr) -> None:
         """Hand the CURRENT volume to ``on_lr_stage``, and never let it matter.
@@ -888,6 +890,7 @@ class LearnedReconstructor:
         return term, sample_batch, desc
 
     def reconstruct(self) -> np.ndarray:
+        plan(train=20, render=1, save=2)
         device = self._device()
 
         if self._scene is not None:
@@ -1309,6 +1312,7 @@ class LearnedReconstructor:
                 self._on_step(model, it, loss)
 
             if self.log_every and (it % self.log_every == 0 or it == self.iterations - 1):
+                report('train', it + 1, self.iterations)
                 rate = (it + 1) / max(1e-9, time.time() - t0)
                 seen = budget_after(it + 1)['visits']
                 _lr_now = float(optimizer.param_groups[0]["lr"])
@@ -1493,6 +1497,7 @@ class LearnedReconstructor:
             print("  Export skipped (export=False) — the trained module is on "
                   "`.model`.")
             return None
+        self._final_export = True   # only this render moves the GUI's progress bar
         vol = self.export_volume(model, domain, device)
         self.reconstructed_volume = vol
         return vol

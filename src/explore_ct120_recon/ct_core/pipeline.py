@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from .progress import report
 import torch
 
 from .scan_setup import (
@@ -161,6 +163,19 @@ def add_common_args(parser):
              '(default: %(default)s). Reduces GPU memory usage. Factor 2 halves each '
              'detector dimension (detector pixel size and central-pixel '
              'indices are converted consistently).'
+    )
+    parser.add_argument(
+        '--detector-warp',
+        default='auto',
+        choices=('auto', 'off', 'full', 'nonaffine'),
+        help='Per-pixel detector distortion correction, applied to the '
+             'projections (and flat fields) once at load time, exactly as '
+             'the vendor does before its own reconstruction (default: auto). '
+             'auto: apply the calibration for this detector from the same '
+             'epoch (scan.xml CentreOfRotation) when one exists, else '
+             'nothing. nonaffine: the transferable part of a calibration '
+             'from another epoch. Scans from 2024 on reconstruct '
+             'split/doubled without it; the 2022 scans are fine as they are.'
     )
     parser.add_argument(
         '--cor-mode',
@@ -335,6 +350,8 @@ class ScanContext:
     view_groups: Optional[np.ndarray] = None
     group_labels: tuple = ('00',)
     detector_psi: Optional[dict] = field(default=None)
+    #: provenance of the detector unwarp applied to the projections, or None
+    detector_warp: Optional[dict] = None
     # Carried on the context rather than threaded through every diagnostic
     # signature so the noise-ceiling frames are levelled exactly like the
     # sinogram the backend trains on — an unlevelled ceiling would be
@@ -675,6 +692,26 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         bright_field=bright_field, dark_field=dark_field,
         measure=(roi_bounds is None and not use_domain))
 
+    # ---- detector unwarp (every backend, once, on the raw frames) --------
+    # Before the geometry is built and before any pooling: the field is in
+    # raw detector pixels and the scan.xml geometry describes the detector
+    # AFTER it, so everything downstream (support, psi self-calibration,
+    # preprocessing, every reconstructor) sees corrected frames.
+    from .detector_warp import select_projection_warp, warp_projections
+    warp_info = None
+    warp = select_projection_warp(
+        scan_folder, scan_data['xml_header'],
+        (projections.shape[1], projections.shape[2]),
+        mode=getattr(args, 'detector_warp', 'auto'))
+    if warp is not None:
+        projections, bright_field, dark_field = warp_projections(
+            projections, bright_field, dark_field, warp)
+        mean_px, max_px = warp.magnitude()
+        warp_info = {'mode': warp.mode, 'calibration': Path(warp.source).name,
+                     'detector_serial': warp.detector_serial,
+                     'cor_xml': warp.cor_xml, 'mean_px': mean_px,
+                     'max_px': max_px, 'tag': warp.tag()}
+
     factor = int(getattr(args, 'downsample', 1) or 1)
     # Grid + CoR policy + the pitch rescale, in one shared call — so muNeRF,
     # which holds a cached sinogram and never comes through here, runs
@@ -692,6 +729,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         # replaced below. Printing it would advertise a volume nobody uses.
         verbose=not use_domain,
     )
+    geometry['detector_warp_applied'] = warp_info
 
     # Optional detector downsampling (average pooling) of the PIXELS. The
     # geometry side of it was handled above.
@@ -762,6 +800,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         view_groups=scan_data.get('view_groups'),
         group_labels=tuple(scan_data.get('group_labels', ('00',))),
         air_normalization=bool(getattr(args, 'air_normalization', True)),
+        detector_warp=warp_info,
     )
 
 
@@ -770,7 +809,8 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
 # --------------------------------------------------------------------------
 
 def resolve_detector_psi(scan_folder, verbose=True,
-                         fallback_note="using psi=0 and the XML CoR"
+                         fallback_note="using psi=0 and the XML CoR",
+                         detector_warp: Optional[str] = None
                          ) -> Optional[dict]:
     """Read the scan-keyed detector-psi calibration JSON, if it exists.
 
@@ -802,6 +842,17 @@ def resolve_detector_psi(scan_folder, verbose=True,
             return None
         record = json.loads(cal_path.read_text())
         record['_path'] = str(cal_path)
+        # psi is measured on the frames as they are fed to the backprojector,
+        # so a measurement made on raw frames does not describe unwarped ones
+        # (Scan_2005: +0.08 deg raw, -0.16 deg unwarped) — treat as a miss.
+        cached_warp = record.get('detector_warp')
+        if (cached_warp or None) != (detector_warp or None):
+            if verbose:
+                print(f"\n  Geometry auto-calibration: cached {cal_path.name} "
+                      f"was measured with detector warp "
+                      f"{cached_warp or 'off'}, this run uses "
+                      f"{detector_warp or 'off'} — re-measuring.")
+            return None
         if verbose:
             print(f"\n  Geometry auto-calibration from {cal_path.name}:")
             print(f"    psi = {float(record['psi_deg']):+.4f} deg  (method "
@@ -875,7 +926,8 @@ def measure_detector_psi(ctx: ScanContext, verbose=True) -> Optional[dict]:
             path = calibration_json_path(
                 None, serial, Path(ctx.scan_folder).name)
             write_calibration_json(path, result, downsample=total_ds,
-                                   detector_serial=serial)
+                                   detector_serial=serial,
+                                   detector_warp=(ctx.detector_warp or {}).get('tag'))
             if verbose:
                 print(f"  Saved calibration to {path.name} — future runs on "
                       f"this scan (any pipeline) will reuse it.")
@@ -907,7 +959,23 @@ def resolve_or_measure_detector_psi(ctx: ScanContext, verbose=True,
     None only when both paths are unavailable, in which case the stated
     fallback applies.
     """
-    record = resolve_detector_psi(ctx.scan_folder, verbose=False)
+    # Frames unwarped with the FULL same-epoch field sit on the vendor's
+    # ideal detector grid, which already contains the in-plane rotation: the
+    # vendor reconstructs them with psi = 0, and so do we. A self-calibration
+    # on top is measuring its own noise — on Scan_2005 it returned -0.35 deg
+    # at prominence 0.06 and bent the tube at z = -20 mm that psi = 0 leaves
+    # round (2026-10-21).
+    if (ctx.detector_warp or {}).get('mode') == 'full':
+        if verbose:
+            print("\n  Geometry calibration: psi = 0 — the projections were "
+                  "unwarped with the same-epoch detector calibration, which "
+                  "already carries the detector's in-plane rotation; the "
+                  "self-calibration is not run on top of it.")
+        ctx.detector_psi = None
+        return None
+    record = resolve_detector_psi(
+        ctx.scan_folder, verbose=False,
+        detector_warp=(ctx.detector_warp or {}).get('tag'))
     if record is not None:
         if verbose:
             print(f"\n  Geometry calibration (cached "
@@ -962,6 +1030,7 @@ def save_outputs(volume, ctx: ScanContext, args, output_path: str,
     psi = ctx.geometry.get('det_psi_rad')
     if psi:
         metadata['detector_psi_deg'] = float(np.degrees(psi))
+    report('save', 0, 1)
     path, anchors, volume_hu = postprocess_and_save(
         volume_mu=volume,
         geometry=ctx.geometry,
@@ -972,6 +1041,7 @@ def save_outputs(volume, ctx: ScanContext, args, output_path: str,
         save_mu=getattr(args, 'save_mu', False),
         metadata=metadata,
     )
+    report('save', 1, 1)
     if logger is not None:
         logger.log_hu_calibration(anchors)
     return path, anchors, volume_hu

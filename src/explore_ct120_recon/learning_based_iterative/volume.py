@@ -38,6 +38,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from ..ct_core.progress import report
 from .training import unwrap_model
 
 SLICE_DIRECTIONS = ("axial", "coronal", "sagittal")
@@ -105,7 +106,8 @@ class _EvalMode:
 @torch.no_grad()
 def render_volume(model, scene_or_geometry, domain=None, *,
                   device="cpu", chunk: int = EXPORT_CHUNK,
-                  mask: bool = True, progress: bool = False) -> np.ndarray:
+                  mask: bool = True, progress: bool = False,
+                  report_progress: bool = False) -> np.ndarray:
     """Evaluate `model` at every export voxel centre. Returns (Nx, Ny, Nz) mu.
 
     Correct for any representation, including one whose own grid has a
@@ -118,6 +120,10 @@ def render_volume(model, scene_or_geometry, domain=None, *,
     undefined there — ``normalize`` maps them outside [-1, 1] and nothing ever
     trained them — so the default is on. It is a no-op for a box domain, and
     for any export ROI that sits wholly inside the domain.
+
+    `report_progress` prints the GUI's ``progress: render`` lines; only the
+    final export of a run sets it, so a mid-training render does not move
+    the job's bar.
     """
     geometry, domain = _resolve(scene_or_geometry, domain)
     Nx, Ny, Nz = (int(v) for v in geometry["vol_shape"])
@@ -148,6 +154,8 @@ def render_volume(model, scene_or_geometry, domain=None, *,
             if mask:
                 vals = vals * domain.cylinder_mask(pts)
             out[:, :, z0:z1] = vals.reshape(Nx, Ny, z1 - z0).cpu()
+            if report_progress:
+                report('render', z1, Nz)
 
     return np.ascontiguousarray(out.numpy(), dtype=np.float32)
 

@@ -75,6 +75,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "explore_ct120_recon.gui" = ["static/*", "static/assets/*", "templates/*", "icons/*"]
+"explore_ct120_recon" = ["calibration/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

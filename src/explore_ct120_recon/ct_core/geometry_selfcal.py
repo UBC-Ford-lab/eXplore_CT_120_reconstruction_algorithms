@@ -443,7 +443,8 @@ def calibration_json_path(repo_root, detector_serial: str,
 
 
 def write_calibration_json(path: Path, result: dict, *, downsample: int,
-                           detector_serial: Optional[str]) -> None:
+                           detector_serial: Optional[str],
+                           detector_warp: Optional[str] = None) -> None:
     """Persist an estimate in the schema muNeRF reads (and upgrades)."""
     ds = int(downsample)
     record = {
@@ -458,6 +459,8 @@ def write_calibration_json(path: Path, result: dict, *, downsample: int,
         "detector_serial": detector_serial,
         "measured_on": date.today().isoformat(),
         "elapsed_s": float(result.get("elapsed_s", 0.0)),
+        # which detector unwarp the frames carried when psi was measured
+        "detector_warp": detector_warp,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, indent=2))

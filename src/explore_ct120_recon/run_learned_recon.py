@@ -37,7 +37,6 @@ from .learning_based_iterative.losses import (DATA_TERMS, DEFAULT_DATA_TERM,
                                               describe_data_terms)
 from .learning_based_iterative import (algorithm_names, describe_algorithms,
                                        get_algorithm)
-from .learning_based_iterative.detector_warp import resolve_detector_warp
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
@@ -578,13 +577,6 @@ detector), else a loud package default — and logged under wls/*.
                              'baseline, since fusion reorders floating-point '
                              'ops. max-autotune benchmarks kernel variants '
                              '(minutes of extra compile).')
-    parser.add_argument('--detector-warp', default='off',
-                        choices=('off', 'auto', 'nonaffine', 'full'),
-                        help='Per-pixel detector distortion correction applied '
-                             'to ray geometry (default: off — matches the '
-                             'classical backends, which have no equivalent). '
-                             'auto/nonaffine/full use the serial-keyed '
-                             'calibration in data/calibration/ when present.')
 
     # Cross-validation holdout (same knobs as the TIGRE backend)
     parser.add_argument('--no-crossval', action='store_true', default=False,
@@ -871,7 +863,7 @@ def main(argv=None):
         'subpixel_rays': args.subpixel_rays,
         'seed': args.seed,
         'compile': args.compile_mode,
-        'detector_warp': args.detector_warp,
+        'detector_warp': ((ctx.detector_warp or {}).get('tag') or 'off'),
         'crossval': not args.no_crossval,
         'withhold_eval': bool(args.withhold_eval),
         # Where the representation came from. A dotted module NAME (never a
@@ -905,19 +897,11 @@ def main(argv=None):
         if record is not None:
             ctx.geometry['det_psi_rad'] = float(np.radians(record['psi_deg']))
 
-    # ---- optional detector unwarp (learning-based exclusive) ---------------
-    # The differentiable projector builds every ray through one choke point,
-    # so the per-pixel detector distortion calibration can be applied to ray
-    # geometry — something the classical backends cannot do.
-    if args.detector_warp != 'off':
-        n_b, n_a = ctx.projections.shape[1], ctx.projections.shape[2]
-        ds = int(ctx.downsample or 1)
-        warp = resolve_detector_warp(
-            {'detector_warp': {'mode': args.detector_warp}},
-            ctx.scan_folder, (n_b * ds, n_a * ds), downsample=ds)
-        if warp is not None:
-            ctx.geometry['detector_warp'] = warp
-            ctx.geometry['sinogram_downsample'] = ds
+    # ---- detector unwarp -----------------------------------------------
+    # Applied to the PROJECTIONS in prepare_scan (shared --detector-warp
+    # flag), the same for every backend. The ray-domain variant this driver
+    # used to offer is still available to config-driven muNeRF runs through
+    # geometry.detector_warp, but never on top of resampled frames.
 
     # ---- projection diagnostics: noise ceiling at the eval angle -----------
     # Other acquisition phase when the scan has one, else the neighbouring

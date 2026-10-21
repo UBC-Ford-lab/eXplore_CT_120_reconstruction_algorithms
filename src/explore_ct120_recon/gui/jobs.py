@@ -51,6 +51,7 @@ class Job:
     remote_state: Optional[str] = None   # the scheduler's word for it
     node: Optional[str] = None           # allocated node
     resources: str = ''                  # extra sbatch arguments for this job
+    progress: Optional[dict] = None      # last 'progress:' line + rate, see executors._scan_log
 
     @staticmethod
     def new(driver, algorithm, values, command, executor, *, note='', input='', cwd='', resources='') -> 'Job':
@@ -64,7 +65,7 @@ class Job:
         return d
 
 
-_JSON_COLUMNS = ('values', 'command')
+_JSON_COLUMNS = ('values', 'command', 'progress')
 _COLUMNS = [f.name for f in fields(Job)]
 _REAL = ('created', 'started', 'finished')
 _INT = ('gpu_index', 'pid', 'returncode')
@@ -104,7 +105,7 @@ class JobStore:
     def _row_to_job(row) -> Job:
         d = dict(row)
         for c in _JSON_COLUMNS:
-            d[c] = json.loads(d[c]) if d[c] else ([] if c == 'command' else {})
+            d[c] = json.loads(d[c]) if d[c] else ([] if c == 'command' else None if c == 'progress' else {})
         return Job(**d)
 
     def add(self, job: Job) -> Job:

@@ -5,6 +5,7 @@ import numpy as np
 import os
 import sys
 
+from ..ct_core.progress import plan, report
 from ..ct_core.preprocessing import (air_normalize_sinogram,
                                      ring_artifact_correction,
                                      soft_clamp_transmission)
@@ -517,6 +518,7 @@ class FDKReconstructor:
             print(f"  Pass 1 (flat-field + log): chunk_size={chunk_size}")
             for start in range(0, self.N_angles, chunk_size):
                 end = min(start + chunk_size, self.N_angles)
+                report('preprocess', start, self.N_angles)
                 chunk = torch.from_numpy(
                     np.array(self.projections[start:end], dtype=np.float32)
                 ).to(device)
@@ -566,6 +568,7 @@ class FDKReconstructor:
         print(f"  Pass 2 (weighting + filtering): chunk_size={chunk_size}")
         for start in range(0, self.N_angles, chunk_size):
             end = min(start + chunk_size, self.N_angles)
+            report('filter', start, self.N_angles)
             chunk = torch.from_numpy(
                 np.ascontiguousarray(sinogram_out[start:end], dtype=np.float32)
             ).to(device)
@@ -700,6 +703,7 @@ class FDKReconstructor:
 
             # Angle-outer loop: U, a, weight are z-independent → compute as 2D per angle
             for i in range(self.N_angles):
+                report('backproject', i, self.N_angles)
                 if proj_on_gpu:
                     proj = proj_tensor[i].unsqueeze(0).unsqueeze(0)
                 else:
@@ -840,11 +844,13 @@ class FDKReconstructor:
         stage), so that the scale is fitted once, from the finished volume,
         rather than baked in here with a stale scanner constant.
         """
+        plan(preprocess=1, filter=1, backproject=10, save=2)
         # Step 1+2: Fused preprocessing + weighting + filtering (single GPU pass)
         print("\nApplying fused preprocessing + weighting + filtering...")
         self._preprocess_and_filter()
         print("Backprojecting...")
         self.backprojection()
+        report('backproject', self.N_angles, self.N_angles)
 
         # No HU conversion here — the volume stays in μ (mm⁻¹) and unclipped
         # so the downstream calibrator can see the real air peak. Clipping it

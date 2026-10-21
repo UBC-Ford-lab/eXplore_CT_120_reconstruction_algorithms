@@ -382,7 +382,7 @@ class RemoteExecutor(Executor):
     def _scan_for_links(job: Job, local_log: Path, store: JobStore) -> None:
         from .executors import LocalExecutor
         seen = {'wandb_url': job.wandb_url, 'output_path': job.output_path,
-                'output_logged': False}
+                'output_logged': False, 'progress': job.progress}
         found = LocalExecutor._scan_log(local_log, seen)
         if found:
             store.update(job.id, **found)

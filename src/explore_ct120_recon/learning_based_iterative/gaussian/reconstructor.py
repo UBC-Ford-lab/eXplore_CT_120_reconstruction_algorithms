@@ -65,6 +65,7 @@ import time
 import numpy as np
 import torch
 
+from ...ct_core.progress import plan, report
 from ...ct_core.early_stop import (EarlyStopper, HoldoutScorer,
                                                LCurve, StoppingRules,
                                                resolve_holdout_index,
@@ -220,6 +221,7 @@ class GaussianReconstructor(LearnedReconstructor):
 
     # -- the loop ----------------------------------------------------------
     def reconstruct(self) -> np.ndarray:
+        plan(train=20, save=2)
         device = self._device()
         torch.manual_seed(self.seed)
         rng = np.random.default_rng(self.seed)
@@ -764,6 +766,7 @@ class GaussianReconstructor(LearnedReconstructor):
             # doing (or not doing) its job.
             if self.log_every and (it % self.log_every == 0
                                    or it == self.iterations):
+                report('train', it, self.iterations)
                 rate = it / max(1e-9, time.time() - t0)
                 visits = it / max(1, len(train_views))
                 lr_now = float(optimizer.param_groups[0]['lr'])

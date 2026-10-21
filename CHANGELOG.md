@@ -2,10 +2,45 @@
 
 ## 0.2.4 (unreleased)
 
+- Detector unwarp for every backend (`--detector-warp`, default `auto`).
+  Scans taken since the scanner's 2024 recalibration carry a +-20 px
+  detector distortion in their raw `acq-*` frames that the vendor removes
+  before reconstructing (its `Corrected/uwarp-*` frames); the scan.xml
+  geometry describes the detector after that step. Reconstructed raw, every
+  off-axis structure in a short scan split into two offset halves, and no
+  centre-of-rotation value fixed it at more than one height. The field is
+  measured once per detector epoch from paired acq/uwarp frames (noise
+  registration, bicubic fit; `data/calibration/detector_warp_<serial>_cor<xml
+  centre>.npz`, publish with `python -m explore_ct120_recon.ct_core.detector_warp
+  export`; the UBC scanner's 2024-epoch field ships inside the package under
+  `explore_ct120_recon/calibration/`) and `prepare_scan` resamples the projections and flat fields with
+  it at load time, so FDK, ASTRA, TIGRE, the learned backends, the psi
+  self-calibration and the support measurement all see corrected frames. The
+  unit of knowledge is a detector epoch (serial + the scan.xml
+  CentreOfRotation the vendor rewrites at every recalibration, e.g. a source
+  change): an epoch with a measured field gets it; an epoch recorded as
+  needing none (the 2022 scans) is left alone; an unknown epoch whose scan
+  carries `Corrected/uwarp-*` frames is measured from them on the spot and
+  stored; an unknown epoch without them, on a detector that has records,
+  stops with instructions rather than reconstructing split. Another
+  epoch's non-affine part is an opt-in (`nonaffine`). With the
+  full same-epoch field applied the frames sit on the vendor's ideal grid,
+  so psi is 0 and the self-calibration is skipped; otherwise the psi cache
+  records which unwarp the frames carried and re-measures on a mismatch.
+  The learned driver's own `--detector-warp` (ray domain) is replaced by the
+  shared flag; the ray-domain path remains for config-driven runs.
+
 - Windows: a local job died with `UnicodeEncodeError: 'charmap' codec` at the
   first unit symbol it printed, since stdout to the log file used the ANSI
   code page; jobs now run with `PYTHONUTF8=1`.
 - The package version is shown under the page title.
+- One progress bar for the whole job, with a time estimate, on the job page
+  (and a percentage in the job list). Each driver declares its phases and
+  their rough share of the run (`progress-plan: ...`) and prints
+  `progress: <phase> <done>/<total>` from its loops (FDK preprocess, filter
+  and backprojection passes, iterations, rendered slabs, the save); the
+  server maps them onto a single cumulative fraction that never goes back
+  and measures its pace over the last five minutes for the estimate.
 
 ## 0.2.3 (2026-10-19)
 

@@ -26,6 +26,7 @@ try:
 except ImportError:
     tigre = None
 
+from ...ct_core.progress import plan, report
 from ...ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
                                    LCurve, StoppingRules, metrics_dict,
                                    plot_convergence, resolve_holdout_index,
@@ -692,6 +693,7 @@ class TIGREReconstructor:
         Returns:
             self.reconstructed_volume — np.ndarray of shape (Nx, Ny, Nz)
         """
+        plan(iterate=20, save=2)
         _check_tigre_available()
 
         print("=" * 60)
@@ -943,6 +945,7 @@ class TIGREReconstructor:
                 chunk_kwargs = {**kwargs, 'verbose': False}
                 i_done = 0
                 while i_done < self.iterations:
+                    report('iterate', i_done, self.iterations)
                     chunk = min(self.eval_every, self.iterations - i_done)
                     chunk_kwargs['lmbda'] = self.lmbda * (self.lmbda_red ** i_done)
                     if vol_tigre is not None:
@@ -993,6 +996,7 @@ class TIGREReconstructor:
             i_done = 0
 
             while i_done < self.iterations:
+                report('iterate', i_done, self.iterations)
                 chunk = min(self.eval_every, self.iterations - i_done)
 
                 # Correct starting lambda so decay is continuous across chunks.

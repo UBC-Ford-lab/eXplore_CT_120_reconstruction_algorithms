@@ -51,6 +51,8 @@ analysis/
 # Tests (kept in the parent muNeRF repo)
 tests/
 
+wandb/
+
 # GUI frontend build inputs (the built page in src/.../gui/static IS committed)
 gui-frontend/node_modules/
 

@@ -118,6 +118,11 @@ td.clip { max-width: 22rem; overflow: hidden; text-overflow: ellipsis; white-spa
 .note { font-size: 0.85rem; color: var(--ink-2); }
 details { margin: 0.5rem 0; }
 summary { cursor: pointer; color: var(--ink-2); font-size: 0.9rem; }
+.progress { display: flex; align-items: center; gap: 0.7rem; margin-top: 0.5rem; font-size: 0.8rem; color: var(--ink-2); }
+.progress .bar { flex: 1; height: 6px; background: var(--hair); border-radius: 3px; overflow: hidden; }
+.progress .bar > div { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.6s ease; }
+.progress.failed .bar > div, .progress.cancelled .bar > div { background: var(--ink-3); }
+.progress span { white-space: nowrap; }
 .log { background: var(--panel); border: 1px solid var(--hair); border-radius: 4px; padding: 0.6rem 0.7rem; height: calc(100vh - 21rem); min-height: 12rem; overflow: auto; font: 0.82rem/1.38 var(--mono); white-space: pre-wrap; word-break: break-word; margin: 0; }
 
 /* ---- machines ----------------------------------------------------------- */

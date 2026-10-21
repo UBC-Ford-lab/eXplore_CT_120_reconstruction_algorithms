@@ -17,6 +17,7 @@ try:
 except ImportError:
     astra = None
 
+from ...ct_core.progress import plan, report
 from ...ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
                                    LCurve, StoppingRules, metrics_dict,
                                    plot_convergence, resolve_holdout_index,
@@ -392,6 +393,7 @@ class ASTRAReconstructor:
         best_vol, best_iter, lcurve_vols = None, 0, {}
         i_done = 0
         while i_done < self.iterations:
+            report('iterate', i_done, self.iterations)
             chunk = min(self.eval_every, self.iterations - i_done)
             astra.algorithm.run(alg_id, chunk)
             i_done += chunk
@@ -489,6 +491,7 @@ class ASTRAReconstructor:
         Returns:
             self.reconstructed_volume — np.ndarray of shape (Nx, Ny, Nz)
         """
+        plan(iterate=20, save=2)
         _check_astra_available()
 
         print("=" * 60)

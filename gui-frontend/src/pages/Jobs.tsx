@@ -53,7 +53,7 @@ export default function Jobs() {
                 <td className="mono clip" title={j.input}>{j.input.split('/').pop()}</td>
                 <td>{j.executor}{j.node ? ` · ${j.node}` : ''}{j.gpu_index != null ? ` · GPU ${j.gpu_index}` : ''}{j.remote_state && j.status === 'pending' ? ` · ${j.remote_state}` : ''}</td>
                 <td className="faint">{fmtTime(j.started ?? j.created)}</td>
-                <td className="num">{fmtDuration(j.duration)}</td>
+                <td className="num">{fmtDuration(j.duration)}{j.status === 'running' && j.progress?.fraction != null && <span className="faint"> · {Math.round(j.progress.fraction * 100)} %</span>}</td>
                 <td className="mono clip small" title={j.output_path ?? ''}>{j.output_path ? j.output_path.split('/').pop() : ''}</td>
                 <td className="clip">{j.note}</td>
                 <td>{!ACTIVE.includes(j.status) && <button className="quiet" onClick={e => remove(e, j)} title="remove the record; files stay">✕</button>}</td>

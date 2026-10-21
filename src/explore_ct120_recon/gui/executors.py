@@ -30,8 +30,80 @@ from .jobs import Job, JobStore
 _WANDB_RUN = re.compile(r'View run(?: \S+)? at:? (https://\S+/runs/\S+)')
 # Every driver announces where it writes with one of these lines; the first
 # match replaces the path predicted at submit time.
+_PROGRESS = re.compile(r'^progress: (\S+) (\d+)/(\d+)\s*$', re.M)
+_PLAN = re.compile(r'^progress-plan: (.+?)\s*$', re.M)
 _OUTPUT = re.compile(r'^\s*(?:Output path|Report written to|Filtered volume saved to|'
                      r'Synthetic scan written to):?\s*(.+?)\s*$', re.M)
+
+
+# How far back the rate behind the time estimate looks. Long enough to
+# average out a chunk, short enough to follow a change of pace (Gaussian
+# densification rounds, a filter pass giving way to backprojection).
+RATE_WINDOW = 300.0
+
+
+def _parse_plan(text: str) -> list[tuple[str, float]]:
+    m = _PLAN.search(text)
+    if not m:
+        return []
+    plan = []
+    for item in m.group(1).split():
+        name, _, w = item.partition('=')
+        try:
+            plan.append((name, max(0.0, float(w or 1))))
+        except ValueError:
+            plan.append((name, 1.0))
+    return plan
+
+
+def _overall(plan: list[tuple[str, float]], phase: str, done: int, total: int) -> Optional[float]:
+    """Where ``phase`` at ``done/total`` sits on the whole run's 0..1 scale."""
+    within = (done / total) if total else 1.0
+    if not plan:
+        return within
+    weight = sum(w for _, w in plan) or 1.0
+    before = 0.0
+    for name, w in plan:
+        if name == phase:
+            return (before + w * min(1.0, within)) / weight
+        before += w
+    return None  # a phase the driver did not announce: the bar holds
+
+
+def _progress_update(prev: Optional[dict], text: str, now: Optional[float] = None) -> Optional[dict]:
+    """The job's progress record from the last ``progress:`` line in its log.
+
+    ``fraction`` is cumulative over the driver's declared phases and never
+    goes backwards; ``samples`` keeps (time, fraction) pairs so the pace is
+    measured over the window rather than since the start, and the estimate
+    survives a server restart (the record is stored with the job).
+    """
+    matches = _PROGRESS.findall(text)
+    if not matches:
+        return prev
+    phase, done, total = matches[-1][0], int(matches[-1][1]), int(matches[-1][2])
+    if prev and (prev.get('phase'), prev.get('done'), prev.get('total')) == (phase, done, total):
+        return prev
+    now = time.time() if now is None else now
+    plan = _parse_plan(text)
+    fraction = _overall(plan, phase, done, total)
+    if fraction is None:
+        fraction = prev['fraction'] if prev and prev.get('fraction') is not None else 0.0
+    if prev and prev.get('fraction') is not None:
+        fraction = max(fraction, prev['fraction'])
+    samples = list(prev['samples']) if prev and prev.get('samples') else []
+    if not samples or fraction != samples[-1][1]:
+        samples.append((now, fraction))
+    samples = [s for s in samples if now - s[0] <= RATE_WINDOW] or samples[-1:]
+    rate = None
+    if len(samples) >= 2 and samples[-1][0] > samples[0][0]:
+        rate = (samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0])
+    finished = fraction >= 1.0 or (plan and phase == plan[-1][0] and done >= total)
+    eta = 0.0 if finished else ((1.0 - fraction) / rate if rate and rate > 0 else None)
+    return {'phase': phase, 'done': done, 'total': total,
+            'phase_fraction': (done / total) if total else None,
+            'fraction': 1.0 if finished else fraction,
+            'rate': rate, 'eta': eta, 'updated': now, 'samples': samples[-40:]}
 
 
 def gpu_inventory() -> list[dict]:
@@ -296,7 +368,7 @@ class LocalExecutor(Executor):
     def _watch(self, job_id: str, proc, log, log_path: Path, store: JobStore) -> None:
         """``proc`` is a Popen for a job this server started, or an int pid for
         one adopted after a restart (then the exit code comes from the exit file)."""
-        seen = {'wandb_url': None, 'output_path': None}
+        seen = {'wandb_url': None, 'output_path': None, 'progress': None}
         exit_file = self.log_dir / f'{job_id}.exit'
         while True:
             if isinstance(proc, int):
@@ -372,6 +444,9 @@ class LocalExecutor(Executor):
                 path = m.group(1).strip()
                 if path != seen.get('output_path'):
                     seen['output_path'] = found['output_path'] = path
+        progress = _progress_update(seen.get('progress'), text)
+        if progress is not None and progress != seen.get('progress'):
+            seen['progress'] = found['progress'] = progress
         return found
 
     @staticmethod

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import DeleteJob from '../components/DeleteJob'
-import { api, fmtDuration, fmtTime, Job } from '../api'
+import { api, fmtDuration, fmtProgress, fmtTime, Job } from '../api'
 import { StatusTag } from './Jobs'
 
 export default function JobDetail() {
@@ -70,6 +70,12 @@ export default function JobDetail() {
         <table><tbody>{changed.map(([k, v]) => <tr key={k}><td className="mono">{k}</td><td className="mono">{JSON.stringify(v)}</td></tr>)}</tbody></table>
       </details>
       <pre ref={pre} className="log">{log || (active ? 'waiting for output…' : '(empty)')}</pre>
+      {job.progress && (active || job.status === 'failed' || job.status === 'cancelled') && (
+        <div className={`progress ${job.status}`} title="one bar for the whole job, from the driver's own progress lines; the estimate comes from the pace over the last few minutes">
+          <div className="bar"><div style={{ width: `${Math.round((job.progress.fraction ?? 0) * 100)}%` }} /></div>
+          <span>{fmtProgress(job.progress, !active)}</span>
+        </div>
+      )}
     </>
   )
 }
