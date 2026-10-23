@@ -206,7 +206,18 @@ def _remove_quietly(path):
 class VFFDataset:
     def __init__(self, folder: str, xml_file: str, save_headers: bool = False, tensor_projections: bool = False,
                  paths_str: str = "acq*", exclude_pred_paths: bool = False, projection_spacing = None,
-                 sub_scan='-00-'):
+                 sub_scan='-00-', view_step: int = 1, frame_transform=None):
+        """``view_step`` > 1 keeps every k-th projection (after the sub-scan
+        filter): the fast coarse preview the GUI's ROI picker shows. The
+        angles still come from each frame's own gantry position, so the
+        kept views are placed exactly; only the synthetic fallback spacing
+        is scaled.
+
+        ``frame_transform`` (optional) is applied to every frame as it is
+        read, as a native-order 2-D array, and the stack holds what it
+        returns (float32, any shape): the preview pools and unwarps each
+        frame on the way in and never materialises the full-resolution
+        stack. Without it the frames are stored as read."""
         self.folder = folder
         self.paths = sorted(Path(folder).glob(paths_str))
         if exclude_pred_paths is True:
@@ -220,6 +231,11 @@ class VFFDataset:
                 self.paths = [p for p in self.paths
                               if p.name.startswith('proj-')
                               or any(t in p.name for t in toks)]
+        view_step = max(1, int(view_step or 1))
+        if view_step > 1:
+            self.paths = self.paths[::view_step]
+            if projection_spacing is not None:
+                projection_spacing = projection_spacing * view_step
 
         with open(xml_file, 'r') as f:
             header = xmltodict.parse(f.read())
@@ -238,6 +254,12 @@ class VFFDataset:
         hdr, data = self._read_vff(self.paths[0])
         data = data.squeeze(0)
         self.det_rows, self.det_cols = data.shape
+
+        self._memmap_path = None
+        if frame_transform is not None:
+            self._load_transformed(frame_transform, save_headers)
+            self._finish(tensor_projections)
+            return
 
         # Create memmap for projections. Use a unique per-process temp file
         # (SLURM_TMPDIR if set, else the system temp dir) rather than a fixed
@@ -285,7 +307,30 @@ class VFFDataset:
         # (the mapping stays valid); Windows refuses with "being used by
         # another process" while any mapping is open, so retry at exit.
         self._discard_memmap_file()
+        self._finish(tensor_projections)
 
+    def _load_transformed(self, frame_transform, save_headers):
+        """Read every frame, hand it (native order) to ``frame_transform``
+        and keep the result: a plain float32 stack shaped by the first
+        result. No scratch memmap, no second pass."""
+        self.projections = None
+        self.projection_angles = np.zeros(len(self.paths), dtype=np.float32)
+        if save_headers:
+            self.headers = []
+        for idx, p in enumerate(self.paths):
+            hdr, dat = read_vff_frame(p)
+            arr = np.asarray(dat.squeeze(0))
+            if arr.dtype.byteorder not in ('=', '|'):
+                arr = arr.byteswap().view(arr.dtype.newbyteorder())
+            out = np.asarray(frame_transform(arr), dtype=np.float32)
+            if self.projections is None:
+                self.projections = np.empty((len(self.paths),) + out.shape, dtype=np.float32)
+            self.projections[idx] = out
+            self.projection_angles[idx] = float(hdr['gantryPosition'])
+            if save_headers:
+                self.headers.append(hdr)
+
+    def _finish(self, tensor_projections):
         # torch is imported here, not at module scope: reading a header or a
         # volume needs numpy only, and a torch import costs seconds on a cold
         # network file system (the GUI launcher pays it for a --help otherwise)
@@ -325,31 +370,50 @@ class VFFDataset:
             atexit.register(_remove_quietly, path)
 
     def _read_vff(self, path: Path):
-        # Use same header parsing as standalone functions
-        header = {}
-        with open(path, 'rb') as f:
-            raw = f.read(1000).decode('latin-1', errors='ignore')
-        try:
-            header_content, _ = raw.split('\f', 1)
-        except ValueError:
-            header_content = raw
-        for line in header_content.splitlines():
-            if '=' in line:
-                key, value = line.split('=', 1)
-                header[key.strip()] = value.strip().rstrip(',;')
+        return read_vff_frame(path)
 
-        # Determine dtype from header
-        bits = int(header.get('bits', '16'))
-        dtype = np.dtype('>b' if bits == 8 else '>h')
-        dims = [int(x) for x in header['size'].split()]
-        if len(dims) == 2:
-            z, y, x = 1, dims[1], dims[0]
-        else:
-            z, y, x = dims[2], dims[1], dims[0]
-        total_bytes = x * y * z * bits // 8
-        offset = os.path.getsize(path) - total_bytes
-        data = np.memmap(path, dtype=dtype, mode='r', offset=offset, shape=(z, y, x))
-        return header, data
+
+def read_vff_frame(path):
+    """One acquisition frame: ``(header dict, big-endian memmap (z, y, x))``.
+    The header parse matches ``read_vff_header``; nothing is copied."""
+    path = Path(path)
+    header = {}
+    with open(path, 'rb') as f:
+        raw = f.read(1000).decode('latin-1', errors='ignore')
+    try:
+        header_content, _ = raw.split('\f', 1)
+    except ValueError:
+        header_content = raw
+    for line in header_content.splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            header[key.strip()] = value.strip().rstrip(',;')
+
+    # Determine dtype from header
+    bits = int(header.get('bits', '16'))
+    dtype = np.dtype('>b' if bits == 8 else '>h')
+    dims = [int(x) for x in header['size'].split()]
+    if len(dims) == 2:
+        z, y, x = 1, dims[1], dims[0]
+    else:
+        z, y, x = dims[2], dims[1], dims[0]
+    total_bytes = x * y * z * bits // 8
+    offset = os.path.getsize(path) - total_bytes
+    data = np.memmap(path, dtype=dtype, mode='r', offset=offset, shape=(z, y, x))
+    return header, data
+
+
+def raw_detector_shape(data_folder, pattern=None) -> "tuple[int, int] | None":
+    """``(rows, cols)`` of the first acquisition frame in ``data_folder``
+    (``proj-*.vff`` if present, else ``acq*``), from its header alone."""
+    folder = Path(data_folder)
+    patterns = [pattern] if pattern else ['proj-*.vff', 'acq*']
+    for pat in patterns:
+        frames = sorted(folder.glob(pat))
+        if frames:
+            dims = [int(v) for v in read_vff_header(frames[0], verbose=False)['size'].split()]
+            return (dims[1], dims[0])
+    return None
 
 
 if __name__ == '__main__':

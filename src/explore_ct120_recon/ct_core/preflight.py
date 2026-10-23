@@ -91,13 +91,38 @@ BATCH_BYTES_PER_SAMPLE = 96
 
 
 def host_mem_available_bytes():
-    """MemAvailable from /proc/meminfo, or None off-Linux."""
+    """Available host RAM in bytes: MemAvailable from /proc/meminfo on Linux,
+    GlobalMemoryStatusEx on Windows, None where neither answers.
+
+    Without the Windows branch the lab machine's report printed no RAM line
+    at all and the host-side check silently never ran there.
+    """
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024
     except OSError:
+        pass
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", wt.DWORD), ("dwMemoryLoad", wt.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        st = _MemStatus()
+        st.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return int(st.ullAvailPhys)
+    except (AttributeError, OSError, ValueError):
         pass
     return None
 
@@ -224,12 +249,34 @@ class Footprint:
 # ----------------------------------------------------------------------------
 
 def _fdk_footprint(req: MachineRequest) -> Footprint:
+    """The FDK backend's VRAM FLOOR, not its fast path.
+
+    `fdk.reconstructor` sizes itself to free VRAM at runtime: the sinogram is
+    filtered in angle chunks, and at backprojection it is preloaded onto the
+    GPU only when it takes under 40 % of the budget — otherwise it stays in
+    host RAM and one projection at a time is moved over, with the z-chunk
+    sized from what is left. Counting the whole sinogram as resident (the old
+    `sino + vol/8`) therefore refused jobs the backend runs fine: a 440 x 2296
+    x 3500 scan on a 16 GiB card was reported as "need 15.2 GiB" and aborted,
+    when its floor is about 0.5 GiB. The floor is the volume on the GPU, the
+    filter pass's per-projection buffers (cone weight, kernel, dark, I0 and
+    one 7-deep chunk), one streamed projection, and a single z-slice of the
+    backprojection working set (2 coordinate grids + 4 per-angle planes + 8
+    per-slice temporaries). The host side is where the sinogram really has to
+    fit: the float sinogram plus the contiguous preload copy, plus the volume.
+    """
+    nx, ny, _ = (int(v) for v in req.vol_shape)
+    proj_bytes = req.n_b * req.n_a * F32
+    per_slice = 14 * nx * ny * F32
+    floor = req.vol_bytes + 12 * proj_bytes + per_slice
     return Footprint(
-        persistent_gpu_bytes=req.sino_bytes + req.vol_bytes // 8,
+        persistent_gpu_bytes=floor,
         host_bytes=2 * req.sino_bytes + req.vol_bytes,
         gpu_required=False,
-        notes=("FDK z-chunks itself to free VRAM; runs on CPU if none "
-               "(slow).",))
+        notes=("FDK streams projections from RAM and z-chunks itself to free "
+               f"VRAM (the whole {req.sino_bytes / GiB:.1f} GiB sinogram is "
+               "preloaded on the GPU when it fits — faster); runs on CPU "
+               "if none (slow).",))
 
 
 def _astra_footprint(req: MachineRequest) -> Footprint:

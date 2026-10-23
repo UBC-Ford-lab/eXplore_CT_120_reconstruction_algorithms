@@ -77,17 +77,18 @@ Examples:
         '--cor',
         type=float,
         default=None,
-        help='Override center-of-rotation detector pixel (central_pixel_a). '
-             'Default: detector geometric centre (see --cor-mode; the '
-             'scan.xml CentreOfRotation over-corrects once detector psi is '
-             'applied). Use for manual COR experiments.'
+        help='Override the centre of rotation: the detector column the '
+             'source-isocentre ray hits (central_pixel_a, in the sinogram\'s '
+             'own index space after --downsample). Default: see --cor-mode. '
+             'Use for manual COR experiments.'
     )
     parser.add_argument(
         '--central-slice',
         type=float,
         default=None,
-        help='Override central detector row (central_pixel_b). '
-             'Default: CentralSlice from scan.xml.'
+        help='Override the central row: the detector row the '
+             'source-isocentre ray hits (central_pixel_b). Default: see '
+             '--cor-mode.'
     )
     parser.add_argument(
         '--cor-offset-scale',

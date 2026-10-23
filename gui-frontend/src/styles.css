@@ -316,3 +316,40 @@ button.browse:hover { color: var(--accent); border-color: var(--accent); }
 .view-box .muted { position: absolute; }
 a.sans { font-family: var(--sans); }
 @media (max-width: 1050px) { .viewer-grid { grid-template-columns: 1fr; } }
+
+/* ---- ROI picker --------------------------------------------------------- */
+.opt.roi-row { grid-template-columns: 11rem minmax(14rem, 24rem) minmax(0, 1fr); }
+.roi-row .input input[type=text] { flex: 1 1 6rem; }
+.roi-row button.small { flex: 0 0 auto; font-size: 0.8rem; padding: 0.1rem 0.5rem; }
+.modal.roi { width: min(96vw, 92rem); max-height: 94vh; }
+.roi-body { display: flex; flex-direction: column; gap: 0.5rem; padding: 0.5rem 0.8rem; overflow: auto; min-height: 0; }
+.roi-wait { padding: 3rem 1rem; text-align: center; }
+.roi-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 1rem; font-size: 0.85rem; }
+.roi-bar .roi-modes { display: inline-flex; gap: 0.2rem; }
+.roi-bar label { display: flex; gap: 0.3rem; align-items: center; color: var(--ink-2); }
+.roi-bar label input[type=range] { width: 7rem; }
+.wl { display: inline-flex; align-items: center; gap: 0.5rem; }
+.wl-track { position: relative; width: 11rem; height: 18px; margin: 0 6px; cursor: pointer; touch-action: none; }
+.wl-track::before { content: ''; position: absolute; left: 0; right: 0; top: 7px; height: 4px; border-radius: 2px;
+  background: linear-gradient(90deg, #000, #fff); border: 1px solid var(--hair); }
+.wl-range { position: absolute; top: 6px; height: 6px; background: rgba(69, 179, 168, 0.55); border-radius: 2px; pointer-events: none; }
+.wl-handle { position: absolute; top: 3px; width: 12px; height: 12px; margin-left: -6px; border-radius: 50%;
+  background: #fff; border: 1.5px solid #0e6b66; cursor: ew-resize; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+.wl-level { position: absolute; top: 0; width: 3px; height: 18px; margin-left: -1.5px; background: #0e6b66; border-radius: 1px; cursor: grab; }
+.wl-level:active { cursor: grabbing; }
+.wl-level::after { content: ''; position: absolute; left: -5px; right: -5px; top: 0; bottom: 0; }  /* easier to grab */
+.roi-view .view-head input[type=range] { flex: 1 1 4rem; min-width: 3rem; }
+.roi-bar .right { display: flex; gap: 0.4rem; margin-left: auto; }
+.roi-bar button.small { font-size: 0.8rem; padding: 0.1rem 0.5rem; }
+.roi-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.8rem; }
+.roi-view { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
+.roi-pane { position: relative; width: 100%; background: #000; border: 1px solid var(--hair); border-radius: 3px; user-select: none; touch-action: none; overflow: hidden; }
+.roi-pane canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; image-rendering: auto; }
+.roi-pane svg { position: absolute; inset: 0; display: block; }
+.roi-pane rect.box { fill: rgba(69, 179, 168, 0.14); stroke: #45b3a8; stroke-width: 1.5; cursor: move; }
+.roi-pane rect.box:hover { fill: rgba(69, 179, 168, 0.22); }
+.roi-pane rect.handle { fill: #fff; stroke: #0e6b66; stroke-width: 1; }
+.roi-bounds { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; align-items: center; font-size: 0.85rem; }
+.roi-bounds .roi-axis { display: inline-flex; gap: 0.35rem; align-items: center; }
+.roi-bounds input[type=number] { width: 5.8rem; font-size: 0.85rem; padding: 0.1rem 0.3rem; }
+@media (max-width: 70rem) { .roi-grid { grid-template-columns: 1fr; } }

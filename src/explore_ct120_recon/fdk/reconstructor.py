@@ -248,8 +248,8 @@ class FDKReconstructor:
            - vol_origin: (x, y, z) volume center in mm
            - dx: voxel size in xy (mm)
            - dz: voxel size in z (mm)
-           - central_pixel_a: detector center column
-           - central_pixel_b: detector center row
+           - central_pixel_a: detector column the source-isocentre ray hits
+           - central_pixel_b: detector row the source-isocentre ray hits
         quantitative: bool, if True (and bright/dark fields are supplied),
             apply flat-field correction and the log transform so the output is
             linear attenuation μ in mm⁻¹ rather than raw filtered intensity.
@@ -661,24 +661,29 @@ class FDKReconstructor:
             # 2D coordinate grids (z-independent) — computed once
             X_2d, Y_2d = torch.meshgrid(self.x, self.y, indexing='ij')  # (Nx, Ny)
 
-            # Detector centering (IMPORTANT — see COR-offset note below).
-            # The rotation axis projects to detector column central_pixel_a and the
-            # mid-plane ray to row central_pixel_b (scan.xml CentreOfRotation /
-            # CentralSlice). The stored VFF projections are NOT pre-centred, so we
-            # must shift the sampled detector coordinate by the displacement of the
-            # TRUE centre from the geometric centre (N-1)/2. Omitting this (the old
-            # a_offset=b_offset=0) reconstructs off-isocentre objects non-round and
-            # mis-registers edges (worst in the vertical/b direction, ~27 px here).
+            # Detector centering. central_pixel_a / central_pixel_b are the
+            # detector column / row the source-to-isocentre ray hits — the
+            # one definition shared by every backend (ray sampler, Gaussian
+            # camera, TIGRE, the support / diagnostics / self-calibration
+            # helpers), see ct_core.pipeline.apply_cor_policy. The sampled
+            # detector coordinate is measured from the panel's geometric
+            # centre (N-1)/2, so a voxel at the isocentre must land at
+            # (central_pixel - (N-1)/2) * pitch from it.
             #
-            # SIGN VERIFIED EMPIRICALLY (June 2026, TRIUMF scanner) against the GEHC
-            # reference recon of Scan_1955: the correct offset is
-            # ((N-1)/2 - central_pixel)*pixel_size. (An earlier attempt used the
-            # OPPOSITE sign, which doubled the error and was reverted — do not flip.)
+            # SIGN: until 2026-10-23 this read ((N-1)/2 - central_pixel), the
+            # MIRROR of the documented definition — the isocentre voxel was
+            # read from column (N-1) - central_pixel_a. Invisible under the
+            # geometric-centre policy (the two coincide) and compensated in
+            # 0.3.0 by mirroring the vendor's CentreOfRotation before it got
+            # here, which made this FDK round but handed every other backend
+            # the mirrored axis (split tube in the Gaussian reconstructions).
+            # The vendor's values are now passed through unmirrored and this
+            # sign matches the definition; the FDK output is unchanged.
             #
-            # cor_offset_scale: 1.0 = apply (default, correct); 0.0 = off (legacy,
-            # for back-compat / comparison); -1.0 = flipped sign (diagnostic only).
-            a_offset = self.cor_offset_scale * ((self.N_a - 1) / 2.0 - self.central_pixel_a) * self.da
-            b_offset = self.cor_offset_scale * ((self.N_b - 1) / 2.0 - self.central_pixel_b) * self.db
+            # cor_offset_scale: 1.0 = apply (default); 0.0 = off (legacy,
+            # axis at the detector centre); -1.0 = flipped sign (diagnostic).
+            a_offset = self.cor_offset_scale * (self.central_pixel_a - (self.N_a - 1) / 2.0) * self.da
+            b_offset = self.cor_offset_scale * (self.central_pixel_b - (self.N_b - 1) / 2.0) * self.db
             if self.cor_offset_scale != 0.0:
                 print(f"  Detector COR offset (scale={self.cor_offset_scale:+.1f}): "
                       f"a={a_offset:+.4f} mm, b={b_offset:+.4f} mm")
@@ -687,7 +692,7 @@ class FDKReconstructor:
                       f"{np.rad2deg(self.det_psi_rad):+.4f} deg "
                       f"(a-coordinate becomes z-dependent)")
             else:
-                print("  Detector COR offset: OFF (legacy, COR at detector centre)")
+                print("  Detector in-plane rotation: none (psi = 0)")
             a_scale = 1.0 / (self.a_length / 2)
             b_scale = 1.0 / (self.b_length / 2)
 

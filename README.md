@@ -155,6 +155,18 @@ pre-filled from the address bar
 (`/new?driver=learned&algorithm=gaussian&input=…&all=1`; the viewer takes
 `/view?machine=&path=&window=`).
 
+![Region of interest: a box dragged over a coarse preview of the scan](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/docs/gui/roi_picker.png)
+
+*Region of interest.* "Choose visually" on the `--roi` row reconstructs the
+whole field of the scan at 0.4 mm where the scan lives (a few seconds on a
+GPU, cached afterwards) and shows it as three slices with a slider each, or
+as projections. The
+box is the six `--roi` numbers: drag its corners, edges or body in any
+pane, or type the bounds; it starts on the scanner's own ROI when the scan
+has one. "Use this ROI" snaps the extents to whole voxels of the job's
+pitch, so the run rebuilds exactly the lattice shown, and the job's log
+states the same bounds and the `--roi` line that reproduces them.
+
 ![New job on a cluster: the sbatch directives as editable chips](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/docs/gui/new_job_cluster.png)
 
 *The same form aimed at a Slurm cluster.* The `#SBATCH` directives appear as

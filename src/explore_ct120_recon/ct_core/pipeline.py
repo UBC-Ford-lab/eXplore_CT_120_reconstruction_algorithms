@@ -182,15 +182,13 @@ def add_common_args(parser):
         default='auto',
         choices=('auto', 'vendor', 'center', 'xml'),
         help='Detector centre-of-rotation policy (default: auto). "vendor": '
-             'the scan.xml CentreOfRotation/CentralSlice in the convention '
-             'the vendor means them — mirrored across the detector '
-             '((N-1) - value) — which is where the axis sits once the frames '
-             'are unwarped (round tube at every height on both epochs, '
-             'vendor-volume NCC 0.939 -> 0.965 on Scan_1510). "center": the '
+             'the scan.xml CentreOfRotation/CentralSlice as written — the '
+             'column/row the source-isocentre ray hits once the frames are '
+             'unwarped (round tube at every height on both epochs, '
+             'vendor-volume NCC 0.939 -> 0.968 on Scan_1510). "center": the '
              'detector geometric centre + the psi self-calibration, the '
              'policy for RAW frames. "auto" = vendor when a detector unwarp '
-             'was applied, center otherwise. "xml" is the legacy unmirrored '
-             'reading, kept for comparison; it over-corrects.'
+             'was applied, center otherwise. "xml" = vendor (legacy name).'
     )
     parser.add_argument(
         '--geometry-autocal',
@@ -484,7 +482,7 @@ def _fov_spec(value, flag: str):
 
 
 def resolve_fov(args, xml_header, projections, *, bright_field=None,
-                dark_field=None, measure: bool = True):
+                dark_field=None, measure: bool = True, detector_shape=None):
     """`--fov-xy` / `--fov-z` -> the two extents build_geometry wants, in mm.
 
     The historical defaults (45 mm transaxial, 120 mm axial) were neither
@@ -514,7 +512,10 @@ def resolve_fov(args, xml_header, projections, *, bright_field=None,
     if want_xy is not None and want_z is not None:
         return want_xy, want_z
 
-    n_b, n_a = int(projections.shape[1]), int(projections.shape[2])
+    # The RAW detector shape; ``projections`` may already be pooled (the
+    # preview), in which case the caller says what the raw one was.
+    n_b, n_a = (int(detector_shape[0]), int(detector_shape[1])) if detector_shape \
+        else (int(projections.shape[1]), int(projections.shape[2]))
     reach = reconstructible_fov(xml_header, n_b, n_a,
                                 cor_mode=('center' if getattr(args, 'cor_mode', 'center') in ('auto', 'vendor') else getattr(args, 'cor_mode', 'center')))
     fov_xy = reach['fov_xy'] if want_xy is None else want_xy
@@ -568,7 +569,18 @@ def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
     """Detector centre-of-rotation policy, applied to every backend's
     geometry.
 
-    DEFAULT ('center'): the rotation axis sits at the detector geometric
+    ``central_pixel_a`` / ``central_pixel_b`` are, everywhere in this package,
+    the detector column / row the source-to-isocentre ray hits (the ray
+    sampler's definition; the FDK, TIGRE, the Gaussian camera and the
+    support / diagnostic / self-calibration helpers all read them so).
+
+    'vendor' (what 'auto' picks after a detector unwarp): the scan.xml
+    CentreOfRotation / CentralSlice as written — they describe the unwarped
+    frames, and they are in our indexing (0.3.0 mirrored them to compensate
+    a sign error in the FDK; both are gone). 'xml' is the same value, kept
+    as a name.
+
+    'center' (what 'auto' picks for raw frames): the rotation axis sits at the detector geometric
     centre. The scan.xml CentreOfRotation/CentralSlice offset and the
     detector-psi calibration are nearly degenerate at any single
     off-midplane height, and applying BOTH over-corrects: the decisive
@@ -590,18 +602,24 @@ def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
     geometry['central_pixel_b_xml'] = geometry['central_pixel_b']
     if cor_mode == 'auto':
         raise ValueError("apply_cor_policy needs a resolved mode (vendor/center/xml)")
-    if cor_mode == 'vendor':
-        # The vendor's numbers index the detector from the other edge: the
-        # unwarped Scan_2005 tube is round at (N_a-1)-1744.96 and split at
-        # 1744.96; the 2022 Scan_1510 likewise at (N_a-1)-1758.48. The row
-        # mirror puts the vendor volume's z offset at 0.01 mm (0.52 unmirrored).
-        geometry['central_pixel_a'] = (n_a - 1) - geometry['central_pixel_a_xml']
-        geometry['central_pixel_b'] = (n_b - 1) - geometry['central_pixel_b_xml']
+    if cor_mode in ('vendor', 'xml'):
+        # The vendor's CentreOfRotation / CentralSlice ARE the column / row
+        # the source-isocentre ray hits on the unwarped detector grid, in our
+        # own indexing (a round tube at every height on both epochs;
+        # Scan_1510 vs the vendor volume NCC 0.939 -> 0.968). 0.3.0 mirrored
+        # them ((N-1) - value) because the FDK backprojector applied its
+        # centre offset with the opposite sign (fixed 2026-10-23, see
+        # fdk/reconstructor.py): the FDK was round only with the mirror,
+        # while every ray-based backend (Gaussian camera, ray sampler,
+        # TIGRE) was handed an axis 2 x 9 px off and split the tube.
+        geometry['central_pixel_a'] = geometry['central_pixel_a_xml']
+        geometry['central_pixel_b'] = geometry['central_pixel_b_xml']
         if verbose:
-            print(f"\n  Centre of rotation: vendor values, mirrored "
+            print(f"\n  Centre of rotation: scan.xml values "
                   f"(a={geometry['central_pixel_a']:.2f}, "
                   f"b={geometry['central_pixel_b']:.2f}) — the axis of the "
-                  f"unwarped detector grid; psi not applied.")
+                  f"unwarped detector grid; psi not applied"
+                  f"{'' if cor_mode == 'vendor' else ' (--cor-mode xml)'}.")
     elif cor_mode == 'center':
         geometry['central_pixel_a'] = (n_a - 1) / 2.0
         geometry['central_pixel_b'] = (n_b - 1) / 2.0
@@ -613,8 +631,6 @@ def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
                   f"b={geometry['central_pixel_b_xml']:.1f}) NOT applied — "
                   f"psi calibration covers the alignment (--cor-mode xml "
                   f"restores the legacy behaviour).")
-    elif verbose:
-        print("\n  Centre of rotation: scan.xml values (--cor-mode xml).")
 
     f = max(1, int(downsample))
     if f > 1:
@@ -684,15 +700,40 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     else:
         scan_folder = auto_detect_scan_folder(data_folder)
 
+    from .detector_warp import pooled_frame_transform, select_projection_warp, warp_projections
+    factor = int(getattr(args, 'downsample', 1) or 1)
+    # Neither is a command-line flag: the GUI's ROI preview thins the views
+    # and, with ``preview_fast``, pools + unwarps each frame AS IT IS READ
+    # (the full-resolution stack never exists) and takes the detector's
+    # whole field instead of measuring the support. A delivered
+    # reconstruction always uses every projection and the drivers' order.
+    view_step = int(getattr(args, 'view_step', 1) or 1)
+    fast = bool(getattr(args, 'preview_fast', False))
+    warp = None
+    frame_transform = None
+    if fast:
+        from .vff_io import raw_detector_shape
+        from .scan_setup import load_xml_header
+        raw_shape = raw_detector_shape(data_folder, args.projection_pattern)
+        if raw_shape is None:
+            raise ScanDataError(f"no projections in {data_folder}")
+        warp = select_projection_warp(
+            scan_folder, load_xml_header(data_folder), raw_shape,
+            mode=getattr(args, 'detector_warp', 'auto'), allow_measure=False)
+        frame_transform = pooled_frame_transform(warp, factor)
+
     scan_data = load_scan_data(
         data_folder, scan_folder,
         args.projection_pattern, args.total_angle,
         sub_scan=f'-{args.phase}-',
+        view_step=view_step, frame_transform=frame_transform,
     )
     projections = scan_data['projections']
     angles = scan_data['angles']
     bright_field = scan_data['bright_field']
     dark_field = scan_data['dark_field']
+    if not fast:
+        raw_shape = (projections.shape[1], projections.shape[2])
 
     # With a model domain, --roi selects what to SAVE and the grid comes from
     # the measured support; without one (FDK, or --model-domain off), --roi IS
@@ -707,22 +748,23 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     fov_xy, fov_z = resolve_fov(
         args, scan_data['xml_header'], projections,
         bright_field=bright_field, dark_field=dark_field,
-        measure=(roi_bounds is None and not use_domain))
+        measure=(roi_bounds is None and not use_domain and not fast),
+        detector_shape=raw_shape)
 
     # ---- detector unwarp (every backend, once, on the raw frames) --------
     # Before the geometry is built and before any pooling: the field is in
     # raw detector pixels and the scan.xml geometry describes the detector
     # AFTER it, so everything downstream (support, psi self-calibration,
     # preprocessing, every reconstructor) sees corrected frames.
-    from .detector_warp import select_projection_warp, warp_projections
     warp_info = None
-    warp = select_projection_warp(
-        scan_folder, scan_data['xml_header'],
-        (projections.shape[1], projections.shape[2]),
-        mode=getattr(args, 'detector_warp', 'auto'))
+    if not fast:
+        warp = select_projection_warp(
+            scan_folder, scan_data['xml_header'], raw_shape,
+            mode=getattr(args, 'detector_warp', 'auto'))
+        if warp is not None:
+            projections, bright_field, dark_field = warp_projections(
+                projections, bright_field, dark_field, warp)
     if warp is not None:
-        projections, bright_field, dark_field = warp_projections(
-            projections, bright_field, dark_field, warp)
         mean_px, max_px = warp.magnitude()
         warp_info = {'mode': warp.mode, 'calibration': ('transform1' if warp.dense is not None else Path(warp.source).name),
                      'detector_serial': warp.detector_serial,
@@ -734,13 +776,12 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         cor_mode = 'vendor' if warp is not None and warp.mode == 'full' else 'center'
     args.cor_mode = cor_mode          # downstream readers see the resolved mode
 
-    factor = int(getattr(args, 'downsample', 1) or 1)
     # Grid + CoR policy + the pitch rescale, in one shared call — so muNeRF,
     # which holds a cached sinogram and never comes through here, runs
     # literally the same arithmetic.
     geometry = build_scan_geometry(
         scan_data['xml_header'],
-        raw_detector_shape=(projections.shape[1], projections.shape[2]),
+        raw_detector_shape=raw_shape,
         fov_xy=fov_xy, fov_z=fov_z,
         voxel_xy=args.voxel_xy, voxel_z=args.voxel_z,
         roi_bounds=None if use_domain else roi_bounds,
@@ -755,7 +796,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
 
     # Optional detector downsampling (average pooling) of the PIXELS. The
     # geometry side of it was handled above.
-    if factor > 1:
+    if factor > 1 and not fast:
         print(f"\nDownsampling projections by factor {factor}...")
         original_shape = projections.shape
         projections = downsample_projections(projections, factor)

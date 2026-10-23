@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import replace
 
 from ...ct_core.calibration import PSF_SIGMA_MM
 from ...ct_core.preflight import Footprint, MachineRequest
@@ -52,12 +53,19 @@ TRAIN_BYTES_PER_PIXEL = 48
 #: state still alive, the extension's per-primitive binning buffer, beside
 #: ONE slab (measured 3.57 - 1.47 sinogram - 0.48 slab = 1.62 GiB for 2.4 M).
 EXPORT_BYTES_PER_GAUSSIAN = 720
-#: The seeding FDK sizes its own chunks to the FREE memory and releases
-#: everything afterwards, so it is charged at what it takes when
-#: unconstrained: 6.36 - 1.47 resident - 0.46 seed volume = 4.4 GiB = six
-#: sinogram copies (raw, flat-fielded, filtered, padded FFT). With less free
-#: it chunks the views and needs less, so this is the conservative end.
-SEED_SINO_COPIES = 6
+#: The seeding FDK (`_seed_volume`) is the submodule's own `FDKReconstructor`
+#: on the model domain coarsened to this pitch (see
+#: ``GaussianReconstructor.SEED_VOXEL_FLOOR_MM``). It sizes its filter
+#: chunks to the FREE VRAM, streams projections from the host when the
+#: sinogram does not fit beside the volume, and releases everything
+#: afterwards — so the seed stage is charged at that FDK's FLOOR
+#: (`ct_core.preflight._fdk_footprint`), beside the target and WLS weights
+#: that are already resident. It used to be charged at six extra sinogram
+#: copies, the FDK's UNCONSTRAINED fast path measured on a P100 with
+#: everything free: on Scan_2005 ds3 (1.46 GiB sinogram) that read 12.2 GiB
+#: for a stage whose floor is 3.5, and refused an RTX 5080 (13.7 GiB free)
+#: a run whose real peak is the 5.0 GiB export.
+SEED_VOXEL_FLOOR_MM = GaussianReconstructor.SEED_VOXEL_FLOOR_MM
 
 #: Adam LR for the position group; the other three groups are fixed multiples
 #: of it (see ``GaussianCloud.param_groups``). NOT the driver's global 1e-4:
@@ -494,6 +502,30 @@ def _n_max(args) -> int:
     return int(getattr(args, 'gauss_max', DEFAULT_N_GAUSSIANS) or DEFAULT_N_GAUSSIANS)
 
 
+def _seed_fdk_floor(args, req: MachineRequest) -> int:
+    """VRAM floor of the seeding FDK: the submodule FDK's own preflight model
+    on the seed grid — the run's domain coarsened to ``SEED_VOXEL_FLOOR_MM``
+    the way ``GaussianReconstructor._seed_geometry`` does it (extents held,
+    counts divided by the integer factor). The pitch comes from the driver's
+    --voxel-xy/--voxel-z; sized by name only (``args=None``) the grid is
+    charged uncoarsened, which is the conservative end."""
+    from ...ct_core.preflight import _fdk_footprint
+
+    def factor(name):
+        d = getattr(args, name, None)
+        try:
+            d = float(d)
+        except (TypeError, ValueError):
+            return 1
+        return max(1, int(round(SEED_VOXEL_FLOOR_MM / d))) if d > 0 else 1
+
+    fx, fz = factor('voxel_xy'), factor('voxel_z')
+    nx, ny, nz = (int(v) for v in req.vol_shape)
+    seed_req = replace(req, vol_shape=(max(1, nx // fx), max(1, ny // fx),
+                                       max(1, nz // fz)))
+    return int(_fdk_footprint(seed_req).persistent_gpu_bytes)
+
+
 def footprint_stages(args, req: MachineRequest) -> dict:
     """Peak device bytes of each SEQUENTIAL stage of a Gaussian run.
 
@@ -509,10 +541,10 @@ def footprint_stages(args, req: MachineRequest) -> dict:
     # beside the target), 1 otherwise — from the driver's --loss, the registry
     # default when sized by name only.
     resident = resident_sinogram_copies(getattr(args, 'loss', None))
-    # Seeding: the FDK reference on the model domain (see the constant),
-    # beside the target and the WLS weights, which are already resident.
-    seed = (resident * sino + SEED_SINO_COPIES * sino
-            + int(req.vol_bytes) // 8)
+    # Seeding: the FDK reference on the coarsened model domain (see the
+    # constant), beside the target and the WLS weights, which are already
+    # resident. The FDK's floor, not its fast path: it chunks to what is free.
+    seed = resident * sino + _seed_fdk_floor(args, req)
     # Training: the whole sinogram is resident (a splat step fits a full
     # view, never a ray batch), and WLS keeps a weight per pixel beside it.
     train = (resident * sino

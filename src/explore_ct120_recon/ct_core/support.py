@@ -298,6 +298,8 @@ def export_grid_geometry(geometry: dict, verbose: bool = False) -> dict:
               f"{out['vol_shape'][2]}"
               f"  ({np.prod(out['vol_shape']) / max(1, Nx * Ny * Nz) * 100:.1f}% "
               f"of the reconstruction domain)")
+        from .scan_setup import describe_grid_bounds
+        describe_grid_bounds(out)
     return out
 
 

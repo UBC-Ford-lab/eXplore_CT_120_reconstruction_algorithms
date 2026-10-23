@@ -39,6 +39,13 @@ export interface DirEntry { name: string; dir: boolean; size: number | null; mti
 export interface DirListing { path: string; parent: string | null; entries: DirEntry[]; error: string | null; places: [string, string][] }
 export interface VolumeInfo { path: string; size: [number, number, number]; bits: number; spacing: [number, number, number] | null; units: string | null; sidecar: boolean; bytes: number; mtime: number; sample: [number, number] }
 export interface Schema { driver: string; script: string; algorithm: string | null; description: string; fields: Field[] }
+export interface RoiBounds { x_min: number; x_max: number; y_min: number; y_max: number; z_min: number; z_max: number }
+/** A coarse FDK of a whole scan (gui/roi_preview.py): ``data`` is base64 of nz*ny*nx uint8 in [z][y][x] order, index up = mm up. */
+export interface RoiPreview {
+  shape: [number, number, number]; spacing: [number, number, number]; bounds: RoiBounds; scanner_roi: RoiBounds | null
+  window: [number, number]; n_views: number; voxel_mm: number; data_folder: string
+  seconds: { load: number; reconstruct: number }; data: string; cached: boolean
+}
 export interface Scan { name: string; path: string }
 export interface Job {
   id: string; driver: string; algorithm: string | null; values: Record<string, any>; command: string[]
@@ -79,6 +86,8 @@ export const api = {
     const [rows, cols] = (r.headers.get('X-Shape') ?? '0,0').split(',').map(Number)
     return { rows, cols, data: new Int16Array(await r.arrayBuffer()) }
   },
+  roiPreview: (body: { executor: string; data_folder: string; scan_folder?: string | null; phase?: string; refresh?: boolean }) =>
+    request<RoiPreview>('/api/roi/preview', { method: 'POST', body: JSON.stringify(body) }),
   browse: (machine: string, path: string | null, hidden = false) =>
     request<DirListing>(`/api/machines/${encodeURIComponent(machine)}/browse`, { method: 'POST', body: JSON.stringify({ path, hidden }) }),
   scans: (machine = 'local') => request<Scan[]>(`/api/machines/${encodeURIComponent(machine)}/scans`),

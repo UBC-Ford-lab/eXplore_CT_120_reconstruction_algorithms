@@ -611,6 +611,58 @@ def warp_frames(frames, warp: DetectorWarp, *, device=None, grid=None):
     return out[0] if squeeze else out
 
 
+def pooled_frame_transform(warp, factor: int, *, device=None):
+    """A per-frame ``pool, then unwarp`` for a coarse preview.
+
+    The drivers unwarp every frame at full resolution and pool afterwards;
+    at a preview pitch (0.4 mm voxels, the detector pooled 4x) that order
+    spends ten seconds resampling pixels that are then averaged away. This
+    returns a callable ``frame (H, W) -> (H//factor, W//factor) float32``
+    that average-pools first and resamples the POOLED frame with the warp
+    field pooled the same way (the displacement, in pooled pixels, is the
+    block mean of the raw displacement over ``factor``). The field is
+    smooth over many pixels, so at the preview pitch the two orders agree;
+    this one is not for a delivered reconstruction. ``warp`` may be None
+    (pooling only). Everything runs on ``device`` (the GPU if there is one).
+    """
+    factor = max(1, int(factor))
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    grid = None
+    if warp is not None:
+        H, W = warp.raw_shape
+        Hp, Wp = H // factor, W // factor
+        full = warp.sampling_grid(device=device, dtype=torch.float64)[0]      # (H, W, 2) normalised
+        gx, gy = full[..., 0], full[..., 1]
+        rr, cc = torch.meshgrid(torch.arange(H, dtype=torch.float64, device=device),
+                                torch.arange(W, dtype=torch.float64, device=device), indexing='ij')
+        d_c = (gx + 1.0) * (W - 1) / 2.0 - cc                                 # raw px
+        d_r = (gy + 1.0) * (H - 1) / 2.0 - rr
+        if factor > 1:
+            pool = torch.nn.functional.avg_pool2d
+            d_c = pool(d_c[None, None, :Hp * factor, :Wp * factor], factor)[0, 0] / factor
+            d_r = pool(d_r[None, None, :Hp * factor, :Wp * factor], factor)[0, 0] / factor
+        jj, ii = torch.meshgrid(torch.arange(Hp, dtype=torch.float64, device=device),
+                                torch.arange(Wp, dtype=torch.float64, device=device), indexing='ij')
+        grid = torch.stack([2.0 * (ii + d_c) / max(Wp - 1, 1) - 1.0,
+                            2.0 * (jj + d_r) / max(Hp - 1, 1) - 1.0], -1)[None].to(torch.float32)
+
+    def transform(frame):
+        arr = np.asarray(frame)
+        if warp is not None and tuple(arr.shape) != tuple(warp.raw_shape):
+            raise ValueError(f"frame is {arr.shape}, calibration is {warp.raw_shape}")
+        x = torch.as_tensor(np.asarray(arr, dtype=np.float32), device=device)[None, None]
+        if factor > 1:
+            h, w = x.shape[-2:]
+            x = torch.nn.functional.avg_pool2d(x[..., :(h // factor) * factor, :(w // factor) * factor], factor)
+        if grid is not None:
+            x = torch.nn.functional.grid_sample(x, grid, mode='bilinear', padding_mode='border',
+                                                align_corners=True)
+        return x[0, 0].cpu().numpy()
+
+    return transform
+
+
 def warp_projections(projections, bright_field, dark_field, warp: DetectorWarp,
                      *, chunk: int = 8, verbose: bool = True):
     """Unwarp a whole scan in place: every projection, plus the flat fields.

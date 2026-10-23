@@ -7,6 +7,7 @@ Routes (all under ``/api``):
   DELETE /machines/{name}
   POST /machines/{name}/check       health checks (ssh, paths, python, package, slurm)
   GET  /machines/{name}/scans       scan folders under the machine's scans root
+  POST /roi/preview                 coarse FDK of a scan for the ROI picker: {executor, data_folder, ...}
   GET  /machines/template/default   the package's Slurm template
   WS   /machines/{name}/login       interactive login (terminal relay) to open the SSH master
   GET  /drivers                     the drivers and, for the learned one, its algorithms
@@ -29,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -93,6 +95,14 @@ class BrowseRequest(BaseModel):
 class VolumeRequest(BaseModel):
     path: str
     executor: str = 'local'
+
+
+class RoiPreviewRequest(BaseModel):
+    executor: str = 'local'
+    data_folder: str
+    scan_folder: Optional[str] = None
+    phase: str = '00'
+    refresh: bool = False       # recompute even when a cached preview exists
 
 
 class MachineRequest(BaseModel):
@@ -345,6 +355,44 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
         (rows, cols), data = hit
         return Response(content=data, media_type='application/octet-stream',
                         headers={'X-Shape': f'{rows},{cols}', 'Cache-Control': 'private, max-age=3600'})
+
+    # -- ROI preview: a coarse FDK for the new-job page's picker ---------------
+    from .roi_preview import PreviewCache, run_preview, spec_for
+    previews = PreviewCache(settings.data_dir / 'previews')
+    preview_lock = threading.Lock()      # one coarse reconstruction at a time
+
+    @app.post('/api/roi/preview')
+    def roi_preview(req: RoiPreviewRequest):
+        """The whole attenuating field of a scan at 0.4 mm, reconstructed
+        where the scan lives, for drawing the ``--roi`` box on. Cached on
+        disk per machine, scan and phase; ``refresh`` recomputes."""
+        ex = executors.get(req.executor)
+        if ex is None:
+            raise HTTPException(404, f'unknown machine {req.executor!r}')
+        if not req.data_folder.strip():
+            raise HTTPException(400, 'give the scan folder first')
+        where = _volume_machine(req.executor)
+        spec = spec_for(req.data_folder.strip(), cwd=where.get('cwd'), scan_folder=req.scan_folder or None,
+                        phase=req.phase or '00')
+        key = previews.key(req.executor, spec)
+        if req.refresh:
+            previews.forget(key)
+        else:
+            hit = previews.get(key)
+            if hit is not None:
+                return {**hit, 'cached': True}
+        with preview_lock:
+            hit = previews.get(key)
+            if hit is not None:
+                return {**hit, 'cached': True}
+            try:
+                result = run_preview(spec, conn=where.get('conn'), python=where.get('python') or ex.python)
+            except subprocess.TimeoutExpired:
+                raise HTTPException(504, 'the preview reconstruction took too long')
+            except Exception as e:
+                raise HTTPException(400, f'preview on {req.executor} failed: {e}')
+            previews.put(key, result)
+        return {**result, 'cached': False}
 
     @app.get('/api/machines/{name}/scans')
     def machine_scans(name: str):

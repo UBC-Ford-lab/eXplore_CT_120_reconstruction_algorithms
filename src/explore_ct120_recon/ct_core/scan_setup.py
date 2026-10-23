@@ -87,8 +87,18 @@ def auto_detect_scan_folder(data_folder: str) -> str:
     return scan_folder
 
 
+def load_xml_header(data_folder) -> dict:
+    """The parsed ``scan.xml`` of ``data_folder`` (the dict every geometry
+    helper takes)."""
+    xml_file = os.path.join(data_folder, 'scan.xml')
+    if not os.path.exists(xml_file):
+        raise ScanDataError(f"scan.xml not found at {xml_file}")
+    with open(xml_file) as f:
+        return xmltodict.parse(f.read())
+
+
 def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
-                   sub_scan='-00-'):
+                   sub_scan='-00-', view_step=1, frame_transform=None):
     """
     Load projections, angles, and calibration fields from a scan folder.
 
@@ -104,6 +114,11 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
         scan_folder: Path to original scan folder with bright.vff/dark.vff
         projection_pattern: Glob pattern for projection files, or None to auto-detect
         total_angle: Total angular coverage string ('determined' or numeric degrees)
+        view_step: keep every k-th projection (1 = all). The total angle is
+            still that of the whole acquisition; only the views thin out.
+        frame_transform: optional callable applied to every frame (and to
+            the flat fields) as it is read; the stack holds its float32
+            output. See ``VFFDataset``.
 
     Returns:
         dict with keys:
@@ -139,7 +154,7 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
             projection_pattern = 'acq*'
 
     # Parse XML
-    header = xmltodict.parse(open(xml_file).read())
+    header = load_xml_header(data_folder)
 
     # Count projection files
     print(f"\nLoading projections (pattern: {projection_pattern})...")
@@ -184,7 +199,12 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
         paths_str=projection_pattern,
         projection_spacing=projection_spacing,
         sub_scan=sub_scan or '-00-',
+        view_step=view_step,
+        frame_transform=frame_transform,
     )
+    if frame_transform is not None:
+        bright_field = np.asarray(frame_transform(bright_field), dtype=np.float32)
+        dark_field = np.asarray(frame_transform(dark_field), dtype=np.float32)
     projections = dataset.projections  # shape (N_angles, N_b, N_a)
     angles = dataset.angles_rad        # shape (N_angles,)
     view_groups, group_labels = view_groups_for(dataset.paths, phases)
@@ -391,6 +411,47 @@ def reconstructible_fov(xml_header, n_b: int, n_a: int,
     }
 
 
+def grid_bounds_mm(geometry, shape=None):
+    """Outer voxel-edge extent of a grid, isocentre-centred mm, as the six
+    ``--roi`` values that rebuild EXACTLY this lattice.
+
+    ``build_geometry`` sizes an ROI grid as ``round(extent / voxel)`` voxels
+    centred on the box, so a box whose extent is already a whole number of
+    voxels round-trips: feeding these bounds back as ``--roi x_min x_max y_min
+    y_max z_min z_max`` gives the same shape and origin, voxel for voxel.
+    The extent is the OUTER edge of the first and last voxel, not their
+    centres; the half-width is ``N * d / 2``, not ``(N - 1) * d / 2``.
+    """
+    Nx, Ny, Nz = (int(v) for v in
+                  (shape if shape is not None else geometry['vol_shape']))
+    ox, oy, oz = (float(v) for v in geometry.get('vol_origin', (0.0, 0.0, 0.0)))
+    dx, dz = float(geometry['dx']), float(geometry['dz'])
+    return {
+        'x_min': ox - Nx * dx / 2.0, 'x_max': ox + Nx * dx / 2.0,
+        'y_min': oy - Ny * dx / 2.0, 'y_max': oy + Ny * dx / 2.0,
+        'z_min': oz - Nz * dz / 2.0, 'z_max': oz + Nz * dz / 2.0,
+    }
+
+
+def roi_flag_for(bounds) -> str:
+    """The ``--roi`` argument string that reproduces ``bounds`` (from
+    ``grid_bounds_mm``), with enough digits for a 0.075 mm lattice."""
+    return '--roi ' + ' '.join(
+        f'{bounds[k]:.4f}' for k in
+        ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max'))
+
+
+def describe_grid_bounds(geometry, shape=None, indent='  ') -> None:
+    """Print the extent of a grid and the --roi that replicates it. Called
+    wherever a grid is announced (geometry build, export crop, sidecar), so a
+    log always states explicitly what to enter to get the same ROI again."""
+    b = grid_bounds_mm(geometry, shape)
+    print(f"{indent}Volume extent (mm): x [{b['x_min']:.4f}, {b['x_max']:.4f}]  "
+          f"y [{b['y_min']:.4f}, {b['y_max']:.4f}]  "
+          f"z [{b['z_min']:.4f}, {b['z_max']:.4f}]")
+    print(f"{indent}Replicate this grid with: {roi_flag_for(b)}")
+
+
 def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None,
                    verbose=True):
     """
@@ -464,6 +525,7 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None
     print(f"  Volume origin: ({vol_origin[0]:.2f}, {vol_origin[1]:.2f}, {vol_origin[2]:.2f}) mm")
     print(f"  Voxel size (xy): {geometry['dx']:.4f} mm")
     print(f"  Voxel size (z): {geometry['dz']:.4f} mm")
+    describe_grid_bounds(geometry)
 
     return geometry
 
@@ -647,6 +709,9 @@ def write_sidecar(vff_path, geometry, anchors, *, shape=None,
         # returns, NOT the (z, y, x) order of the VFF payload.
         'volume_shape': [Nx, Ny, Nz],
         'vol_origin_mm': [ox, oy, oz],
+        # Outer voxel-edge extent, isocentre-centred: the six --roi values
+        # that rebuild this exact lattice (see grid_bounds_mm).
+        'volume_bounds_mm': grid_bounds_mm(geometry, (Nx, Ny, Nz)),
         'hu_calibration': {k.split('/', 1)[-1]: v
                            for k, v in calibration_scalars(anchors).items()},
     }
@@ -659,4 +724,5 @@ def write_sidecar(vff_path, geometry, anchors, *, shape=None,
     with open(path, 'w') as f:
         json.dump(record, f, indent=2)
     print(f"Volume metadata saved to: {path}")
+    describe_grid_bounds(geometry, (Nx, Ny, Nz))
     return path

@@ -5,6 +5,7 @@ import { api, CheckGroup, Driver, Info, Preview, Scan, Schema } from '../api'
 import Form, { defaultsOf, Values } from '../components/Form'
 import SbatchChips from '../components/SbatchChips'
 import Browser, { BrowseButton } from '../components/Browser'
+import RoiPicker, { parseRoi, roiValues } from '../components/RoiPicker'
 
 // Driver groups in the dropdown, in this order.
 const KINDS = [
@@ -16,7 +17,7 @@ const KINDS = [
 
 export default function NewJob({ info }: { info: Info | null }) {
   const nav = useNavigate()
-  // ?driver=learned&algorithm=gaussian&input=data/scans/Scan_1510&machine=fir&all=1 pre-fills the page
+  // ?driver=learned&algorithm=gaussian&input=data/scans/Scan_1510&machine=fir&all=1 pre-fills the page; &roi=pick opens the ROI picker
   const [params] = useSearchParams()
   const [drivers, setDrivers] = useState<Driver[]>([])
   const [scans, setScans] = useState<Scan[]>([])
@@ -34,6 +35,7 @@ export default function NewJob({ info }: { info: Info | null }) {
   const [templatePreview, setTemplatePreview] = useState<Preview | null>(null)   // the same without overrides
   const [showScript, setShowScript] = useState(false)
   const [browseOut, setBrowseOut] = useState(false)
+  const [pickingRoi, setPickingRoi] = useState(params.get('roi') === 'pick')
   const [checking, setChecking] = useState(false)
   const [filter, setFilter] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -128,6 +130,21 @@ export default function NewJob({ info }: { info: Info | null }) {
   const executors = info?.executors ?? []
   const selected = executors.find(m => m.name === machine)
   const algoSummary = d && algorithm ? d.algorithms.find(a => a.name === algorithm)?.summary : null
+
+  // --roi, drawn on a coarse preview of the scan (reconstruction drivers only)
+  const roiField = d?.kind === 'reconstruction' ? schema?.fields.find(f => f.dest === 'roi') : undefined
+  const scanPath: string = roiField ? String(values[d!.primary] ?? '') : ''
+  const roiRaw = values.roi
+  const roiText: string = Array.isArray(roiRaw) ? roiRaw.join(' ') : (roiRaw ?? '')
+  const roiBounds = parseRoi(roiRaw)
+  const voxelXY = Number(values.voxel_xy ?? schema?.fields.find(f => f.dest === 'voxel_xy')?.default ?? 0.075) || 0.075
+  const voxelZ = Number(values.voxel_z ?? schema?.fields.find(f => f.dest === 'voxel_z')?.default ?? 0.075) || 0.075
+  const roiSummary = roiBounds
+    ? `x [${roiBounds.x_min}, ${roiBounds.x_max}]  y [${roiBounds.y_min}, ${roiBounds.y_max}]  z [${roiBounds.z_min}, ${roiBounds.z_max}] mm · `
+      + `${Math.round((roiBounds.x_max - roiBounds.x_min) / voxelXY)} × ${Math.round((roiBounds.y_max - roiBounds.y_min) / voxelXY)} × ${Math.round((roiBounds.z_max - roiBounds.z_min) / voxelZ)} voxels`
+    : roiText.trim() === 'full' ? 'the whole reconstructible field'
+    : roiText.trim() === '' || roiText.trim() === 'auto' ? "auto: the scanner's own ROI (SubVolumeCoordinates.xml), or the whole field without one"
+    : roiField?.help ?? ''
   return (
     <>
       <div className="page-head">
@@ -183,13 +200,31 @@ export default function NewJob({ info }: { info: Info | null }) {
           <span className="right">{changedCount} changed from the defaults</span>
         </div>
         {!schema && !error && <p className="muted">Loading the form…</p>}
-        {filtered && <Form schema={filtered} values={values} setValues={setValues} scans={scans} showAll={showAll} machine={machine} afterInput={
+        {filtered && <Form schema={filtered} values={values} setValues={setValues} scans={scans} showAll={showAll} machine={machine} afterInput={<>
+          {roiField && (
+            <div className={'opt pos roi-row' + (roiText.trim() && roiText.trim() !== 'auto' ? ' changed' : '')} title={roiField.help}>
+              <label htmlFor="f-roi-row" className="flag">{roiField.flags[0]}</label>
+              <div className="input">
+                <input id="f-roi-row" type="text" value={roiText} placeholder="auto"
+                  onChange={e => { const t = e.target.value; setValues({ ...values, roi: t.trim() === '' ? null : t.split(/\s+/).filter(Boolean) }) }} />
+                <button type="button" className="small" disabled={!scanPath.trim()} onClick={() => setPickingRoi(true)}
+                  title={scanPath.trim() ? 'draw the box on a coarse preview of this scan' : 'give the scan folder first'}>choose visually…</button>
+              </div>
+              <div className="help">{roiSummary}</div>
+            </div>
+          )}
           <div className="opt pos note-row">
             <label htmlFor="f-note" className="flag">note</label>
             <div className="input"><input id="f-note" type="text" value={note} onChange={e => setNote(e.target.value)} placeholder="what this job is for" /></div>
             <div className="help">Free text stored with the job record; not passed to the driver.</div>
           </div>
-        } />}
+        </>} />}
+        {pickingRoi && roiField && (
+          <RoiPicker machine={machine} dataFolder={scanPath} scanFolder={values.scan_folder ?? null} phase={String(values.phase ?? '00')}
+            voxelXY={voxelXY} voxelZ={voxelZ} initial={roiBounds}
+            onClose={() => setPickingRoi(false)}
+            onPick={b => { setPickingRoi(false); setValues({ ...values, roi: roiValues(b) }) }} />
+        )}
       </div>
 
       <div className="runbar" ref={bar}>
