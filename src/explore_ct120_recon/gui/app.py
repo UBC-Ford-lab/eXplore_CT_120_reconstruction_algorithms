@@ -50,7 +50,7 @@ from .jobs import ACTIVE, Job, JobStore
 from .machines import DEFAULT_TEMPLATE, Machine, MachineRegistry
 from .remote import RemoteExecutor, SlurmExecutor
 from .inputs import plan_for, run_checks
-from .schema import DRIVERS, build_command, driver_schema, predict_output, shell_string
+from .schema import DRIVERS, build_command, capture_parser, driver_schema, predict_output, shell_string
 
 STATIC_DIR = Path(__file__).with_name('static')
 
@@ -103,6 +103,13 @@ class RoiPreviewRequest(BaseModel):
     scan_folder: Optional[str] = None
     phase: str = '00'
     refresh: bool = False       # recompute even when a cached preview exists
+
+
+class EstimateRequest(BaseModel):
+    algorithm: str
+    values: dict = {}
+    executor: str = 'local'
+    resources: str = ''          # the sbatch overrides: where a Slurm job's GPU class is named
 
 
 class MachineRequest(BaseModel):
@@ -361,21 +368,19 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
     previews = PreviewCache(settings.data_dir / 'previews')
     preview_lock = threading.Lock()      # one coarse reconstruction at a time
 
-    @app.post('/api/roi/preview')
-    def roi_preview(req: RoiPreviewRequest):
-        """The whole attenuating field of a scan at 0.4 mm, reconstructed
-        where the scan lives, for drawing the ``--roi`` box on. Cached on
-        disk per machine, scan and phase; ``refresh`` recomputes."""
-        ex = executors.get(req.executor)
+    def _preview(executor: str, data_folder: str, scan_folder, phase: str, refresh: bool = False) -> dict:
+        """The cached preview of a scan on a machine, computed there when
+        missing (one at a time); ``cached`` says which."""
+        ex = executors.get(executor)
         if ex is None:
-            raise HTTPException(404, f'unknown machine {req.executor!r}')
-        if not req.data_folder.strip():
+            raise HTTPException(404, f'unknown machine {executor!r}')
+        if not str(data_folder or '').strip():
             raise HTTPException(400, 'give the scan folder first')
-        where = _volume_machine(req.executor)
-        spec = spec_for(req.data_folder.strip(), cwd=where.get('cwd'), scan_folder=req.scan_folder or None,
-                        phase=req.phase or '00')
-        key = previews.key(req.executor, spec)
-        if req.refresh:
+        where = _volume_machine(executor)
+        spec = spec_for(str(data_folder).strip(), cwd=where.get('cwd'), scan_folder=scan_folder or None,
+                        phase=phase or '00')
+        key = previews.key(executor, spec)
+        if refresh:
             previews.forget(key)
         else:
             hit = previews.get(key)
@@ -390,9 +395,84 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
             except subprocess.TimeoutExpired:
                 raise HTTPException(504, 'the preview reconstruction took too long')
             except Exception as e:
-                raise HTTPException(400, f'preview on {req.executor} failed: {e}')
+                raise HTTPException(400, f'preview on {executor} failed: {e}')
             previews.put(key, result)
         return {**result, 'cached': False}
+
+    @app.post('/api/roi/preview')
+    def roi_preview(req: RoiPreviewRequest):
+        """The whole attenuating field of a scan at 0.4 mm, reconstructed
+        where the scan lives, for drawing the ``--roi`` box on. Cached on
+        disk per machine, scan and phase; ``refresh`` recomputes."""
+        return _preview(req.executor, req.data_folder, req.scan_folder, req.phase or '00', req.refresh)
+
+    @app.post('/api/drivers/learned/estimate')
+    def estimate(req: EstimateRequest):
+        """What a Gaussian job at the form's current flags will cost:
+        primitives (the seeding rule on the scan's preview), VRAM (the
+        algorithm's preflight footprint) and time (iterations times a rate
+        measured from the last finished runs on that machine)."""
+        from . import detail
+        d = DRIVERS['learned']
+        if not d.has_algorithms or req.algorithm not in {a['name'] for a in d.algorithms()}:
+            raise HTTPException(400, f'no estimate for {req.algorithm!r}')
+        ex = executors.get(req.executor)
+        if ex is None:
+            raise HTTPException(400, f'unknown machine {req.executor!r}')
+        try:
+            sch = driver_schema(d, req.algorithm)
+            values = dict(req.values)
+            for f in sch['fields']:
+                if f['positional'] and not values.get(f['dest']):
+                    values[f['dest']] = f'<{f["dest"]}>'
+            cmd = build_command(d, sch, values, req.algorithm)
+            args = detail.args_for(capture_parser(d, req.algorithm), cmd)
+        except (ValueError, SystemExit) as e:
+            raise HTTPException(400, f'the form does not parse: {e}')
+
+        def read_log(j):
+            return Path(j.log_path).read_text(errors='replace') if j.log_path and Path(j.log_path).exists() else ''
+        gpu = _gpu_class(ex, req)
+        runs = store.list(limit=400)
+        words = lambda n: f'from your last {n} run{"s" if n > 1 else ""} on {req.executor}'   # noqa: E731
+        if req.algorithm not in detail.ALGORITHMS:
+            # no primitive count: the time half from past runs alone
+            m = detail.measured_seconds_per_iteration(runs, req.algorithm, req.executor, read_log)
+            return detail.runtime_estimate(algorithm=req.algorithm, args=args,
+                                           seconds_per_it=m[0] if m else None, source=words(m[1]) if m else '', gpu=gpu)
+        preview = _preview(req.executor, req.values.get(d.primary, ''), req.values.get('scan_folder'), '00')
+        if not preview.get('scan'):
+            # a preview cached before the scan block existed: recompute once
+            preview = _preview(req.executor, req.values.get(d.primary, ''), req.values.get('scan_folder'), '00', refresh=True)
+        measured = detail.measured_rate(runs, req.algorithm, req.executor, read_log)
+        rate, source = (None, '')
+        if measured:
+            rate, source = measured[0], words(measured[1])
+        try:
+            return detail.estimate(algorithm=req.algorithm, args=args, preview=preview, rate=rate, rate_source=source, gpu=gpu)
+        except Exception as e:                                   # noqa: BLE001
+            raise HTTPException(400, f'estimate failed: {e}')
+
+    def _gpu_class(ex, req: EstimateRequest):
+        """The GPU class a job on ``ex`` would run on: a Slurm job's from the
+        gres it asks for (template or overrides), otherwise the cards the
+        machine shows."""
+        from .detail import gpu_class
+        if getattr(ex, 'kind', '') == 'slurm':
+            try:
+                job, _ = _build_job(SubmitRequest(driver='learned', algorithm=req.algorithm, values=req.values,
+                                                  executor=req.executor, resources=req.resources), lenient=True)
+                gres = [d['value'] for d in ex.directives(job)
+                        if d['key'] in ('gpus-per-node', 'gres', 'gpus', 'gpus-per-task', 'gpus-per-socket') and d['value']]
+                found = gpu_class(gres)
+                if found:
+                    return found
+            except Exception:                                    # noqa: BLE001
+                pass
+        try:
+            return gpu_class([g.get('name', '') for g in ex.describe().get('gpus', [])])
+        except Exception:                                        # noqa: BLE001
+            return None
 
     @app.get('/api/machines/{name}/scans')
     def machine_scans(name: str):
@@ -620,6 +700,26 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
         except Exception as e:
             raise HTTPException(502, str(e))
 
+    @app.get('/api/jobs/{job_id}/checkpoint')
+    def job_checkpoint(job_id: str):
+        """The cloud checkpoint a Gaussian run left behind (``<stem>_cloud.pt``),
+        if any: what a 'resume' continues from. Looked up on the job's own
+        machine, so a call costs a round trip; the page asks once."""
+        j = store.get(job_id)
+        if j is None:
+            raise HTTPException(404)
+        from .detail import ALGORITHMS as gaussian_algorithms
+        if j.driver != 'learned' or (j.algorithm or '') not in gaussian_algorithms:
+            return {'checkpoint': None, 'bytes': None, 'resumable': False}
+        try:
+            files = _job_files(j, 'list')
+        except Exception as e:
+            raise HTTPException(502, str(e))
+        found = next((f for f in files if not f['dir'] and f['path'].endswith('_cloud.pt')), None)
+        return {'checkpoint': found['path'] if found else None,
+                'bytes': found['bytes'] if found else None,
+                'resumable': bool(found) and j.status in ('failed', 'cancelled')}
+
     @app.delete('/api/jobs/{job_id}')
     def delete_job(job_id: str, data: bool = False):
         """Remove the record; with ``?data=true`` also the run's files and log."""
@@ -658,12 +758,18 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
     if STATIC_DIR.is_dir() and (STATIC_DIR / 'index.html').exists():
         app.mount('/assets', StaticFiles(directory=STATIC_DIR / 'assets'), name='assets')
 
+        # The page shell is tiny and names the hashed bundle, so it must be
+        # revalidated on every load: a heuristically cached index.html keeps
+        # pointing at the previous bundle (also cached) and the page silently
+        # runs the old frontend after a rebuild until a hard reload.
+        NO_CACHE = {'Cache-Control': 'no-cache'}
+
         @app.get('/{path:path}', include_in_schema=False)
         def spa(path: str):
             candidate = STATIC_DIR / path
             if path and candidate.is_file():
-                return FileResponse(candidate)
-            return FileResponse(STATIC_DIR / 'index.html')
+                return FileResponse(candidate, headers=NO_CACHE)
+            return FileResponse(STATIC_DIR / 'index.html', headers=NO_CACHE)
     else:
         @app.get('/', include_in_schema=False)
         def no_page():

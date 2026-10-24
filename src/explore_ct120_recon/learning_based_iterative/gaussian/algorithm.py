@@ -338,6 +338,18 @@ def add_args(group) -> None:
                         'so without this a failure there costs the entire '
                         'run, and the file is what --gauss-resume and any '
                         're-export read.')
+    g.add_argument('--gauss-checkpoint-every', type=int, default=None,
+                   dest='gauss_checkpoint_every', metavar='N',
+                   help='also write the cloud to --gauss-checkpoint every N '
+                        'iterations during training, replacing the previous '
+                        'one (default: at every held-out evaluation, i.e. '
+                        '--eval-every; 0 = only at the end). A run that is '
+                        'killed — a Slurm time limit, a cancel, a lost node — '
+                        'then keeps everything but its last N iterations, '
+                        'and --gauss-resume continues it. SIGTERM and Ctrl-C '
+                        'write this checkpoint before the process ends; '
+                        'SIGUSR1 (sbatch --signal=B:USR1@600) ends the run '
+                        'properly, export included.')
     g.add_argument('--gauss-densify-roi-margin', type=float, default=None,
                    dest='gauss_densify_roi_margin', metavar='MM',
                    help='confine clone/split to the export ROI plus this '
@@ -354,8 +366,13 @@ def add_args(group) -> None:
                         'seed is still built (it fixes the units), then '
                         'replaced; the checkpoint must come from the same '
                         'data and signal-scale setting, which is checked. '
-                        'Densification, the ceiling and the stopping rules '
-                        'all restart as for a fresh run of --iterations.')
+                        'From a FINISHED run this is a warm start: the count '
+                        'begins at one and densification, the ceiling and the '
+                        'stopping rules restart. From a PARTIAL checkpoint '
+                        '(periodic, or written on a signal) it is a '
+                        'continuation: training picks up at the iteration the '
+                        'file records, with its learning rates and evaluation '
+                        'history, and runs to --iterations.')
     for name, default in GaussianCloud.DEFAULT_LR_MULTIPLIERS.items():
         g.add_argument(f'--gauss-lr-{name}', type=float, default=None,
                        dest=f'gauss_lr_{name}', metavar='MULT',
@@ -467,6 +484,7 @@ def options(args) -> dict:
         densify_grad_threshold=(None if args.gauss_densify_grad is None
                                 else float(args.gauss_densify_grad)),
         checkpoint_path=_checkpoint_default(args),
+        checkpoint_every=args.gauss_checkpoint_every,
         max_aspect=float(args.gauss_max_aspect),
         max_sigma_spacing=float(args.gauss_max_sigma_spacing),
         view_every_evals=int(args.gauss_view_every_evals),

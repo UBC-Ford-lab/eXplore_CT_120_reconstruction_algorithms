@@ -4,6 +4,11 @@
 # is yours. Resource lines can be
 # overridden per job from the form (they are passed to sbatch after this
 # script, and sbatch's command line wins over #SBATCH directives).
+# {{command}} expands to the driver plus a few lines that forward Slurm's
+# advance warning to it, and it ends the script: keep it last. Unless a
+# --signal line is set here, jobs are submitted with --signal=B:USR1@600, so
+# a run that would hit the time limit stops ten minutes early, writes its
+# checkpoint and exports what it has. {{raw_command}} is the bare command.
 #SBATCH --job-name={job_name}
 #SBATCH --output={log}
 #SBATCH --gpus-per-node=1

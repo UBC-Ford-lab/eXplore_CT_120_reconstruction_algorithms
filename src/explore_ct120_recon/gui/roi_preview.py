@@ -63,9 +63,12 @@ WINDOW_PCT = (0.5, 99.99)   # mu percentiles mapped to 0 and 255: air black,
 def spec_for(data_folder: str, *, cwd: Optional[str] = None, scan_folder: Optional[str] = None,
              phase: str = '00', voxel_mm: float = VOXEL_MM, view_step: int = VIEW_STEP,
              downsample: int = DOWNSAMPLE, window_pct=WINDOW_PCT) -> dict:
+    # 'version' is part of the cache key: 2 added the 'scan' block (detector,
+    # phases, geometry) that the detail estimate reads.
     return {'data_folder': data_folder, 'cwd': cwd, 'scan_folder': scan_folder or None,
             'phase': phase or '00', 'voxel_mm': float(voxel_mm), 'view_step': int(view_step),
-            'downsample': int(downsample), 'window_pct': [float(v) for v in window_pct]}
+            'downsample': int(downsample), 'window_pct': [float(v) for v in window_pct],
+            'version': 2}
 
 
 def compute_preview(spec: dict) -> dict:
@@ -155,7 +158,40 @@ def compute_preview(spec: dict) -> dict:
         'voxel_mm': voxel,
         'data_folder': folder,
         'seconds': {'load': round(t_load, 1), 'reconstruct': round(t_recon, 1)},
+        'scan': scan_facts(folder, ctx, factor=int(spec.get('downsample') or DOWNSAMPLE)),
         'data': base64.b64encode(data.tobytes()).decode(),
+    }
+
+
+def scan_facts(folder: str, ctx, *, factor: int) -> dict:
+    """What the detail estimate needs about the acquisition, independent of
+    the preview's own thinning and pooling: the raw detector, the views per
+    phase and the phases on disk, the geometry at the raw pitch."""
+    import re
+    from pathlib import Path
+
+    import numpy as np
+
+    from ..ct_core.vff_io import raw_detector_shape
+
+    g = ctx.geometry
+    frames = sorted(Path(folder).glob('acq-*.vff'))
+    phases: dict = {}
+    for f in frames:
+        m = re.match(r'acq-(\d+)-', f.name)
+        if m:
+            phases[m.group(1)] = phases.get(m.group(1), 0) + 1
+    if not phases:
+        n = len(sorted(Path(folder).glob('proj-*.vff'))) or int(ctx.projections.shape[0]) * int(getattr(ctx, 'view_step', 1) or 1)
+        phases = {'00': n}
+    per = int(round(float(np.median(list(phases.values()))))) if phases else 0
+    raw = raw_detector_shape(folder)
+    return {
+        'detector': [int(v) for v in raw] if raw else None,
+        'phases': sorted(phases),
+        'views_per_phase': per,
+        'R_s': float(g['R_s']), 'R_d': float(g['R_d']),
+        'pitch_mm': float(g['da']) / max(1, int(factor)),
     }
 
 

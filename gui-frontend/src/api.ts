@@ -47,6 +47,19 @@ export interface RoiPreview {
   seconds: { load: number; reconstruct: number }; data: string; cached: boolean
 }
 export interface Scan { name: string; path: string }
+/** What a Gaussian job at the form's flags will cost (gui/detail.py). */
+export interface Walltime { estimate_s: number; raw_s: number; suggested_s: number; suggested: string; bucket_h: number; bucket: string }
+export interface Estimate {
+  algorithm: string; iterations: number; rate_source: string; gpu: string | null; warnings: string[]
+  // the time half, for every learned algorithm; null before a run of that algorithm exists on the machine
+  seconds: number | null; seconds_per_it: number | null; walltime: Walltime | null
+  // the Gaussian half (null for the other representations)
+  primitives: number | null
+  spacing_mm?: number; downsample?: number; voxel_xy?: number; voxel_z?: number
+  psf_mm?: number; pooled_pixel_mm?: number | null; cap?: number; seeds?: 'auto' | number
+  n_views?: number; detector?: [number, number]; vol_shape?: [number, number, number]
+  gpu_bytes?: number; host_bytes?: number; preview_cached?: boolean
+}
 export interface Job {
   id: string; driver: string; algorithm: string | null; values: Record<string, any>; command: string[]
   executor: string; status: 'queued' | 'pending' | 'running' | 'finished' | 'failed' | 'cancelled'
@@ -106,11 +119,14 @@ export const api = {
     request<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(body) }),
   preview: (body: { driver: string; algorithm?: string | null; values: Record<string, any>; executor: string; resources?: string }) =>
     request<Preview>('/api/jobs/preview', { method: 'POST', body: JSON.stringify(body) }),
+  estimate: (algorithm: string, values: Record<string, any>, executor: string, resources = '') =>
+    request<Estimate>('/api/drivers/learned/estimate', { method: 'POST', body: JSON.stringify({ algorithm, values, executor, resources }) }),
   checks: (driver: string, algorithm: string | null, values: Record<string, any>, executor: string) =>
     request<{ groups: CheckGroup[] }>(`/api/drivers/${driver}/checks`, { method: 'POST', body: JSON.stringify({ algorithm, values, executor }) }),
   files: (id: string) => request<{ files: { path: string; dir: boolean; bytes: number }[]; output_path: string | null }>(`/api/jobs/${id}/files`),
   remove: (id: string, data: boolean) => request<{ deleted: string; files: any[] }>(`/api/jobs/${id}?data=${data}`, { method: 'DELETE' }),
   cancel: (id: string) => request<Job>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
+  checkpoint: (id: string) => request<{ checkpoint: string | null; bytes: number | null; resumable: boolean }>(`/api/jobs/${id}/checkpoint`),
 }
 
 export function fmtDuration(s: number | null): string {

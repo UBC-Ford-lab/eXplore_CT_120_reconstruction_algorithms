@@ -301,6 +301,26 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
         self.motion = self._build_motion(domain, device, cloud)
         return cloud
 
+    def _resume(self, cloud, path: str) -> dict:
+        """The cloud as in the base class, plus the motion model's snapshot:
+        codes, basis, membership and gates. A continuation past the parts
+        activation needs the membership graph, which lives outside the
+        snapshot (it is a function of the rest positions), so it is rebuilt
+        from the restored cloud."""
+        state = super()._resume(cloud, path)
+        snap = state.get('motion')
+        if self.motion is None or snap is None:
+            return state
+        self.motion.restore(snap)
+        if self.motion.parts_active and self.motion.graph is None:
+            self.motion.build_graph(cloud.xyz.detach(), k=self.mcfg['part_knn'])
+        print(f"    resumed the motion model: {tuple(snap['codes'].shape)} codes, "
+              f"grid {tuple(snap['grid_shape'])}"
+              + (f", {self.motion.n_parts} parts active" if self.motion.parts_active
+                 else "") + (", air gate restored" if snap.get('air_gate') is not None
+                             else ""))
+        return state
+
     # -- the seams ----------------------------------------------------------
     def _motion_active(self) -> bool:
         return (self.motion is not None

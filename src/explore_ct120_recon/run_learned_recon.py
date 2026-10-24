@@ -33,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .learning_based_iterative.trainer import StoppedBySignal
 from .learning_based_iterative.losses import (DATA_TERMS, DEFAULT_DATA_TERM,
                                               describe_data_terms)
 from .learning_based_iterative import (algorithm_names, describe_algorithms,
@@ -996,7 +997,18 @@ def main(argv=None):
             f"Rename them in its LearnedAlgorithm.options.")
     reconstructor = algorithm.reconstructor(**shared, **options)
 
-    reconstructor.reconstruct()
+    try:
+        reconstructor.reconstruct()
+    except StoppedBySignal as e:
+        # Not an error of the run's own: the process was told to stop and
+        # has saved its cloud. Say where, record it, and exit with the
+        # conventional code for the signal so the caller sees a stop.
+        print(f"\n  {e}")
+        logger.set_summary({'stopped_by_signal': e.signal_name,
+                            'checkpoint': e.checkpoint or '',
+                            'iterations_run': e.iteration})
+        logger.finish()
+        raise SystemExit(130 if e.signal_name == 'SIGINT' else 143)
 
     # What the trainer ACTUALLY used, read back off the backend (not off args
     # — early stopping cuts the iteration count, and the batch may have been

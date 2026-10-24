@@ -10,6 +10,7 @@ export default function JobDetail() {
   const [job, setJob] = useState<Job | null>(null)
   const [log, setLog] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [ckpt, setCkpt] = useState<{ checkpoint: string | null; bytes: number | null; resumable: boolean } | null>(null)
   const offset = useRef(0)
   const pre = useRef<HTMLPreElement>(null)
 
@@ -32,6 +33,12 @@ export default function JobDetail() {
   }, [id])
 
   useEffect(() => { if (pre.current) pre.current.scrollTop = pre.current.scrollHeight }, [log])
+  // once the run is over: did it leave a cloud checkpoint to continue from?
+  const over = job && !(job.status === 'queued' || job.status === 'pending' || job.status === 'running')
+  useEffect(() => {
+    if (!id || !over) { setCkpt(null); return }
+    api.checkpoint(id).then(setCkpt).catch(() => setCkpt(null))
+  }, [id, over, job?.status])
 
   if (error) return <p className="error">{error}</p>
   if (!job) return <p className="muted">Loading…</p>
@@ -46,6 +53,10 @@ export default function JobDetail() {
         {job.duration != null && <span className="faint">{fmtDuration(job.duration)}{active ? ' so far' : ''}</span>}
         <div className="right actions" style={{ margin: 0 }}>
           {active && <button onClick={() => api.cancel(job.id).then(setJob).catch(e => setError(e.message))}>Cancel</button>}
+          {!active && ckpt?.resumable && ckpt.checkpoint && (
+            <button className="primary" title={`continue this run from ${ckpt.checkpoint}: the same flags and output, --gauss-resume added`}
+              onClick={() => nav(`/new?from=${encodeURIComponent(job.id)}&resume=${encodeURIComponent(ckpt.checkpoint!)}`)}>Resume…</button>
+          )}
           {!active && <DeleteJob job={job} onDeleted={() => nav('/jobs')} />}
         </div>
       </div>
@@ -57,6 +68,7 @@ export default function JobDetail() {
         {job.finished && <><div>Finished</div><div>{fmtTime(job.finished)}{job.returncode != null ? ` · exit ${job.returncode}` : ''}</div></>}
         {job.remote_id && <><div>Remote id</div><div>{job.remote_id}{job.remote_state ? ` · ${job.remote_state}` : ''}</div></>}
         {job.resources && <><div>sbatch</div><div className="mono">{job.resources}</div></>}
+        {ckpt?.checkpoint && <><div>Checkpoint</div><div className="mono span">{ckpt.checkpoint}{ckpt.bytes != null ? <span className="faint sans"> · {(ckpt.bytes / 2 ** 20).toFixed(0)} MiB{ckpt.resumable ? ' · the run can be resumed from here' : ''}</span> : null}</div></>}
         {job.package_version && <><div>Package</div><div>{job.package_version}</div></>}
         {job.output_path && <><div>Output</div><div className="mono span">{job.output_path}{job.output_path.endsWith('.vff') && job.status === 'finished' && <> · <Link to={`/view?machine=${encodeURIComponent(job.executor)}&path=${encodeURIComponent(job.output_path)}`} className="sans">view volume</Link></>}</div></>}
         {job.wandb_url && <><div>W&amp;B</div><div className="span"><a href={job.wandb_url} target="_blank" rel="noreferrer">{job.wandb_url}</a></div></>}

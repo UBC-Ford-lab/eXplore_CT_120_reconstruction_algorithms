@@ -353,3 +353,23 @@ a.sans { font-family: var(--sans); }
 .roi-bounds .roi-axis { display: inline-flex; gap: 0.35rem; align-items: center; }
 .roi-bounds input[type=number] { width: 5.8rem; font-size: 0.85rem; padding: 0.1rem 0.3rem; }
 @media (max-width: 70rem) { .roi-grid { grid-template-columns: 1fr; } }
+
+/* detail presets (Gaussian jobs) */
+.opt.detail-row { grid-template-columns: 11rem minmax(0, 1fr); }
+.detail-row .seg { display: inline-flex; flex-wrap: wrap; gap: 0; border: 1px solid var(--hair); border-radius: 6px; overflow: hidden; }
+.detail-row .seg button, .detail-row .seg .custom { display: flex; flex-direction: column; align-items: flex-start; gap: 0.05rem; padding: 0.25rem 0.7rem; border: 0; border-right: 1px solid var(--hair); border-radius: 0; background: transparent; color: var(--ink); line-height: 1.15; }
+.detail-row .seg > :last-child { border-right: 0; }
+.detail-row .seg button:hover { background: var(--hair-2); }
+.detail-row .seg button.on { background: var(--accent); color: #fff; }
+.detail-row .seg button.on small { color: #fff; opacity: 0.85; }
+.detail-row .seg small, .detail-row .seg .custom small { font-size: 0.72rem; color: var(--ink-2); font-family: var(--mono); }
+.detail-row .seg .custom { color: var(--accent); }
+.detail-help { white-space: normal !important; line-height: 1.4; }
+.detail-help b.ok { color: var(--ok, #2a7); }
+.detail-help b.warn, .detail-help .warn { color: var(--warn, #b80); }
+.detail-help b.fail { color: var(--bad); }
+
+/* the run-time estimate beside the sbatch chips */
+.time-budget { margin-left: .5em; white-space: normal }
+.time-budget b.warn, .time-budget .warn { color: var(--warn, #b7791f) }
+.time-budget button.small { margin-left: .35em; padding: 0 .5em; font-size: inherit }

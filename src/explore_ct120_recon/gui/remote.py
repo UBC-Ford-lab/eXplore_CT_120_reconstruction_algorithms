@@ -472,6 +472,30 @@ class RemoteExecutor(Executor):
             active.append(job)
 
 
+# What ``{command}`` expands to in a Slurm template. The driver runs in the
+# background with this shell waiting on it, because bash only runs a trap once
+# its foreground command has finished: a signal sent to the batch shell while
+# the driver runs in the foreground would sit unhandled until the driver ended
+# on its own. With the driver backgrounded, Slurm's advance warning
+# (``--signal=B:USR1@600``, added at submission when the template sets none)
+# reaches this shell, is forwarded, and the driver stops, checkpoints and
+# exports in the ten minutes that remain. The hard limit's SIGTERM goes to
+# every process of the job on Slurm's own account; the shell ignores its copy
+# so it is still there to return the driver's exit code.
+SLURM_SIGNAL = 'B:USR1@600'
+SLURM_COMMAND_WRAPPER = '''# ct120-gui: run the driver in the background and forward Slurm's advance
+# warning (USR1, see --signal) to it; bash runs a trap only between commands.
+{command} &
+_ct120_pid=$!
+trap 'kill -USR1 "$_ct120_pid" 2>/dev/null' USR1
+trap '' TERM
+while :; do
+  if wait "$_ct120_pid"; then _ct120_rc=0; else _ct120_rc=$?; fi
+  kill -0 "$_ct120_pid" 2>/dev/null || break     # alive: wait was interrupted by a trap
+done
+exit "$_ct120_rc"'''
+
+
 class SlurmExecutor(RemoteExecutor):
     """Submits drivers with ``sbatch`` from the machine's template."""
 
@@ -485,7 +509,9 @@ class SlurmExecutor(RemoteExecutor):
         remote_log = f'{self._remote_dir()}/logs/{job.id}.log'
         fields = {'job_name': f'ct120_{job.driver}_{Path(job.input).name or job.id}'[:60],
                   'job_id': job.id, 'log': remote_log, 'workdir': self.workdir,
-                  'env': self._env_exports(job), 'command': shlex.join(job.command),
+                  'env': self._env_exports(job),
+                  'command': SLURM_COMMAND_WRAPPER.format(command=shlex.join(job.command)),
+                  'raw_command': shlex.join(job.command),
                   'python': self.python, 'input': job.input}
         try:
             return self.machine.template_text().format_map(fields)
@@ -527,7 +553,15 @@ class SlurmExecutor(RemoteExecutor):
                     i += 1
                 put(key, value or None, 'override')
             i += 1
+        if not any(d['key'] == 'signal' for d in found):
+            put('signal', SLURM_SIGNAL, 'default')
         return found
+
+    def _signal_args(self, job: Job) -> list[str]:
+        """``--signal=B:USR1@600`` unless the template or the overrides set one."""
+        if any(d['key'] == 'signal' and d['source'] != 'default' for d in self.directives(job)):
+            return []
+        return [f'--signal={SLURM_SIGNAL}']
 
     def start(self, job: Job, store: JobStore) -> None:
         local_log = self.log_dir / f'{job.id}.log'
@@ -536,7 +570,7 @@ class SlurmExecutor(RemoteExecutor):
             script = self.render(job)
             self.conn.check(f'mkdir -p {shlex.quote(self._remote_dir())}/logs {shlex.quote(self._remote_dir())}/jobs')
             self.conn.write_file(script_path, script)
-            extra = shlex.split(job.resources or '')
+            extra = self._signal_args(job) + shlex.split(job.resources or '')
             out = self.conn.check(f'cd {shlex.quote(self.workdir)} && sbatch --parsable {shlex.join(extra)} {shlex.quote(script_path)}', timeout=120)
             slurm_id = out.strip().split(';')[0].splitlines()[-1]
             int(slurm_id)

@@ -104,6 +104,25 @@ from .training import (OPTIMIZERS, autocast_ctx, build_optimizer,
 from .volume import EXPORT_CHUNK, render_volume  # noqa: F401 (EXPORT_CHUNK re-exported)
 
 
+class StoppedBySignal(RuntimeError):
+    """A trainer ended by SIGTERM/SIGINT after writing its checkpoint.
+
+    Raised instead of returning a volume: the sender wanted the process gone,
+    so the export is not attempted and the driver exits non-zero with the
+    checkpoint path in the message (``--gauss-resume`` continues from it).
+    """
+
+    def __init__(self, signal_name: str, checkpoint: str | None, iteration: int):
+        self.signal_name = signal_name
+        self.checkpoint = checkpoint
+        self.iteration = int(iteration)
+        super().__init__(
+            f"stopped by {signal_name} at iteration {iteration}"
+            + (f"; the cloud is saved at {checkpoint} — continue with "
+               f"--gauss-resume {checkpoint}" if checkpoint else
+               "; no checkpoint could be written"))
+
+
 class LearnedReconstructor:
     """Differentiable-rendering reconstruction, following the backend contract.
 

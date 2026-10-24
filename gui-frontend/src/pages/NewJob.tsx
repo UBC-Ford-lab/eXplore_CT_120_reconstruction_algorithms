@@ -1,11 +1,13 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import InputChecks, { worst } from '../components/InputChecks'
-import { api, CheckGroup, Driver, Info, Preview, Scan, Schema } from '../api'
+import { api, CheckGroup, Driver, Estimate, Info, Job, Preview, Scan, Schema } from '../api'
 import Form, { defaultsOf, Values } from '../components/Form'
 import SbatchChips from '../components/SbatchChips'
 import Browser, { BrowseButton } from '../components/Browser'
 import RoiPicker, { parseRoi, roiValues } from '../components/RoiPicker'
+import DetailPresets, { DETAIL_ALGORITHMS, estimateKey } from '../components/DetailPresets'
+import TimeBudget, { walltimeCheck } from '../components/TimeBudget'
 
 // Driver groups in the dropdown, in this order.
 const KINDS = [
@@ -18,7 +20,10 @@ const KINDS = [
 export default function NewJob({ info }: { info: Info | null }) {
   const nav = useNavigate()
   // ?driver=learned&algorithm=gaussian&input=data/scans/Scan_1510&machine=fir&all=1 pre-fills the page; &roi=pick opens the ROI picker
+  // ?from=<job id> pre-fills driver, algorithm, machine and every value from that job; with &resume=<cloud.pt>
+  // the run continues from that checkpoint (--gauss-resume) into the same output
   const [params] = useSearchParams()
+  const [fromJob, setFromJob] = useState<Job | null>(null)
   const [drivers, setDrivers] = useState<Driver[]>([])
   const [scans, setScans] = useState<Scan[]>([])
   const [driver, setDriver] = useState(params.get('driver') ?? 'fdk')
@@ -31,6 +36,9 @@ export default function NewJob({ info }: { info: Info | null }) {
   const [predicted, setPredicted] = useState<{ dest?: string | null; path?: string; writes?: string[]; explicit?: boolean } | null>(null)
   const [showAll, setShowAll] = useState(params.get('all') === '1')
   const [checks, setChecks] = useState<CheckGroup[] | null>(null)
+  const [est, setEst] = useState<Estimate | null>(null)                    // the learned job's cost (gui/detail.py)
+  const [estState, setEstState] = useState<'idle' | 'busy' | 'error'>('idle')
+  const [estError, setEstError] = useState('')
   const [preview, setPreview] = useState<Preview | null>(null)
   const [templatePreview, setTemplatePreview] = useState<Preview | null>(null)   // the same without overrides
   const [showScript, setShowScript] = useState(false)
@@ -51,6 +59,15 @@ export default function NewJob({ info }: { info: Info | null }) {
   }, [])
 
   useEffect(() => { api.drivers().then(setDrivers) }, [])
+  useEffect(() => {
+    const id = params.get('from')
+    if (!id) return
+    api.job(id).then(j => {
+      setFromJob(j)
+      setDriver(j.driver); setAlgorithm(j.algorithm); setMachine(j.executor); setResources(j.resources ?? '')
+      if (params.get('resume')) setNote(`resumed job ${j.id}${j.note ? ` · ${j.note}` : ''}`)
+    }).catch(e => setError(String(e.message)))
+  }, [])
   useEffect(() => { setScans([]); api.scans(machine).then(setScans).catch(() => setScans([])) }, [machine])
   const d = drivers.find(x => x.name === driver)
   useEffect(() => {
@@ -62,9 +79,18 @@ export default function NewJob({ info }: { info: Info | null }) {
       const v = defaultsOf(s)
       const input = params.get('input')
       if (input && d.primary in v) v[d.primary] = input
+      if (fromJob && fromJob.driver === driver && (fromJob.algorithm ?? null) === algo) {
+        const known = new Set(s.fields.map(f => f.dest))
+        for (const [k, val] of Object.entries(fromJob.values)) if (known.has(k)) v[k] = val
+        const resume = params.get('resume')
+        if (resume && known.has('gauss_resume')) {
+          v.gauss_resume = resume
+          if (!v.output && fromJob.output_path && known.has('output')) v.output = fromJob.output_path
+        }
+      }
       setSchema(s); setValues(v)
     }).catch(e => setError(String(e.message)))
-  }, [driver, algorithm, d])
+  }, [driver, algorithm, d, fromJob])
 
   useEffect(() => {
     if (!schema) return
@@ -97,7 +123,22 @@ export default function NewJob({ info }: { info: Info | null }) {
     }, 300)
     return () => { live = false; clearTimeout(t) }
   }, [schema, values, driver, algorithm, machine, resources, selectedKind])
-  const verdict = checks ? worst(checks) : null
+  // the run-time (and, for a Gaussian job, primitives/VRAM) estimate; the
+  // detail row and the walltime line both read it
+  const scanPathNow = String(values[d?.primary ?? 'data_folder'] ?? '')
+  const estKey = estimateKey(values, machine, algorithm ?? '', resources)
+  useEffect(() => {
+    if (!schema || driver !== 'learned' || !algorithm || !scanPathNow.trim()) { setEst(null); setEstState('idle'); return }
+    let live = true
+    setEstState('busy')
+    const t = setTimeout(() => api.estimate(algorithm, values, machine, resources)
+      .then(e => { if (live) { setEst(e); setEstState('idle') } })
+      .catch(e => { if (live) { setEstError(String(e.message)); setEstState('error') } }), 700)
+    return () => { live = false; clearTimeout(t) }
+  }, [schema, driver, estKey, scanPathNow])
+  const walltime = selectedKind === 'slurm' ? walltimeCheck(est, preview?.directives ?? null) : null
+  const allChecks = checks || walltime ? [...(checks ?? []), ...(walltime ? [walltime.group] : [])] : null
+  const verdict = allChecks ? worst(allChecks) : null
 
   const outDest = predicted?.dest ?? 'output'
   const outField = predicted?.dest === null ? undefined : schema?.fields.find(f => f.dest === outDest)
@@ -185,11 +226,15 @@ export default function NewJob({ info }: { info: Info | null }) {
       <div className="newjob" style={{ paddingBottom: barHeight + 12 }}>
         {schema?.description && <p className="blurb">{schema.description}{algoSummary ? <> <b>{algorithm}</b>: {algoSummary}.</> : null}</p>}
         {selected && selected.kind !== 'local' && <p className="note">Paths are on {selected.host}; relative paths resolve in <span className="mono">{selected.cwd}</span>.</p>}
+        {selectedKind !== 'slurm' && driver === 'learned' && algorithm && !DETAIL_ALGORITHMS.includes(algorithm) && (est || estState !== 'idle') && (
+          <p className="note"><TimeBudget est={est} state={estState} error={estError} directives={null} resources={resources} setResources={setResources} /></p>
+        )}
         {selected?.kind === 'slurm' && preview && (
           <div className="sbatch">
             <span className="sbatch-label" title="the #SBATCH directives this job is submitted with; click a value to change it for this job only (it goes into the overrides field, the machine\'s template is untouched)">sbatch</span>
             <SbatchChips directives={preview.directives} templateDirectives={templatePreview?.directives ?? []} resources={resources} setResources={setResources} />
             {preview.error && <span className="error small">{preview.error}</span>}
+            {driver === 'learned' && <TimeBudget est={est} state={estState} error={estError} directives={preview.directives} resources={resources} setResources={setResources} />}
             <button className="quiet small" onClick={() => setShowScript(v => !v)}>{showScript ? 'hide script' : 'script'}</button>
             {showScript && preview.script && <pre className="script">{preview.script}</pre>}
           </div>
@@ -200,7 +245,15 @@ export default function NewJob({ info }: { info: Info | null }) {
           <span className="right">{changedCount} changed from the defaults</span>
         </div>
         {!schema && !error && <p className="muted">Loading the form…</p>}
+        {fromJob && schema && (
+          <p className="note">{params.get('resume')
+            ? <>Continuing job <span className="mono">{fromJob.id}</span> from its checkpoint: same flags and output, <span className="mono">--gauss-resume</span> added. Training picks up at the iteration the checkpoint records and runs to <span className="mono">--iterations</span>.</>
+            : <>Flags copied from job <span className="mono">{fromJob.id}</span>.</>}</p>
+        )}
         {filtered && <Form schema={filtered} values={values} setValues={setValues} scans={scans} showAll={showAll} machine={machine} afterInput={<>
+          {driver === 'learned' && algorithm && DETAIL_ALGORITHMS.includes(algorithm) && schema && (
+            <DetailPresets schema={schema} values={values} setValues={setValues} machine={machine} machines={executors} scanPath={scanPathNow} est={est} state={estState} error={estError} />
+          )}
           {roiField && (
             <div className={'opt pos roi-row' + (roiText.trim() && roiText.trim() !== 'auto' ? ' changed' : '')} title={roiField.help}>
               <label htmlFor="f-roi-row" className="flag">{roiField.flags[0]}</label>
@@ -254,7 +307,7 @@ export default function NewJob({ info }: { info: Info | null }) {
             </span>
           </div>
         </div>
-        {(checks || checking) && <div className="runbar-checks"><InputChecks groups={checks} checking={checking} /></div>}
+        {(allChecks || checking) && <div className="runbar-checks"><InputChecks groups={allChecks} checking={checking} /></div>}
         {error && <p className="error small">{error}</p>}
       </div>
     </>

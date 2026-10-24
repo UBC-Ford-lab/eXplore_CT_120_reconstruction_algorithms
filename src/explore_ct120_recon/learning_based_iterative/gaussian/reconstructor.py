@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import math
 import os
+import signal
 import tempfile
 import time
 
@@ -73,7 +74,7 @@ from ...ct_core.early_stop import (EarlyStopper, HoldoutScorer,
                                                resolve_patience, solution_norm)
 from ...ct_core.projection_diag import covered_detector_window
 from ...ct_core.support import export_grid_geometry
-from ..trainer import LearnedReconstructor
+from ..trainer import LearnedReconstructor, StoppedBySignal
 from ..training import lr_multiplier
 
 from . import camera as cam_mod
@@ -134,6 +135,7 @@ class GaussianReconstructor(LearnedReconstructor):
                  photometric_ref: float = 0.01,
                  photometric_lr: float | None = None,
                  checkpoint_path: str | None = None,
+                 checkpoint_every: int | None = None,
                  export_chunk_voxels: int = DEFAULT_MAX_VOXELS,
                  **kwargs):
         self.cfg = dict(
@@ -174,7 +176,9 @@ class GaussianReconstructor(LearnedReconstructor):
             lr_multipliers=dict(lr_multipliers or {}),
             photometric=str(photometric), photometric_reg=float(photometric_reg),
             photometric_ref=float(photometric_ref),
-            photometric_lr=(None if photometric_lr is None else float(photometric_lr)))
+            photometric_lr=(None if photometric_lr is None else float(photometric_lr)),
+            checkpoint_every=(None if checkpoint_every is None
+                              else int(checkpoint_every)))
         self.photo: PhotometricModel | None = None
         if self.cfg['density_control'] not in ('adaptive', 'mcmc', 'fixed'):
             raise ValueError(f"density_control must be 'adaptive', 'mcmc' or "
@@ -185,6 +189,14 @@ class GaussianReconstructor(LearnedReconstructor):
         self._signal_scale_arg = signal_scale
         self._export_chunk = int(export_chunk_voxels)
         self._checkpoint_path = checkpoint_path
+        # Set by a signal (see `_install_signal_handlers`): the loop ends at
+        # the next iteration, checkpoints, and exports or not by the name.
+        self._stop_signal: str | None = None
+        # Filled by `_resume` from a PARTIAL checkpoint: the iteration the
+        # loop continues from, with the LRs and reducer state of that moment.
+        self._resume_iter = 0
+        self._resume_lrs: list | None = None
+        self._resume_plateau: dict | None = None
         super().__init__(projections, angles, geometry, **kwargs)
         # The data term is the SHARED registry's (`loss=`, any of
         # losses.DATA_TERMS): a whole view is a complete row and a complete
@@ -505,341 +517,379 @@ class GaussianReconstructor(LearnedReconstructor):
 
         order, cursor = [], 0
         t0 = time.time()
-        self.iterations_run = 0
+        start = int(self._resume_iter)
+        self.iterations_run = start
         stop_reason = 'max iterations'
-        for it in range(1, self.iterations + 1):
-            staged = False        # a stage frame was drawn this iteration
-            # LR ownership, per iteration. The warmup ramp always owns the
-            # ramp; after it the reducer takes over for good when there is one,
-            # and the cosine owns the whole run when there is not. `_schedule`
-            # counts from zero, this loop from one.
-            if self.lr_plateau is None or it <= self.lr_warmup_iters:
-                scale = float(_schedule(it - 1))
-                for group, g0 in zip(optimizer.param_groups, base_lrs):
-                    group['lr'] = g0 * scale
-            elif not self.lr_plateau.active:
-                for group, g0 in zip(optimizer.param_groups, base_lrs):
-                    group['lr'] = g0
-                self.lr_plateau.activate(optimizer)
-                print(f"  lr_plateau: taking over LR control at iteration {it} "
-                      f"(warmup done, base "
-                      f"{', '.join(f'{g:.2e}' for g in base_lrs)})")
-                self._lr_stage(cloud, domain, device, it, 0, base_lrs[0])
-                staged = True
+        if start > 0:
+            self._resume_schedule(optimizer, base_lrs, start)
+        ckpt_every = self.cfg['checkpoint_every']
+        if ckpt_every is None:
+            ckpt_every = int(self.eval_every) if holdout is not None else 1000
+        previous_handlers = self._install_signal_handlers()
+        # try/finally: a run that ends by an exception must not leave its
+        # handlers on the process (the next run in the same interpreter
+        # would inherit them and a signal would then land in a dead object).
+        try:
+            for it in range(start + 1, self.iterations + 1):
+                if self._stop_signal is not None:
+                    stop_reason = f'stopped by {self._stop_signal}'
+                    break
+                staged = False        # a stage frame was drawn this iteration
+                # LR ownership, per iteration. The warmup ramp always owns the
+                # ramp; after it the reducer takes over for good when there is one,
+                # and the cosine owns the whole run when there is not. `_schedule`
+                # counts from zero, this loop from one.
+                if self.lr_plateau is None or it <= self.lr_warmup_iters:
+                    scale = float(_schedule(it - 1))
+                    for group, g0 in zip(optimizer.param_groups, base_lrs):
+                        group['lr'] = g0 * scale
+                elif not self.lr_plateau.active:
+                    for group, g0 in zip(optimizer.param_groups, base_lrs):
+                        group['lr'] = g0
+                    self.lr_plateau.activate(optimizer)
+                    print(f"  lr_plateau: taking over LR control at iteration {it} "
+                          f"(warmup done, base "
+                          f"{', '.join(f'{g:.2e}' for g in base_lrs)})")
+                    self._lr_stage(cloud, domain, device, it, 0, base_lrs[0])
+                    staged = True
 
-            if cursor >= len(order):
-                order = list(rng.permutation(train_views))
-                cursor = 0
-            view = int(order[cursor]); cursor += 1
+                if cursor >= len(order):
+                    order = list(rng.permutation(train_views))
+                    cursor = 0
+                view = int(order[cursor]); cursor += 1
 
-            out = self._render_train(cloud, cameras, view)
-            pred = cam_mod.Camera.to_ours(out['image'])
-            loss = self._loss(pred, target[view], view)
-            if mcmc:
-                # Upstream's opacity_reg / scale_reg, made scale-free by the
-                # seed medians. The amplitude term is what retires redundant
-                # primitives so relocation has something to move.
-                if self.cfg['density_reg'] > 0:
-                    loss = loss + self.cfg['density_reg'] * (
-                        cloud.density.mean() / self._seed_ref['density'])
-                if self.cfg['scale_reg'] > 0:
-                    loss = loss + self.cfg['scale_reg'] * (
-                        cloud.scaling.mean() / self._seed_ref['scale'])
-            loss = self._regularise(loss, cloud, view)
+                out = self._render_train(cloud, cameras, view)
+                pred = cam_mod.Camera.to_ours(out['image'])
+                loss = self._loss(pred, target[view], view)
+                if mcmc:
+                    # Upstream's opacity_reg / scale_reg, made scale-free by the
+                    # seed medians. The amplitude term is what retires redundant
+                    # primitives so relocation has something to move.
+                    if self.cfg['density_reg'] > 0:
+                        loss = loss + self.cfg['density_reg'] * (
+                            cloud.density.mean() / self._seed_ref['density'])
+                    if self.cfg['scale_reg'] > 0:
+                        loss = loss + self.cfg['scale_reg'] * (
+                            cloud.scaling.mean() / self._seed_ref['scale'])
+                loss = self._regularise(loss, cloud, view)
 
-            optimizer.zero_grad(set_to_none=True)
-            if gate_z is not None and not mcmc and gate_from <= it <= d_until:
-                # The noise gate's control experiment: the same loss, the same
-                # view, against a target whose residual has the magnitudes of
-                # the real one and random signs. Its gradient is what noise
-                # alone produces for every primitive; `record_gradients` pairs
-                # it with the real one. One extra backward per iteration while
-                # densification can fire (`GaussianCloud.record_null_gradients`).
-                with torch.no_grad():
-                    r = (pred - target[view]).abs()
-                    flip = torch.where(torch.rand_like(r) < 0.5, -1.0, 1.0)
-                    null_target = pred.detach() - r * flip
-                self._loss(pred, null_target, view).backward(retain_graph=True)
-                with torch.no_grad():
-                    cloud.record_null_gradients(out['screenspace'],
-                                                out['visible'])
-                    if out['screenspace'].grad is not None:
-                        out['screenspace'].grad.zero_()
                 optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            with torch.no_grad():
-                cloud.record_gradients(out['screenspace'], out['visible'],
-                                       out['radii'])
-            optimizer.step()
-            # A projection, applied where the voxel backend applies its own
-            # non-negativity projection: a constraint on the solution set, not
-            # a penalty competing with the data term.
-            # Positions keep moving after densification stops, so the ceiling
-            # keeps being re-measured for the whole run; the densify branch
-            # below re-measures on its own when it fires, so skip it here.
-            if (self._sigma_spacing > 0 and self._cap_every > 0
-                    and it % self._cap_every == 0
-                    and not (d_from <= it <= d_until)):
-                cloud.update_spacing_cap(self._sigma_spacing)
-            clamped = cloud.project_scales(self._min_sigma_w, self._max_aspect)
-            if mcmc and self.cfg['mcmc_noise'] > 0:
-                lr_ratio = float(optimizer.param_groups[0]['lr']) / base_lrs[0]
-                cloud.add_position_noise(
-                    amount=self.cfg['mcmc_noise'] * lr_ratio,
-                    dead_score=cloud.mass().abs() / dead_line)
-            self.iterations_run = it
+                if gate_z is not None and not mcmc and gate_from <= it <= d_until:
+                    # The noise gate's control experiment: the same loss, the same
+                    # view, against a target whose residual has the magnitudes of
+                    # the real one and random signs. Its gradient is what noise
+                    # alone produces for every primitive; `record_gradients` pairs
+                    # it with the real one. One extra backward per iteration while
+                    # densification can fire (`GaussianCloud.record_null_gradients`).
+                    with torch.no_grad():
+                        r = (pred - target[view]).abs()
+                        flip = torch.where(torch.rand_like(r) < 0.5, -1.0, 1.0)
+                        null_target = pred.detach() - r * flip
+                    self._loss(pred, null_target, view).backward(retain_graph=True)
+                    with torch.no_grad():
+                        cloud.record_null_gradients(out['screenspace'],
+                                                    out['visible'])
+                        if out['screenspace'].grad is not None:
+                            out['screenspace'].grad.zero_()
+                    optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                with torch.no_grad():
+                    cloud.record_gradients(out['screenspace'], out['visible'],
+                                           out['radii'])
+                optimizer.step()
+                # A projection, applied where the voxel backend applies its own
+                # non-negativity projection: a constraint on the solution set, not
+                # a penalty competing with the data term.
+                # Positions keep moving after densification stops, so the ceiling
+                # keeps being re-measured for the whole run; the densify branch
+                # below re-measures on its own when it fires, so skip it here.
+                if (self._sigma_spacing > 0 and self._cap_every > 0
+                        and it % self._cap_every == 0
+                        and not (d_from <= it <= d_until)):
+                    cloud.update_spacing_cap(self._sigma_spacing)
+                clamped = cloud.project_scales(self._min_sigma_w, self._max_aspect)
+                if mcmc and self.cfg['mcmc_noise'] > 0:
+                    lr_ratio = float(optimizer.param_groups[0]['lr']) / base_lrs[0]
+                    cloud.add_position_noise(
+                        amount=self.cfg['mcmc_noise'] * lr_ratio,
+                        dead_score=cloud.mass().abs() / dead_line)
+                self.iterations_run = it
 
-            # ---- held-out evaluation, BEFORE densification -----------------
-            # MEASURED, run rsgwh174 (Scan_1510 ds3/75 um): densification
-            # fires at multiples of densify_every (100) and evaluation at
-            # multiples of eval_every (250), so every x000/x500 evaluation ran
-            # IMMEDIATELY after a clone/split/prune/re-cap round while every
-            # x250 one had 50 recovery steps. A split halves each parent's mass
-            # by construction (two children at sigma/1.6, same amplitude) and
-            # the width re-measure that follows tightens every neighbourhood
-            # the new primitives landed in; density trains at 100x the base
-            # rate and repairs ~2.5 % of mass in ~50 steps, so the x250 curve
-            # was smooth and the x000/x500 curve sat 3-9 dB below it, deepening
-            # as the cloud grew. The stopper read three of those dips as "no
-            # improvement" and ended the run at 5750 with 63 % of its budget;
-            # the LR reducer halved on them too. Evaluating first scores the
-            # cloud the optimiser actually produced, and the best-iterate
-            # snapshot is then a pre-densify cloud as well.
-            if holdout is not None and (it % self.eval_every == 0
-                                        or it == self.iterations):
-                metrics = self._evaluate(cloud, cameras[holdout], scorer,
-                                         view=holdout)
-                n_evals = len(self.crossval_history) + 1
-                self.crossval_history.append({'iteration': it, **metrics})
-                if self.diag_fn is not None:
-                    # Figures are GATED. `log_projection_diag` defaults
-                    # figures=True, so calling it every evaluation uploaded a
-                    # heatmap and a power spectrum every time — a few hundred
-                    # per long run, against the base loop's one in four.
+                # ---- held-out evaluation, BEFORE densification -----------------
+                # MEASURED, run rsgwh174 (Scan_1510 ds3/75 um): densification
+                # fires at multiples of densify_every (100) and evaluation at
+                # multiples of eval_every (250), so every x000/x500 evaluation ran
+                # IMMEDIATELY after a clone/split/prune/re-cap round while every
+                # x250 one had 50 recovery steps. A split halves each parent's mass
+                # by construction (two children at sigma/1.6, same amplitude) and
+                # the width re-measure that follows tightens every neighbourhood
+                # the new primitives landed in; density trains at 100x the base
+                # rate and repairs ~2.5 % of mass in ~50 steps, so the x250 curve
+                # was smooth and the x000/x500 curve sat 3-9 dB below it, deepening
+                # as the cloud grew. The stopper read three of those dips as "no
+                # improvement" and ended the run at 5750 with 63 % of its budget;
+                # the LR reducer halved on them too. Evaluating first scores the
+                # cloud the optimiser actually produced, and the best-iterate
+                # snapshot is then a pre-densify cloud as well.
+                if holdout is not None and (it % self.eval_every == 0
+                                            or it == self.iterations):
+                    metrics = self._evaluate(cloud, cameras[holdout], scorer,
+                                             view=holdout)
+                    n_evals = len(self.crossval_history) + 1
+                    self.crossval_history.append({'iteration': it, **metrics})
+                    if self.diag_fn is not None:
+                        # Figures are GATED. `log_projection_diag` defaults
+                        # figures=True, so calling it every evaluation uploaded a
+                        # heatmap and a power spectrum every time — a few hundred
+                        # per long run, against the base loop's one in four.
+                        self.diag_fn(self._line_integral(cloud, cameras[holdout],
+                                                         view=holdout),
+                                     scorer.crop(sino[holdout]), it,
+                                     figures=(n_evals % self.figure_every_evals == 0))
+                    elif self.log_fn is not None:
+                        self.log_fn({f'diag/{k}': v for k, v in metrics.items()},
+                                    step=it)
+                    if self.log_fn is not None and torch.cuda.is_available():
+                        # The allocator's PEAK, not nvidia-smi's reservation: the
+                        # cache grows into whatever is free and says nothing about
+                        # need (MEASURED: 15.4 GiB reserved, then trimmed to 7.8,
+                        # for the same 2.4 M cloud). This is what the preflight's
+                        # size model has to reproduce.
+                        self.log_fn({'sys/gpu_peak_alloc_gib':
+                                         torch.cuda.max_memory_allocated() / 2**30,
+                                     'sys/gpu_reserved_gib':
+                                         torch.cuda.memory_reserved() / 2**30},
+                                    step=it)
+
+                    improved = stopper.update(
+                        it, metrics,
+                        snapshot_fn=((lambda: self._state(cloud))
+                                     if self.save_best else None))
+                    if self.lr_plateau is not None and self.lr_plateau.step(
+                            improved, optimizer, iteration=it):
+                        # A reduction resets the stopper's patience on purpose: a
+                        # noise dip should buy an LR cut, not end the run.
+                        stopper.num_bad = 0
+                        lrs = ', '.join(f'{g:.2e}' for g in
+                                        self.lr_plateau.current_lrs(optimizer))
+                        print(f"  lr_plateau: reduction "
+                              f"{self.lr_plateau.num_reductions} -> {lrs}")
+                        if self.log_fn is not None:
+                            self.log_fn(
+                                {'lr_plateau/reductions':
+                                     self.lr_plateau.num_reductions,
+                                 'lr_plateau/lr':
+                                     self.lr_plateau.current_lrs(optimizer)[0]}, it)
+                        self._lr_stage(cloud, domain, device, it,
+                                       self.lr_plateau.num_reductions,
+                                       self.lr_plateau.current_lrs(optimizer)[0])
+                        staged = True
+                    # The denser record: a frame every K evaluations, on top of
+                    # the one per LR change. Free for this backend (three planes
+                    # of the ROI cost ~20 ms, the whole ROI 0.9 s), so the cadence
+                    # is the caller's choice; a reduction that already drew this
+                    # evaluation is not drawn twice.
+                    if (self._view_every_evals > 0 and not staged
+                            and n_evals % self._view_every_evals == 0):
+                        self._lr_stage(
+                            cloud, domain, device, it,
+                            (self.lr_plateau.num_reductions
+                             if self.lr_plateau is not None else 0),
+                            float(optimizer.param_groups[0]['lr']),
+                            slug=f"iter{it:06d}")
+                    if lcurve is not None:
+                        lcurve.add(it, float(np.sqrt(metrics['mse'])),
+                                   self._solution_norm(cloud))
+                        if 'lcurve' in self.stop_on and lcurve_depth > 0:
+                            lcurve_snapshots[it] = self._state(cloud)
+                            for old_it in sorted(lcurve_snapshots)[:-lcurve_depth]:
+                                del lcurve_snapshots[old_it]
+                        if self.log_fn is not None:
+                            c_it, _ = lcurve.corner()
+                            self.log_fn({'lcurve/residual': lcurve.residual[-1],
+                                         'lcurve/solution': lcurve.solution[-1],
+                                         **({'lcurve/corner_iter': c_it}
+                                            if c_it is not None else {})}, it)
+
+                    if rules.should_stop():
+                        if (self.lr_plateau is not None
+                                and not self.lr_plateau.at_floor(optimizer, it)):
+                            # Patience ran out but the LR has further to fall.
+                            # Stopping here would deliver an un-annealed cloud.
+                            stopper.num_bad = 0
+                            rules.fired = None
+                        else:
+                            stop_reason = rules.reason()
+                            break
+
+                # ---- the periodic checkpoint -----------------------------------
+                # The cloud as it stands, on the evaluation cadence, so a run
+                # that is killed (a Slurm time limit, a lost node, a cancel)
+                # keeps everything but the last few hundred iterations and can
+                # be continued with --gauss-resume. MEASURED, Slurm job 87868:
+                # 7.1 M primitives, 16 500 iterations and 5 hours on an H100,
+                # cancelled at the time limit with nothing on disk but plots.
+                if (ckpt_every > 0 and it % ckpt_every == 0
+                        and it != self.iterations):
+                    self._checkpoint(cloud, optimizer=optimizer, partial=True)
+
+                if (mcmc and d_from <= it <= d_until
+                        and it % self.cfg['densify_every'] == 0):
+                    eligible = (None if self._densify_box is None else
+                                cloud.inside_box(*self._densify_box))
+                    dead = cloud.mass().abs() < dead_line
+                    stats = cloud.relocate_dead(optimizer, dead=dead,
+                                                targets_ok=eligible)
+                    self._last_densify = {'relocated': stats['relocated'],
+                                          'gated': -1, 'eligible': len(cloud)}
+                    cap = cloud.update_spacing_cap(self._sigma_spacing,
+                                                   fresh=stats.get('moved', dead))
+                    cloud.project_scales(self._min_sigma_w, self._max_aspect)
+                    if self.log_fn is not None:
+                        self.log_fn({'model/n_gaussians': len(cloud),
+                                     'model/relocated': stats['relocated'],
+                                     'model/relocate_targets': stats['targets'],
+                                     'model/dead_frac':
+                                         stats['dead'] / max(1, len(cloud)),
+                                     'model/cap_median_mm':
+                                         cap['cap_median'] / self.world_scale,
+                                     'model/cap_over': cap['cap_n']}, step=it)
+                elif d_from <= it <= d_until and it % self.cfg['densify_every'] == 0:
+                    eligible = (None if self._densify_box is None else
+                                cloud.inside_box(*self._densify_box))
+                    stats = cloud.densify_and_prune(
+                        optimizer,
+                        fraction=self.cfg['densify_fraction'],
+                        absolute=self.cfg['densify_grad_threshold'],
+                        split_scale=split_scale, min_density=min_density,
+                        max_scale=max_scale, max_count=self.cfg['max_gaussians'],
+                        eligible=eligible, split_mode=self.cfg['split_mode'],
+                        gate_z=gate_z, min_sigma=self._min_sigma_w)
+                    self.n_gaussians = stats['after']
+                    self._last_densify = stats
+                    # Fresh children keep their parent's ceiling this round (see
+                    # `update_spacing_cap`); the random split also needs the
+                    # projection because it shrinks all three axes alike and can
+                    # push a child below the floor.
+                    fresh = None
+                    if stats['n_new'] > 0:
+                        fresh = torch.arange(len(cloud), device=device) >= (
+                            len(cloud) - stats['n_new'])
+                    cap = cloud.update_spacing_cap(self._sigma_spacing, fresh=fresh)
+                    cloud.project_scales(self._min_sigma_w, self._max_aspect)
+                    if self.log_fn is not None:
+                        self.log_fn({'model/n_gaussians': stats['after'],
+                                     'model/densify_eligible': stats['eligible'],
+                                     # the set the quantile ranked: eligible, seen
+                                     # and past the gate; fraction x this = splits
+                                     'model/densify_candidates': stats.get('candidates', -1),
+                                     'model/densify_threshold': stats['threshold'],
+                                     'model/cloned': stats['cloned'],
+                                     'model/split': stats['split'],
+                                     'model/pruned': stats['pruned'],
+                                     # How many primitives the data still asked to
+                                     # refine (-1: gate idle). Zero means the data
+                                     # have gone silent and further rounds would
+                                     # only fill the null space.
+                                     'model/densify_gated': stats['gated'],
+                                     'model/densify_floored': stats['floored'],
+                                     'model/cap_median_mm':
+                                         cap['cap_median'] / self.world_scale,
+                                     'model/cap_over': cap['cap_n']}, step=it)
+
+                # The training curve every other backend logs. Without it a
+                # Gaussian run has no loss, no LR and no rate in W&B — only the
+                # diag/* scalars at each evaluation, which cannot show a schedule
+                # doing (or not doing) its job.
+                if self.log_every and (it % self.log_every == 0
+                                       or it == self.iterations):
+                    report('train', it, self.iterations)
+                    rate = (it - start) / max(1e-9, time.time() - t0)
+                    visits = it / max(1, len(train_views))
+                    lr_now = float(optimizer.param_groups[0]['lr'])
+                    last = getattr(self, '_last_densify', None)
+                    gated = (f"  gated {last['gated']:,}/{last['eligible']:,}"
+                             f", split {last.get('split', 0):,}/round"
+                             if last is not None and last['gated'] >= 0
+                             and d_from <= it <= d_until else "")
+                    if (last is not None and 'relocated' in last
+                            and d_from <= it <= d_until):
+                        gated = f"  relocated {last['relocated']:,}"
+                    print(f"  iter {it:6d}/{self.iterations}  "
+                          f"loss {loss.item():.3e}  lr {lr_now:.2e}  "
+                          f"{rate:.2f} it/s  {self.n_gaussians:,} gaussians  "
+                          f"{visits:.2f} visits/measurement{gated}", flush=True)
+                    if self.log_fn is not None:
+                        self.log_fn({'train/loss': float(loss.item()),
+                                     'train/lr': lr_now,
+                                     'train/it_per_s': rate,
+                                     'train/data_visits': visits,
+                                     'train/rays_per_batch': self.rays_per_batch,
+                                     'model/n_gaussians': self.n_gaussians,
+                                     # How hard the shape constraints are biting.
+                                     # A number that stays high means the data term
+                                     # is still pushing towards needles and the cap
+                                     # is the only thing holding them back.
+                                     'model/clamped_thin': clamped['clamped_thin'],
+                                     'model/clamped_aspect':
+                                         clamped['clamped_aspect'],
+                                     'model/clamped_wide':
+                                         clamped['clamped_wide']}, it)
+
+            print(f"  {self.iterations_run - start} iterations in "
+                  f"{(time.time() - t0) / 60:.2f} min"
+                  + (f" (resumed at {start}, {self.iterations_run} in all)"
+                     if start else "")
+                  + f", {self.n_gaussians:,} Gaussians — {stop_reason}")
+            if holdout is not None and self.crossval_history:
+                last = self.crossval_history[-1]
+                print(f"  Eval projection: {self.stop_metric} "
+                      f"{last[self.stop_metric]:.6g} at the end, best "
+                      f"{stopper.best:.6g} at iter {stopper.best_iter}")
+                if lcurve is not None:
+                    c_it, _ = lcurve.corner()
+                    print(f"  L-curve corner: "
+                          f"{c_it if c_it is not None else 'none yet'}"
+                          + ("" if c_it is None or stopper.best_iter is None
+                             or c_it == stopper.best_iter
+                             else f" — DISAGREES with the held-out peak "
+                                  f"({stopper.best_iter})"))
+                # Guarantee final figures even when the last evaluation was not a
+                # figure checkpoint, exactly as the base loop does.
+                if (self.diag_fn is not None
+                        and len(self.crossval_history) % self.figure_every_evals != 0):
                     self.diag_fn(self._line_integral(cloud, cameras[holdout],
                                                      view=holdout),
-                                 scorer.crop(sino[holdout]), it,
-                                 figures=(n_evals % self.figure_every_evals == 0))
-                elif self.log_fn is not None:
-                    self.log_fn({f'diag/{k}': v for k, v in metrics.items()},
-                                step=it)
-                if self.log_fn is not None and torch.cuda.is_available():
-                    # The allocator's PEAK, not nvidia-smi's reservation: the
-                    # cache grows into whatever is free and says nothing about
-                    # need (MEASURED: 15.4 GiB reserved, then trimmed to 7.8,
-                    # for the same 2.4 M cloud). This is what the preflight's
-                    # size model has to reproduce.
-                    self.log_fn({'sys/gpu_peak_alloc_gib':
-                                     torch.cuda.max_memory_allocated() / 2**30,
-                                 'sys/gpu_reserved_gib':
-                                     torch.cuda.memory_reserved() / 2**30},
-                                step=it)
+                                 scorer.crop(sino[holdout]), self.iterations_run,
+                                 figures=True, scalars=False)
 
-                improved = stopper.update(
-                    it, metrics,
-                    snapshot_fn=((lambda: self._state(cloud))
-                                 if self.save_best else None))
-                if self.lr_plateau is not None and self.lr_plateau.step(
-                        improved, optimizer, iteration=it):
-                    # A reduction resets the stopper's patience on purpose: a
-                    # noise dip should buy an LR cut, not end the run.
-                    stopper.num_bad = 0
-                    lrs = ', '.join(f'{g:.2e}' for g in
-                                    self.lr_plateau.current_lrs(optimizer))
-                    print(f"  lr_plateau: reduction "
-                          f"{self.lr_plateau.num_reductions} -> {lrs}")
-                    if self.log_fn is not None:
-                        self.log_fn(
-                            {'lr_plateau/reductions':
-                                 self.lr_plateau.num_reductions,
-                             'lr_plateau/lr':
-                                 self.lr_plateau.current_lrs(optimizer)[0]}, it)
-                    self._lr_stage(cloud, domain, device, it,
-                                   self.lr_plateau.num_reductions,
-                                   self.lr_plateau.current_lrs(optimizer)[0])
-                    staged = True
-                # The denser record: a frame every K evaluations, on top of
-                # the one per LR change. Free for this backend (three planes
-                # of the ROI cost ~20 ms, the whole ROI 0.9 s), so the cadence
-                # is the caller's choice; a reduction that already drew this
-                # evaluation is not drawn twice.
-                if (self._view_every_evals > 0 and not staged
-                        and n_evals % self._view_every_evals == 0):
-                    self._lr_stage(
-                        cloud, domain, device, it,
-                        (self.lr_plateau.num_reductions
-                         if self.lr_plateau is not None else 0),
-                        float(optimizer.param_groups[0]['lr']),
-                        slug=f"iter{it:06d}")
-                if lcurve is not None:
-                    lcurve.add(it, float(np.sqrt(metrics['mse'])),
-                               self._solution_norm(cloud))
-                    if 'lcurve' in self.stop_on and lcurve_depth > 0:
-                        lcurve_snapshots[it] = self._state(cloud)
-                        for old_it in sorted(lcurve_snapshots)[:-lcurve_depth]:
-                            del lcurve_snapshots[old_it]
-                    if self.log_fn is not None:
-                        c_it, _ = lcurve.corner()
-                        self.log_fn({'lcurve/residual': lcurve.residual[-1],
-                                     'lcurve/solution': lcurve.solution[-1],
-                                     **({'lcurve/corner_iter': c_it}
-                                        if c_it is not None else {})}, it)
-
-                if rules.should_stop():
-                    if (self.lr_plateau is not None
-                            and not self.lr_plateau.at_floor(optimizer, it)):
-                        # Patience ran out but the LR has further to fall.
-                        # Stopping here would deliver an un-annealed cloud.
-                        stopper.num_bad = 0
-                        rules.fired = None
-                    else:
-                        stop_reason = rules.reason()
-                        break
-
-            if (mcmc and d_from <= it <= d_until
-                    and it % self.cfg['densify_every'] == 0):
-                eligible = (None if self._densify_box is None else
-                            cloud.inside_box(*self._densify_box))
-                dead = cloud.mass().abs() < dead_line
-                stats = cloud.relocate_dead(optimizer, dead=dead,
-                                            targets_ok=eligible)
-                self._last_densify = {'relocated': stats['relocated'],
-                                      'gated': -1, 'eligible': len(cloud)}
-                cap = cloud.update_spacing_cap(self._sigma_spacing,
-                                               fresh=stats.get('moved', dead))
-                cloud.project_scales(self._min_sigma_w, self._max_aspect)
-                if self.log_fn is not None:
-                    self.log_fn({'model/n_gaussians': len(cloud),
-                                 'model/relocated': stats['relocated'],
-                                 'model/relocate_targets': stats['targets'],
-                                 'model/dead_frac':
-                                     stats['dead'] / max(1, len(cloud)),
-                                 'model/cap_median_mm':
-                                     cap['cap_median'] / self.world_scale,
-                                 'model/cap_over': cap['cap_n']}, step=it)
-            elif d_from <= it <= d_until and it % self.cfg['densify_every'] == 0:
-                eligible = (None if self._densify_box is None else
-                            cloud.inside_box(*self._densify_box))
-                stats = cloud.densify_and_prune(
-                    optimizer,
-                    fraction=self.cfg['densify_fraction'],
-                    absolute=self.cfg['densify_grad_threshold'],
-                    split_scale=split_scale, min_density=min_density,
-                    max_scale=max_scale, max_count=self.cfg['max_gaussians'],
-                    eligible=eligible, split_mode=self.cfg['split_mode'],
-                    gate_z=gate_z, min_sigma=self._min_sigma_w)
-                self.n_gaussians = stats['after']
-                self._last_densify = stats
-                # Fresh children keep their parent's ceiling this round (see
-                # `update_spacing_cap`); the random split also needs the
-                # projection because it shrinks all three axes alike and can
-                # push a child below the floor.
-                fresh = None
-                if stats['n_new'] > 0:
-                    fresh = torch.arange(len(cloud), device=device) >= (
-                        len(cloud) - stats['n_new'])
-                cap = cloud.update_spacing_cap(self._sigma_spacing, fresh=fresh)
-                cloud.project_scales(self._min_sigma_w, self._max_aspect)
-                if self.log_fn is not None:
-                    self.log_fn({'model/n_gaussians': stats['after'],
-                                 'model/densify_eligible': stats['eligible'],
-                                 # the set the quantile ranked: eligible, seen
-                                 # and past the gate; fraction x this = splits
-                                 'model/densify_candidates': stats.get('candidates', -1),
-                                 'model/densify_threshold': stats['threshold'],
-                                 'model/cloned': stats['cloned'],
-                                 'model/split': stats['split'],
-                                 'model/pruned': stats['pruned'],
-                                 # How many primitives the data still asked to
-                                 # refine (-1: gate idle). Zero means the data
-                                 # have gone silent and further rounds would
-                                 # only fill the null space.
-                                 'model/densify_gated': stats['gated'],
-                                 'model/densify_floored': stats['floored'],
-                                 'model/cap_median_mm':
-                                     cap['cap_median'] / self.world_scale,
-                                 'model/cap_over': cap['cap_n']}, step=it)
-
-            # The training curve every other backend logs. Without it a
-            # Gaussian run has no loss, no LR and no rate in W&B — only the
-            # diag/* scalars at each evaluation, which cannot show a schedule
-            # doing (or not doing) its job.
-            if self.log_every and (it % self.log_every == 0
-                                   or it == self.iterations):
-                report('train', it, self.iterations)
-                rate = it / max(1e-9, time.time() - t0)
-                visits = it / max(1, len(train_views))
-                lr_now = float(optimizer.param_groups[0]['lr'])
-                last = getattr(self, '_last_densify', None)
-                gated = (f"  gated {last['gated']:,}/{last['eligible']:,}"
-                         f", split {last.get('split', 0):,}/round"
-                         if last is not None and last['gated'] >= 0
-                         and d_from <= it <= d_until else "")
-                if (last is not None and 'relocated' in last
-                        and d_from <= it <= d_until):
-                    gated = f"  relocated {last['relocated']:,}"
-                print(f"  iter {it:6d}/{self.iterations}  "
-                      f"loss {loss.item():.3e}  lr {lr_now:.2e}  "
-                      f"{rate:.2f} it/s  {self.n_gaussians:,} gaussians  "
-                      f"{visits:.2f} visits/measurement{gated}", flush=True)
-                if self.log_fn is not None:
-                    self.log_fn({'train/loss': float(loss.item()),
-                                 'train/lr': lr_now,
-                                 'train/it_per_s': rate,
-                                 'train/data_visits': visits,
-                                 'train/rays_per_batch': self.rays_per_batch,
-                                 'model/n_gaussians': self.n_gaussians,
-                                 # How hard the shape constraints are biting.
-                                 # A number that stays high means the data term
-                                 # is still pushing towards needles and the cap
-                                 # is the only thing holding them back.
-                                 'model/clamped_thin': clamped['clamped_thin'],
-                                 'model/clamped_aspect':
-                                     clamped['clamped_aspect'],
-                                 'model/clamped_wide':
-                                     clamped['clamped_wide']}, it)
-
-        print(f"  {self.iterations_run} iterations in "
-              f"{(time.time() - t0) / 60:.2f} min, "
-              f"{self.n_gaussians:,} Gaussians — {stop_reason}")
-        if holdout is not None and self.crossval_history:
-            last = self.crossval_history[-1]
-            print(f"  Eval projection: {self.stop_metric} "
-                  f"{last[self.stop_metric]:.6g} at the end, best "
-                  f"{stopper.best:.6g} at iter {stopper.best_iter}")
-            if lcurve is not None:
-                c_it, _ = lcurve.corner()
-                print(f"  L-curve corner: "
-                      f"{c_it if c_it is not None else 'none yet'}"
-                      + ("" if c_it is None or stopper.best_iter is None
-                         or c_it == stopper.best_iter
-                         else f" — DISAGREES with the held-out peak "
-                              f"({stopper.best_iter})"))
-            # Guarantee final figures even when the last evaluation was not a
-            # figure checkpoint, exactly as the base loop does.
-            if (self.diag_fn is not None
-                    and len(self.crossval_history) % self.figure_every_evals != 0):
-                self.diag_fn(self._line_integral(cloud, cameras[holdout],
-                                                 view=holdout),
-                             scorer.crop(sino[holdout]), self.iterations_run,
-                             figures=True, scalars=False)
-
-        # ---- restore the delivered iterate --------------------------------
-        # Only when a rule FIRED: a run that reached its iteration limit was
-        # asked for every iteration and gets the last one.
-        self.stop_iter = int(self.iterations_run)
-        self.stopped_by = None if rules is None else rules.fired
-        self.delivered_iter = self.stop_iter
-        if rules is not None and self.stopped_by is not None:
-            keep = rules.best_iter()
-            state = (stopper.best_state if self.stopped_by == 'holdout'
-                     else lcurve_snapshots.get(keep))
-            if keep is not None and keep != self.stop_iter and state is not None:
-                print(f"  restoring the iterate from iteration {keep} "
-                      f"({self.stopped_by})")
-                self._restore_state(cloud, state)
-                self.delivered_iter = int(keep)
-        self._checkpoint(cloud)
+            # ---- restore the delivered iterate --------------------------------
+            # Only when a rule FIRED: a run that reached its iteration limit was
+            # asked for every iteration and gets the last one.
+            self.stop_iter = int(self.iterations_run)
+            self.stopped_by = None if rules is None else rules.fired
+            self.delivered_iter = self.stop_iter
+            if rules is not None and self.stopped_by is not None:
+                keep = rules.best_iter()
+                state = (stopper.best_state if self.stopped_by == 'holdout'
+                         else lcurve_snapshots.get(keep))
+                if keep is not None and keep != self.stop_iter and state is not None:
+                    print(f"  restoring the iterate from iteration {keep} "
+                          f"({self.stopped_by})")
+                    self._restore_state(cloud, state)
+                    self.delivered_iter = int(keep)
+            # A run ended by a signal is a partial one: its cloud is saved at the
+            # iteration it reached, so --gauss-resume continues the count.
+            path = self._checkpoint(cloud, optimizer=optimizer,
+                                    partial=self._stop_signal is not None)
+        finally:
+            self._restore_signal_handlers(previous_handlers)
+        if self._stop_signal in ('SIGTERM', 'SIGINT'):
+            # The sender wanted the process gone (a cancel, Slurm's hard
+            # limit with 30 s to live): the checkpoint is the deliverable,
+            # the export (minutes) is not attempted.
+            raise StoppedBySignal(self._stop_signal, path,
+                                  int(self.iterations_run))
         self.reconstructed_volume = self._export(cloud, domain)
         return self.reconstructed_volume
 
@@ -868,8 +918,10 @@ class GaussianReconstructor(LearnedReconstructor):
             self._weight_state["w"] = self._wls_w[view]
         return self._data_term(pred / self._wls_scale, target / self._wls_scale)
 
-    def _checkpoint(self, cloud) -> str | None:
-        """Write the delivered cloud to disk BEFORE the volume is queried.
+    def _checkpoint(self, cloud, *, optimizer=None,
+                    partial: bool = False) -> str | None:
+        """Write the cloud to disk: at the end BEFORE the volume is queried,
+        and periodically during training (``partial=True``).
 
         The export is the last step of the run and the only one that
         serialises anything, which made it the one step whose failure costs
@@ -879,32 +931,135 @@ class GaussianReconstructor(LearnedReconstructor):
         `voxelize_gaussians` and all of it was gone, because a cloud that has
         not been queried has not been saved.
 
-        A cloud is small (11 floats per primitive: 53 MB at 1.2 M), so there is
-        no reason for this to be optional. Everything needed to re-export
-        without retraining goes in: the parameters, the two unit scales, and
-        the grid they belong to.
+        A cloud is small (11 floats per primitive: 53 MB at 1.2 M, 310 MB at
+        7 M), so there is no reason for this to be optional. Everything needed
+        to re-export without retraining goes in: the parameters, the two unit
+        scales, and the grid they belong to. A PARTIAL checkpoint also carries
+        what a continuation needs: the iteration, the per-group learning
+        rates and the plateau reducer's state, and the evaluation history.
+        The file is written next to its final name and renamed into place, so
+        a kill during the write leaves the previous checkpoint intact.
         """
         path = self._checkpoint_path or os.path.join(
             tempfile.gettempdir(), f"gaussian_cloud_{os.getpid()}.pt")
+        it = int(self.iterations_run)
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            torch.save({**self._checkpoint_payload(cloud),
-                        'world_scale': self.world_scale,
-                        'signal_scale': self.signal_scale,
-                        'geometry': {k: self.geometry[k] for k in
-                                     ('vol_shape', 'vol_origin', 'dx', 'dz')
-                                     if k in self.geometry},
-                        'n_gaussians': len(cloud),
-                        'delivered_iter': getattr(self, 'delivered_iter', None)},
-                       path)
-            print(f"  cloud checkpoint -> {path} "
-                  f"({os.path.getsize(path) / 2**20:.0f} MiB); the export can "
-                  f"be redone from this without retraining")
+            payload = {**self._checkpoint_payload(cloud),
+                       'world_scale': self.world_scale,
+                       'signal_scale': self.signal_scale,
+                       'geometry': {k: self.geometry[k] for k in
+                                    ('vol_shape', 'vol_origin', 'dx', 'dz')
+                                    if k in self.geometry},
+                       'n_gaussians': len(cloud),
+                       'partial': bool(partial),
+                       'iteration': it,
+                       'iterations': int(self.iterations),
+                       'stop_signal': self._stop_signal,
+                       'crossval_history': list(self.crossval_history),
+                       'delivered_iter': (it if partial else
+                                          getattr(self, 'delivered_iter', None))}
+            if optimizer is not None:
+                payload['lrs'] = [float(g['lr']) for g in optimizer.param_groups]
+            if self.lr_plateau is not None:
+                payload['lr_plateau'] = {
+                    'active': bool(self.lr_plateau.active),
+                    'level': float(self.lr_plateau.level),
+                    'num_reductions': int(self.lr_plateau.num_reductions)}
+            tmp = f"{path}.tmp"
+            torch.save(payload, tmp)
+            os.replace(tmp, path)
+            size = os.path.getsize(path) / 2**20
+            if partial:
+                print(f"  checkpoint at iteration {it} -> {path} "
+                      f"({size:.0f} MiB; --gauss-resume continues from here)",
+                      flush=True)
+            else:
+                print(f"  cloud checkpoint -> {path} ({size:.0f} MiB); the "
+                      f"export can be redone from this without retraining")
             return path
         except Exception as e:                     # never lose a run to this
             print(f"  WARNING: could not write the cloud checkpoint ({e}); "
-                  f"an export failure would now cost the whole run")
+                  + ("the previous one stands" if partial else
+                     "an export failure would now cost the whole run"))
             return None
+
+    # -- signals -------------------------------------------------------------
+    # Slurm's time limit, a GUI cancel and Ctrl-C all arrive as signals, and a
+    # process without a handler dies with its cloud in memory. The handler
+    # only raises a flag; the loop ends at the next iteration boundary and the
+    # ordinary tail runs — restore, checkpoint, then export or not:
+    #   SIGUSR1  the advance warning (sbatch --signal=B:USR1@600): finish the
+    #            run properly, export included, with the minutes that remain.
+    #   SIGTERM  the sender wants the process gone (cancel, the hard limit
+    #            with KillWait seconds to live): checkpoint, no export.
+    #   SIGINT   as SIGTERM; a second Ctrl-C ends the process at once.
+    def _install_signal_handlers(self) -> dict:
+        previous = {}
+
+        def handler(signum, _frame):
+            name = signal.Signals(signum).name
+            if self._stop_signal is not None:
+                if signum == signal.SIGINT:
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+                return                              # a repeat: already stopping
+            self._stop_signal = name
+            what = ("checkpoint, then export" if name == 'SIGUSR1' else
+                    "checkpoint only, no export"
+                    + (" (a second Ctrl-C ends it at once)"
+                       if name == 'SIGINT' else ""))
+            print(f"\n  {name} received: stopping at the next iteration — "
+                  f"{what}", flush=True)
+
+        for name in ('SIGTERM', 'SIGINT', 'SIGUSR1'):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                previous[sig] = signal.signal(sig, handler)
+            except (ValueError, OSError):           # not the main thread
+                pass
+        return previous
+
+    @staticmethod
+    def _restore_signal_handlers(previous: dict) -> None:
+        for sig, old in previous.items():
+            try:
+                signal.signal(sig, old if old is not None else signal.SIG_DFL)
+            except (ValueError, OSError):
+                pass
+
+    def _resume_schedule(self, optimizer, base_lrs, start: int) -> None:
+        """Put the LR chain back where the checkpoint left it.
+
+        The optimiser itself starts fresh (Adam's moments are not saved: at
+        7 M primitives they weigh twice the cloud and rebuild within a few
+        hundred steps), but the LEVEL of the chain is the schedule's memory
+        and must not restart at the peak: a resumed run that trained at 1/50
+        of the base rate would otherwise take a full-rate step into a cloud
+        that had settled.
+        """
+        lrs = self._resume_lrs
+        if lrs is None or len(lrs) != len(optimizer.param_groups):
+            print(f"  resuming at iteration {start}/{self.iterations}; the "
+                  f"checkpoint carries no usable LR state, the schedule "
+                  f"restarts")
+            return
+        if self.lr_plateau is not None and start > self.lr_warmup_iters:
+            for group, g0 in zip(optimizer.param_groups, base_lrs):
+                group['lr'] = g0
+            self.lr_plateau.activate(optimizer)
+            state = self._resume_plateau or {}
+            self.lr_plateau.level = float(state.get('level', 1.0))
+            self.lr_plateau.num_reductions = int(state.get('num_reductions', 0))
+        for group, lr in zip(optimizer.param_groups, lrs):
+            group['lr'] = float(lr)
+        print(f"  resuming at iteration {start}/{self.iterations}: lr "
+              f"{optimizer.param_groups[0]['lr']:.2e}"
+              + (f", {self.lr_plateau.num_reductions} plateau reductions so far"
+                 if self.lr_plateau is not None else "")
+              + f", {len(self.crossval_history)} evaluations on record")
 
     def _solution_norm(self, cloud) -> float:
         """||x|| for the L-curve: l2 of the density vector, in mm^-1.
@@ -1068,7 +1223,7 @@ class GaussianReconstructor(LearnedReconstructor):
         if self.log_fn is not None:
             self.log_fn({'model/density_floor_mm': floor / self.signal_scale}, 0)
 
-    def _resume(self, cloud, path: str) -> None:
+    def _resume(self, cloud, path: str) -> dict:
         """Replace the seed with a saved cloud (`--gauss-checkpoint` output).
 
         The seed is still built first so that everything derived from the
@@ -1077,6 +1232,15 @@ class GaussianReconstructor(LearnedReconstructor):
         scales are checked rather than trusted: a checkpoint from a different
         downsample or signal-scale setting is in different units, and the
         densities would be silently wrong by that factor.
+
+        Two kinds of file arrive here. The checkpoint of a FINISHED run is a
+        warm start: the cloud is taken, the iteration count starts at one, as
+        before. A PARTIAL checkpoint (periodic, or written on a signal) is a
+        continuation: the loop picks up at the iteration it records, with the
+        LR chain and the evaluation history of that moment, so the delivered
+        run is the one that was asked for, minus the moments the optimiser
+        needs to rebuild. Returns the loaded state for a subclass to read its
+        own part (the motion model).
         """
         state = torch.load(path, map_location='cpu', weights_only=False)
         for key, mine in (('world_scale', self.world_scale),
@@ -1088,9 +1252,29 @@ class GaussianReconstructor(LearnedReconstructor):
                     f"resolves {mine:.6g}; the checkpoint was made on other "
                     f"data or settings and its units do not transfer")
         cloud.restore(state['cloud'])
-        print(f"    resumed {len(cloud):,} primitives from {path}"
-              + (f" (delivered at iteration {state['delivered_iter']})"
-                 if 'delivered_iter' in state else ""))
+        if self.photo is not None and state.get('photometric') is not None:
+            self.photo.restore(state['photometric'])
+        if state.get('partial'):
+            done = int(state.get('iteration', 0))
+            if done >= self.iterations:
+                raise ValueError(
+                    f"resume: {path} already holds iteration {done} and this "
+                    f"run asks for {self.iterations}; raise --iterations to "
+                    f"continue it, or re-export from the checkpoint instead")
+            self._resume_iter = done
+            self._resume_lrs = state.get('lrs')
+            self._resume_plateau = state.get('lr_plateau')
+            self.crossval_history = list(state.get('crossval_history') or [])
+            print(f"    resumed {len(cloud):,} primitives from {path}: a "
+                  f"partial run stopped at iteration {done}"
+                  + (f" by {state['stop_signal']}" if state.get('stop_signal')
+                     else "")
+                  + f"; continuing to {self.iterations}")
+        else:
+            print(f"    resumed {len(cloud):,} primitives from {path}"
+                  + (f" (delivered at iteration {state['delivered_iter']})"
+                     if state.get('delivered_iter') is not None else ""))
+        return state
 
     def _seed(self, domain, rng, device) -> GaussianCloud:
         ref = self._reference_volume()
