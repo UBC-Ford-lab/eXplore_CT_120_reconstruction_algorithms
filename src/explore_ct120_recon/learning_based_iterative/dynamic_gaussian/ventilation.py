@@ -345,9 +345,11 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
             anchors, *, pitch_mm: float = 0.3, reference='auto',
             render_fn=None, max_voxels: int | None = None,
             min_lung_mm3: float = MIN_LUNG_MM3, dilate_mm: float = DILATE_MM,
-            peak_frac: float = PEAK_FRAC, log=print) -> dict:
+            peak_frac: float = PEAK_FRAC, per_view: bool = True, log=print) -> dict:
     """Everything: the per-primitive J / SV over the lung, the SV and J maps
     on the coarse grid in the expiration state, and the global numbers.
+    ``per_view``: also read every view's own state (one render and one
+    Jacobian per view, see PER VIEW below).
     ``reference``: 'auto' (the gate holding less air), 0 or 1.
     ``dilate_mm``: the band around the lung window over which ALL parcels'
     volume change is summed for the tidal volume (the map's smoothing pushes
@@ -378,8 +380,6 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
     else:
         ref = int(reference)
     insp = 1 - ref
-    log(f"  air in the thorax: gate 0 {air[0]:.1f} mm^3, gate 1 {air[1]:.1f} mm^3 -> "
-        f"expiration = gate {ref}" + (" (auto)" if reference == 'auto' else ""))
     code_ref, code_insp = gate_code(motion, -1.0 if ref == 0 else 1.0), gate_code(motion, -1.0 if insp == 0 else 1.0)
 
     xyz = cloud.xyz.detach()
@@ -416,7 +416,6 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
     f_air = air_fraction(hu_ref_i)
     sv = specific_ventilation(J, f_air)
     n_lung = int(lung_i.sum())
-    log(f"  {n_lung:,} lung primitives (by position in the inspiration state, followed to expiration)")
 
     # the maps: mass-weighted means of J and SV over the lung primitives
     shown_ref = motion.displaced_with_code(cloud, code_ref)
@@ -524,6 +523,79 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
                 'tidal_volume_mm3': {'lung_parcels': float(np.nansum((J_pk_map[covered] - 1.0) * frac[covered]) * dV),
                                      'band': float(np.nansum(J_pk_all[band] - 1.0) * dV)},
                 'views': {'insp': [int(v) for v in v_insp], 'exp': [int(v) for v in v_exp]}}
+        # the same two peak states read by density: the air change between
+        # them is the peak-to-peak tidal volume on the measured side, the
+        # number the field's peak reading is to be compared with
+        air_pk = {}
+        for name, code in (('exp', code_ref_pk), ('insp', code_insp_pk)):
+            hu_pk = anchors.apply(render_fn(motion.displaced_with_code(cloud, code), geom, ws, ss, max_voxels))
+            air_pk[name] = air_volume_mm3(hu_pk, region, p)
+        peak['air_mm3'] = air_pk
+        peak['delta_air_image_mm3'] = air_pk['insp'] - air_pk['exp']
+
+    # PER VIEW: every view's OWN state (its gate contrast plus its free code)
+    # rendered and read the same two ways, so the spread of breathing across
+    # the scan is reported, not only the two gate means. Density: the thorax
+    # air content of the view's state (the same region, so the views are
+    # comparable). Field: every parcel's J from the expiration gate-mean
+    # state to the view's state, footprint-averaged in the reference frame
+    # and summed over the band — the same integral as tidal_volume_mm3.band,
+    # so an inspiration view reads near the band value and an expiration
+    # view near zero. Frozen views (held out; their codes never trained) are
+    # skipped. One render and one Jacobian per view (0.7 s on a P100).
+    view_stats = None
+    if per_view and trace is not None and int(motion.n_codes) > 0:
+        import time as _time
+        t0 = _time.time()
+        levels = trace[0]
+        fixed_v = motion.fixed[:, 0].detach().cpu().numpy()
+        gate_of = np.where(fixed_v < 0, 0, 1)
+        frozen_mask = motion.frozen.cpu().numpy().astype(bool)
+        views = np.flatnonzero(~frozen_mask)
+        air_v = np.full(int(motion.n_views), np.nan)
+        field_v = np.full(int(motion.n_views), np.nan)
+        for v in views:
+            code_v = motion.full_code(int(v)).detach()
+            hu_v = anchors.apply(render_fn(motion.displaced_with_code(cloud, code_v), geom, ws, ss, max_voxels))
+            air_v[v] = air_volume_mm3(hu_v, region, p)
+            det_v, _ = jacobian_dets(motion, xyz, code_v)
+            J_v = (det_v / det_ref.clamp_min(1e-6)).to(torch.float32)
+            m = render_fn(_Replaced(shown_ref, J_v), geom, ws, ss, max_voxels)
+            J_v_map = np.where(unit_ref > 1e-9, m / np.where(unit_ref > 1e-9, unit_ref, 1.0), np.nan)
+            field_v[v] = float(np.nansum(J_v_map[band] - 1.0) * dV)
+
+        def stats(a):
+            a = np.asarray(a, dtype=np.float64)
+            a = a[np.isfinite(a)]
+            if a.size == 0:
+                return {'n': 0}
+            return {'n': int(a.size), 'mean': float(a.mean()), 'std': float(a.std(ddof=1)) if a.size > 1 else 0.0,
+                    'min': float(a.min()), 'max': float(a.max()),
+                    'p10': float(np.percentile(a, 10)), 'p90': float(np.percentile(a, 90))}
+
+        sel = {g: views[gate_of[views] == g] for g in (0, 1)}
+        by_gate = {f'gate{g}': {'air': stats(air_v[sel[g]]), 'field_band': stats(field_v[sel[g]]),
+                                'level': stats(levels[sel[g]])} for g in (0, 1)}
+        n_top = {g: max(1, int(round(float(peak_frac) * sel[g].size))) for g in (0, 1)}
+        top_insp = sel[insp][np.argsort(levels[sel[insp]] * (-1.0 if insp == 0 else 1.0))[::-1][:n_top[insp]]]
+        top_exp = sel[ref][np.argsort(levels[sel[ref]] * (-1.0 if insp == 0 else 1.0))[:n_top[ref]]]
+        view_stats = {
+            'definition': 'each live view rendered in its own state (gate contrast + free code). air_mm3: thorax '
+                          'air content of that state. field_band_mm3: (J - 1) x volume from the expiration '
+                          'gate-mean state to the view\'s state, summed over the lung window + band (the same '
+                          'integral as tidal_volume_mm3.band). Frozen (held-out) views are NaN.',
+            'n_views': int(views.size), 'seconds': float(_time.time() - t0),
+            'gate': [int(g) for g in gate_of], 'level': [float(v) for v in levels],
+            'air_mm3': [float(v) for v in air_v], 'field_band_mm3': [float(v) for v in field_v],
+            'by_gate': by_gate,
+            'tidal_volume_mm3': {
+                'density_gate_means': float(np.nanmean(air_v[sel[insp]]) - np.nanmean(air_v[sel[ref]])),
+                'density_extreme_views': float(np.nanmean(air_v[top_insp]) - np.nanmean(air_v[top_exp])),
+                'field_gate_means': float(np.nanmean(field_v[sel[insp]]) - np.nanmean(field_v[sel[ref]])),
+                'field_extreme_views': float(np.nanmean(field_v[top_insp]) - np.nanmean(field_v[top_exp])),
+                'extreme_frac': float(peak_frac)}}
+        log(f"  ventilation: {views.size} views read one by one in {view_stats['seconds']:.0f} s")
+
     lung_j, lung_sv = J[lung_i], sv[lung_i]
     out = {
         'definition': {
@@ -545,6 +617,7 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
         'tidal_volume_mm3': {'lung_parcels': dv_field, 'band': dv_band, 'window_all_parcels': dv_window_all,
                              'dilate_mm': float(dilate_mm), 'band_mm3': float(band.sum() * dV)},
         'peak': peak,
+        'per_view': view_stats,
         'breathing_trace': None if trace is None else {
             'levels': [float(v) for v in trace[0]], 'gate': [int(g) for g in np.where(motion.fixed[:, 0].detach().cpu().numpy() < 0, 0, 1)],
             'projection': [float(v) for v in trace[1]],
@@ -589,8 +662,6 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
     if gate_at is not None and n_lung:
         out['gate_over_lung'] = {'median': float(np.median(g_prim[lung_i])),
                                  'frac_below_0.5': float((g_prim[lung_i] < 0.5).mean())}
-        log(f"  air gate seen by the lung parcels: median {out['gate_over_lung']['median']:.2f}, "
-            f"{100 * out['gate_over_lung']['frac_below_0.5']:.0f} % below 0.5 (diagnostic; the reading is the realised J)")
     in_region = sample(region.astype(np.float32), geom, x_ref, order=0) > 0.5
     solid = in_region & (f_air < 0.1)
     out['per_primitive']['thorax'] = in_region      # for the strain figure
@@ -599,26 +670,104 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
         out['solid_tissue_strain'] = {
             'n': int(solid.sum()), 'rms': float(np.sqrt((js ** 2).mean())),
             'median': float(np.median(js)), 'p99': float(np.percentile(np.abs(js), 99))}
-        log(f"  solid tissue in the thorax ({int(solid.sum()):,} parcels, f_air < 0.1): "
-            f"|J - 1| rms {out['solid_tissue_strain']['rms']:.3f}, p99 "
-            f"{out['solid_tissue_strain']['p99']:.3f} — the field's error where volume cannot change")
     parts = motion.membership()
     if parts is not None and n_lung:
         arg = parts.argmax(dim=1).cpu().numpy()
         out['parts_overlap'] = {f'part{j}': float((arg[lung_i] == j).mean()) for j in range(motion.n_parts)}
-    log(f"  J = mean-inspiratory / mean-expiratory gate state; tidal volume {dv_field:.1f} mm^3 over the "
-        f"lung parcels, {dv_band:.1f} mm^3 over the window + {float(dilate_mm):g} mm band (all parcels)")
-    if peak is not None:
-        log(f"  peak states from the breathing levels (top {100 * peak['frac']:.0f} % of each gate's views): "
-            f"amplitude {peak['amplitude_over_gate_mean']:.2f}x the gate means; J median {peak['J']['median']:.3f}; "
-            f"tidal volume {peak['tidal_volume_mm3']['lung_parcels']:.1f} (lung parcels) / "
-            f"{peak['tidal_volume_mm3']['band']:.1f} mm^3 (band)")
-    log(f"  J median {out['J']['median']:.3f} (p10-p90 {out['J']['p10']:.3f}-{out['J']['p90']:.3f}, "
-        f"{100 * out['J']['frac_below_1']:.1f} % below 1); SV median {out['SV']['median']:.3f}; "
-        f"field volume change {dv_field:.1f} mm^3 vs the parcels' own air change {dv_parcels:.1f} mm^3 "
-        f"(ratio {out['field_over_parcels']:.2f}; the whole thorax's air change is {dv_image:.1f} mm^3, "
-        f"a share of it held by boundary parcels outside the lung window)")
+    for line in summary_table(out, reference_auto=(reference == 'auto')):
+        log(line)
     return out
+
+
+def summary_table(out: dict, *, reference_auto: bool = True) -> list:
+    """The ventilation record as log lines. Two readings of the same tidal
+    volume side by side — DENSITY (the measurement: thorax air content from
+    -HU/1000 per voxel) and FIELD (the deformation field's volume change over
+    the lung window + band) — between the gate-mean states, between the peak
+    states, and view by view when the per-view readings were made."""
+    ref, insp = int(out['reference_gate']), int(out['inspiration_gate'])
+    tv, air = out['tidal_volume_mm3'], out['air_mm3']
+    dv_image, dv_parcels = float(out['delta_air_image_mm3']), float(out['delta_air_parcels_mm3'])
+    peak, pv = out.get('peak'), out.get('per_view')
+    n_lung = int(out['n_lung_primitives'])
+    L = 44                                  # label column
+
+    def f(x):
+        return "n/a" if x is None or not np.isfinite(x) else f"{x:.1f}"
+
+    def row(label, density, field, note=""):
+        return f"    {label:<{L}}{density:>10}{field:>10}   {note}".rstrip()
+
+    def spread(st):
+        if not st or not st.get('n'):
+            return "n/a"
+        return f"{st['mean']:.1f} +- {st['std']:.1f}  [{st['min']:.1f} .. {st['max']:.1f}]"
+
+    lines = [f"  ventilation in mm^3  (expiration = gate {ref}" + (" by air content" if reference_auto else "")
+             + f", inspiration = gate {insp}; {n_lung:,} lung parcels)",
+             f"    DENSITY = thorax air content from -HU/1000 per voxel, the measurement; "
+             f"FIELD = (J - 1) x volume over the lung window + {tv['dilate_mm']:g} mm band, the model"]
+    # THE HEADLINE: the measured tidal volume with its spread. Every
+    # inspiration view paired with every expiration view is one breath's
+    # worth of air change; the distribution of those pairs gives the
+    # per-breath spread (breathing scatter plus the per-view code noise),
+    # its mean is the gate-mean reading, and the standard error of that mean
+    # follows from the two gates' scatter.
+    if pv is not None and pv.get('n_views'):
+        a = np.asarray(pv['air_mm3'], dtype=np.float64)
+        g = np.asarray(pv['gate'])
+        ai, ae = a[(g == insp) & np.isfinite(a)], a[(g == ref) & np.isfinite(a)]
+        if ai.size > 1 and ae.size > 1:
+            pairs = (ai[:, None] - ae[None, :]).ravel()
+            sem = float(np.sqrt(ai.var(ddof=1) / ai.size + ae.var(ddof=1) / ae.size))
+            pk = f";  peak-to-peak {f(peak.get('delta_air_image_mm3'))}" if peak is not None else ""
+            lines.append(f"    TIDAL VOLUME  {pairs.mean():.1f} +- {sem:.1f} mm^3 (mean of all inspiration-expiration view pairs, s.e.);  "
+                         f"per breath {pairs.mean():.1f} +- {pairs.std(ddof=1):.1f}, p10-p90 {np.percentile(pairs, 10):.1f}-"
+                         f"{np.percentile(pairs, 90):.1f}, min-max {pairs.min():.1f}-{pairs.max():.1f}{pk}")
+            lines.append("")
+    lines.append(row("tidal volume", "DENSITY", "FIELD"))
+    lines.append(row("  between the gate-mean states", f(dv_image), f(tv['band']),
+                     f"thorax air {air[f'gate{ref}']:.1f} -> {air[f'gate{insp}']:.1f}; field / density {tv['band'] / dv_image:.2f}"
+                     if abs(dv_image) > 1e-9 else f"thorax air {air[f'gate{ref}']:.1f} -> {air[f'gate{insp}']:.1f}"))
+    if peak is not None:
+        d_pk = peak.get('delta_air_image_mm3')
+        lines.append(row(f"  between the peak states (top {100 * peak['frac']:.0f} % of views)", f(d_pk),
+                         f(peak['tidal_volume_mm3']['band']),
+                         f"breathing amplitude {peak['amplitude_over_gate_mean']:.2f}x the gate means"))
+    if pv is not None and pv.get('n_views'):
+        t = pv['tidal_volume_mm3']
+        lines.append(row("  gate means of the per-view readings", f(t['density_gate_means']), f(t['field_gate_means']),
+                         f"{pv['n_views']} views read one by one"))
+        lines.append(row(f"  extreme views (top {100 * t['extreme_frac']:.0f} % by breathing level)",
+                         f(t['density_extreme_views']), f(t['field_extreme_views'])))
+        lines.append("    per view (mean +- std  [min .. max])" + " " * (L - 36)
+                     + f"{'DENSITY: thorax air':>28}{'FIELD: volume change from the expiration mean':>52}")
+        for g, name in ((ref, "expiration views"), (insp, "inspiration views")):
+            bg = pv['by_gate'][f'gate{g}']
+            label = "  %s (n=%d)" % (name, bg['air'].get('n', 0))
+            lines.append(f"    {label:<{L - 8}}{spread(bg['air']):>28}{spread(bg['field_band']):>52}")
+    lines.append(f"    lung parcels alone: own air change {f(dv_parcels)}, field {f(tv['lung_parcels'])} "
+                 f"({tv['lung_parcels'] / dv_parcels:.2f}x) — the field checked against the same tissue"
+                 if abs(dv_parcels) > 1e-9 else
+                 f"    lung parcels alone: own air change {f(dv_parcels)}, field {f(tv['lung_parcels'])}")
+    J, SV = out['J'], out['SV']
+    lines.append(f"    J over the lung parcels: median {J['median']:.3f} (p10-p90 {J['p10']:.3f}-{J['p90']:.3f}, "
+                 f"{100 * J['frac_below_1']:.1f} % below 1); SV median {SV['median']:.3f}"
+                 + (f"; peak J median {peak['J']['median']:.3f}" if peak is not None else ""))
+    checks = []
+    st = out.get('solid_tissue_strain')
+    if st:
+        checks.append(f"solid tissue |J - 1| rms {st['rms']:.3f}, p99 {st['p99']:.3f} over {st['n']:,} parcels "
+                      f"(the field's error where volume cannot change)")
+    g = out.get('gate_over_lung')
+    if g:
+        checks.append(f"air gate at the lung parcels median {g['median']:.2f}, {100 * g['frac_below_0.5']:.0f} % below 0.5")
+    po = out.get('parts_overlap')
+    if po:
+        checks.append("lung parcels by motion part " + ", ".join(f"{k} {100 * v:.0f} %" for k, v in po.items()))
+    for i, c in enumerate(checks):
+        lines.append(("    field checks: " if i == 0 else "                  ") + c)
+    return lines
 
 
 # ------------------------------------------------------------- the files --
@@ -663,7 +812,7 @@ def export_ventilation(cloud, motion, roi_geom: dict, world_scale: float,
                        pitch_mm: float = 0.3, reference='auto',
                        max_voxels: int | None = None, min_lung_mm3: float = MIN_LUNG_MM3,
                        dilate_mm: float = DILATE_MM, peak_frac: float = PEAK_FRAC,
-                       log=print) -> str | None:
+                       per_view: bool = True, log=print) -> str | None:
     """``<base>_ventilation.nrrd`` (the SV map), ``<base>_ventilation_J.nrrd``,
     ``<base>_ventilation.json`` (the numbers), ``<base>_ventilation.npz``
     (the per-primitive readings for the validation script) and
@@ -674,7 +823,8 @@ def export_ventilation(cloud, motion, roi_geom: dict, world_scale: float,
         return None
     res = compute(cloud, motion, roi_geom, world_scale, signal_scale, anchors,
                   pitch_mm=pitch_mm, reference=reference, max_voxels=max_voxels,
-                  min_lung_mm3=min_lung_mm3, dilate_mm=dilate_mm, peak_frac=peak_frac, log=log)
+                  min_lung_mm3=min_lung_mm3, dilate_mm=dilate_mm, peak_frac=peak_frac,
+                  per_view=per_view, log=log)
     base = base_path[:-4] if base_path.lower().endswith('.vff') else base_path
     geom = res['grid']
     fields = {'reference gate': str(res['reference_gate']),
@@ -742,13 +892,15 @@ def main(argv=None) -> int:
     ap.add_argument('--out', default=None, help='base path (default <result_dir>/recon)')
     ap.add_argument('--dilate-mm', type=float, default=DILATE_MM, help='band around the lung window for the all-parcel tidal volume')
     ap.add_argument('--peak-frac', type=float, default=PEAK_FRAC, help='share of each gate\'s views defining a peak state')
+    ap.add_argument('--no-per-view', action='store_true', help='skip the per-view readings (one render per view)')
     args = ap.parse_args(argv)
     from .show import load_run
     cloud, motion, geom, ws, ss, hu = load_run(args.result_dir)
     base = args.out or os.path.join(args.result_dir, 'recon')
     path = export_ventilation(cloud, motion, geom, ws, ss, LinearHU(*hu), base,
                               pitch_mm=args.pitch, reference=args.reference,
-                              dilate_mm=args.dilate_mm, peak_frac=args.peak_frac)
+                              dilate_mm=args.dilate_mm, peak_frac=args.peak_frac,
+                              per_view=not args.no_per_view)
     return 0 if path else 1
 
 

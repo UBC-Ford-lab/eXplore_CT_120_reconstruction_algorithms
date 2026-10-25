@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import DeleteJob from '../components/DeleteJob'
+import NoteEditor from '../components/NoteEditor'
 import { api, fmtDuration, fmtProgress, fmtTime, Job } from '../api'
 import { StatusTag } from './Jobs'
 
@@ -72,7 +73,7 @@ export default function JobDetail() {
         {job.package_version && <><div>Package</div><div>{job.package_version}</div></>}
         {job.output_path && <><div>Output</div><div className="mono span">{job.output_path}{job.output_path.endsWith('.vff') && job.status === 'finished' && <> · <Link to={`/view?machine=${encodeURIComponent(job.executor)}&path=${encodeURIComponent(job.output_path)}`} className="sans">view volume</Link></>}</div></>}
         {job.wandb_url && <><div>W&amp;B</div><div className="span"><a href={job.wandb_url} target="_blank" rel="noreferrer">{job.wandb_url}</a></div></>}
-        {job.note && <><div>Note</div><div className="span">{job.note}</div></>}
+        <div>Note</div><div className="span"><NoteEditor job={job} onSaved={setJob} block /></div>
         {job.error && <><div>Error</div><div className="error span">{job.error}</div></>}
         <div>Command</div><div className="mono wrap span">{job.shell ?? job.command.join(' ')}</div>
         <div>Log file</div><div className="mono span">{job.log_path ?? ''}</div>

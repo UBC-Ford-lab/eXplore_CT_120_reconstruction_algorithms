@@ -17,6 +17,7 @@ Routes (all under ``/api``):
   GET  /jobs                        recent jobs (``?status=`` filters)
   POST /jobs                        submit: {driver, algorithm, values, executor, note, resources}
   GET  /jobs/{id}                   one job
+  PATCH /jobs/{id}                  edit the note: {note}; any status
   GET  /jobs/{id}/log               the log from ``?offset=`` (bytes), for tailing
   GET  /jobs/{id}/files             the run's files (what delete-with-data removes)
   DELETE /jobs/{id}                 remove the record (``?data=true``: and the files + log)
@@ -76,6 +77,10 @@ class SubmitRequest(BaseModel):
     executor: str = 'local'
     note: str = ''
     resources: str = ''     # extra sbatch arguments (slurm machines)
+
+
+class NoteRequest(BaseModel):
+    note: str = ''
 
 
 class OutputRequest(BaseModel):
@@ -658,6 +663,18 @@ def create_app(settings: Settings, *, start_worker: bool = True) -> FastAPI:
         j = store.get(job_id)
         if j is None:
             raise HTTPException(404)
+        d = j.to_dict()
+        d['shell'] = shell_string(j.command)
+        return d
+
+    @app.patch('/api/jobs/{job_id}')
+    def edit_job(job_id: str, req: NoteRequest):
+        # The note is the one field a user may change after submitting; it
+        # is only ever shown, never passed to the run.
+        if store.get(job_id) is None:
+            raise HTTPException(404)
+        store.update(job_id, note=req.note.strip())
+        j = store.get(job_id)
         d = j.to_dict()
         d['shell'] = shell_string(j.command)
         return d

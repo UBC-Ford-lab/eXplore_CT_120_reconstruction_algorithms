@@ -126,6 +126,7 @@ export const api = {
   files: (id: string) => request<{ files: { path: string; dir: boolean; bytes: number }[]; output_path: string | null }>(`/api/jobs/${id}/files`),
   remove: (id: string, data: boolean) => request<{ deleted: string; files: any[] }>(`/api/jobs/${id}?data=${data}`, { method: 'DELETE' }),
   cancel: (id: string) => request<Job>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
+  setNote: (id: string, note: string) => request<Job>(`/api/jobs/${id}`, { method: 'PATCH', body: JSON.stringify({ note }) }),
   checkpoint: (id: string) => request<{ checkpoint: string | null; bytes: number | null; resumable: boolean }>(`/api/jobs/${id}/checkpoint`),
 }
 

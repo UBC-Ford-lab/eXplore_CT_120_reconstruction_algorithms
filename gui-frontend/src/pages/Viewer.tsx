@@ -27,10 +27,20 @@ export default function Viewer({ info }: { info: Info | null }) {
   const [preset, setPreset] = useState(PRESETS[wantWindow] ? wantWindow : wantWindow === 'auto' ? 'auto' : wantWindow.includes(',') ? 'custom' : 'full')
   const [slices, setSlices] = useState<Partial<Record<Axis, Slice>>>({})
   const [hover, setHover] = useState<{ axis: Axis; r: number; c: number; v: number } | null>(null)
+  // one view enlarged over the whole window (its own slider on top); Escape closes it
+  // ?view=x|y|z opens that view enlarged
+  const [focus, setFocus] = useState<Axis | null>((AXES as string[]).includes(params.get('view') ?? '') ? params.get('view') as Axis : null)
+  useEffect(() => {
+    if (!focus) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFocus(null) }
+    window.addEventListener('keydown', onKey)
+    document.body.classList.add('no-scroll')
+    return () => { window.removeEventListener('keydown', onKey); document.body.classList.remove('no-scroll') }
+  }, [focus])
 
   // open a volume: header first, then the middle slices
   useEffect(() => {
-    if (!path) { setVol(null); setSlices({}); return }
+    if (!path) { setVol(null); setSlices({}); setFocus(null); return }
     setError(null); setVol(null); setSlices({})
     api.volumeInfo(machine, path).then(v => {
       setVol(v)
@@ -75,6 +85,36 @@ export default function Viewer({ info }: { info: Info | null }) {
   }
   const spacing = vol?.spacing ?? [1, 1, 1]
   const units = vol?.units === 'HU' ? 'HU' : ''
+  const readout = hover ? `${AXIS_NAME[hover.axis].split(' ')[0]} · ${hover.c}, ${hover.r} · ${hover.v}${units ? ' ' + units : ''}` : `x ${pos[0]} · y ${pos[1]} · z ${pos[2]}`
+  function renderView(axis: Axis, big: boolean) {
+    if (!vol) return null
+    const n = axis === 'x' ? vol.size[0] : axis === 'y' ? vol.size[1] : vol.size[2]
+    const index = axis === 'x' ? pos[0] : axis === 'y' ? pos[1] : pos[2]
+    // pixel aspect (height/width) from the voxel spacing of the two in-plane axes
+    const aspect = axis === 'z' ? spacing[1] / spacing[0] : axis === 'y' ? spacing[2] / spacing[0] : spacing[2] / spacing[1]
+    // crosshair: column/row of the other two axes in this plane
+    const cross: [number, number] = axis === 'z' ? [pos[0], pos[1]] : axis === 'y' ? [pos[0], pos[2]] : [pos[1], pos[2]]
+    return (
+      <div className={`view${big ? ' big' : ''}`} key={axis}>
+        <div className="view-head">
+          <b>{AXIS_NAME[axis]}</b>
+          <input type="range" min={0} max={n - 1} value={index} onChange={e => setPos(p => { const q: [number, number, number] = [...p]; q[axis === 'x' ? 0 : axis === 'y' ? 1 : 2] = Number(e.target.value); return q })} />
+          <span className="mono small">{index} / {n - 1}</span>
+          {big && <span className="mono small faint view-readout">{readout}</span>}
+          <button type="button" className="quiet view-full" title={big ? 'back to the three views (Esc)' : 'show only this view, full window'}
+            onClick={() => setFocus(big ? null : axis)}>{big ? '✕' : '⤢'}</button>
+        </div>
+        <SliceCanvas slice={slices[axis]} win={win} aspect={aspect} cross={cross} fit={big}
+          onWheel={d => setPos(p => { const q: [number, number, number] = [...p]; const k = axis === 'x' ? 0 : axis === 'y' ? 1 : 2; q[k] = Math.max(0, Math.min(n - 1, q[k] + d)); return q })}
+          onHover={(r, c, v) => setHover(r < 0 ? null : { axis, r, c, v })}
+          onClick={(r, c) => setPos(p => {
+            const q: [number, number, number] = [...p]
+            if (axis === 'z') { q[0] = c; q[1] = r } else if (axis === 'y') { q[0] = c; q[2] = r } else { q[1] = c; q[2] = r }
+            return q
+          })} />
+      </div>
+    )
+  }
   const executors = info?.executors ?? []
   return (
     <>
@@ -113,37 +153,12 @@ export default function Viewer({ info }: { info: Info | null }) {
               <label>centre <input type="number" value={Math.round(win[0])} onChange={e => { setPreset('custom'); setWin([Number(e.target.value), win[1]]) }} /></label>
               <label>width <input type="number" value={Math.round(win[1])} min={1} onChange={e => { setPreset('custom'); setWin([win[0], Math.max(1, Number(e.target.value))]) }} /></label>
             </span>
-            <span className="viewer-readout mono small">
-              {hover ? `${AXIS_NAME[hover.axis].split(' ')[0]} · ${hover.c}, ${hover.r} · ${hover.v}${units ? ' ' + units : ''}` : `x ${pos[0]} · y ${pos[1]} · z ${pos[2]}`}
-            </span>
+            <span className="viewer-readout mono small">{readout}</span>
           </div>
           <div className="viewer-grid">
-            {AXES.map(axis => {
-              const n = axis === 'x' ? vol.size[0] : axis === 'y' ? vol.size[1] : vol.size[2]
-              const index = axis === 'x' ? pos[0] : axis === 'y' ? pos[1] : pos[2]
-              // pixel aspect (height/width) from the voxel spacing of the two in-plane axes
-              const aspect = axis === 'z' ? spacing[1] / spacing[0] : axis === 'y' ? spacing[2] / spacing[0] : spacing[2] / spacing[1]
-              // crosshair: column/row of the other two axes in this plane
-              const cross: [number, number] = axis === 'z' ? [pos[0], pos[1]] : axis === 'y' ? [pos[0], pos[2]] : [pos[1], pos[2]]
-              return (
-                <div className="view" key={axis}>
-                  <div className="view-head">
-                    <b>{AXIS_NAME[axis]}</b>
-                    <input type="range" min={0} max={n - 1} value={index} onChange={e => setPos(p => { const q: [number, number, number] = [...p]; q[axis === 'x' ? 0 : axis === 'y' ? 1 : 2] = Number(e.target.value); return q })} />
-                    <span className="mono small">{index} / {n - 1}</span>
-                  </div>
-                  <SliceCanvas slice={slices[axis]} win={win} aspect={aspect} cross={cross}
-                    onWheel={d => setPos(p => { const q: [number, number, number] = [...p]; const k = axis === 'x' ? 0 : axis === 'y' ? 1 : 2; q[k] = Math.max(0, Math.min(n - 1, q[k] + d)); return q })}
-                    onHover={(r, c, v) => setHover(r < 0 ? null : { axis, r, c, v })}
-                    onClick={(r, c) => setPos(p => {
-                      const q: [number, number, number] = [...p]
-                      if (axis === 'z') { q[0] = c; q[1] = r } else if (axis === 'y') { q[0] = c; q[2] = r } else { q[1] = c; q[2] = r }
-                      return q
-                    })} />
-                </div>
-              )
-            })}
+            {AXES.map(axis => renderView(axis, false))}
           </div>
+          {focus && <div className="view-overlay">{renderView(focus, true)}</div>}
           <p className="note">Slices are read where the volume lives and shown in on-disk index order (rows down, columns right); click to move the crosshair, scroll or use the slider to change slice. Vendor volumes keep the vendor's axis conventions.</p>
         </div>
       )}
@@ -152,11 +167,25 @@ export default function Viewer({ info }: { info: Info | null }) {
   )
 }
 
-function SliceCanvas({ slice, win, aspect, cross, onHover, onClick, onWheel }: {
-  slice?: Slice; win: [number, number]; aspect: number; cross: [number, number]
+function SliceCanvas({ slice, win, aspect, cross, fit = false, onHover, onClick, onWheel }: {
+  slice?: Slice; win: [number, number]; aspect: number; cross: [number, number]; fit?: boolean
   onHover: (r: number, c: number, v: number) => void; onClick: (r: number, c: number) => void; onWheel: (delta: number) => void
 }) {
   const ref = useRef<HTMLCanvasElement>(null)
+  const box = useRef<HTMLDivElement>(null)
+  // fit: scale the slice (up or down) to the largest aspect-correct rectangle inside the box
+  const [boxSize, setBoxSize] = useState<[number, number]>([0, 0])
+  useEffect(() => {
+    if (!fit || !box.current) return
+    const ro = new ResizeObserver(([e]) => setBoxSize([e.contentRect.width, e.contentRect.height]))
+    ro.observe(box.current)
+    return () => ro.disconnect()
+  }, [fit])
+  let size: React.CSSProperties = { aspectRatio: slice ? `${slice.cols} / ${slice.rows * aspect}` : '1 / 1' }
+  if (fit && slice && boxSize[0] > 0 && boxSize[1] > 0) {
+    const k = Math.min(boxSize[0] / slice.cols, boxSize[1] / (slice.rows * aspect))
+    size = { width: `${Math.floor(slice.cols * k)}px`, height: `${Math.floor(slice.rows * aspect * k)}px`, maxWidth: 'none', maxHeight: 'none' }
+  }
   const img = useMemo(() => {
     if (!slice) return null
     const { rows, cols, data } = slice
@@ -188,8 +217,8 @@ function SliceCanvas({ slice, win, aspect, cross, onHover, onClick, onWheel }: {
     return c >= 0 && r >= 0 && c < slice.cols && r < slice.rows ? [r, c] : null
   }
   return (
-    <div className="view-box">
-      <canvas ref={ref} style={{ aspectRatio: slice ? `${slice.cols} / ${slice.rows * aspect}` : '1 / 1' }}
+    <div className="view-box" ref={box}>
+      <canvas ref={ref} style={size}
         onMouseMove={e => { const v = voxelAt(e); if (v && slice) onHover(v[0], v[1], slice.data[v[0] * slice.cols + v[1]]) }}
         onMouseLeave={() => onHover(-1, -1, 0)}
         onWheel={e => { e.preventDefault(); onWheel(e.deltaY > 0 ? 1 : -1) }}

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api, fmtDuration, fmtTime, Job } from '../api'
+import NoteEditor from '../components/NoteEditor'
 
 export function StatusTag({ s }: { s: Job['status'] }) { return <span className={`st ${s}`}><span className={`dot ${s}`} />{s}</span> }
 
@@ -55,7 +56,7 @@ export default function Jobs() {
                 <td className="faint">{fmtTime(j.started ?? j.created)}</td>
                 <td className="num">{fmtDuration(j.duration)}{j.status === 'running' && j.progress?.fraction != null && <span className="faint"> · {Math.round(j.progress.fraction * 100)} %</span>}</td>
                 <td className="mono clip small" title={j.output_path ?? ''}>{j.output_path ? j.output_path.split('/').pop() : ''}</td>
-                <td className="clip">{j.note}</td>
+                <td className="clip note"><NoteEditor job={j} onSaved={u => setJobs(js => js.map(x => x.id === u.id ? u : x))} /></td>
                 <td>{!ACTIVE.includes(j.status) && <button className="quiet" onClick={e => remove(e, j)} title="remove the record; files stay">✕</button>}</td>
               </tr>
             ))}
