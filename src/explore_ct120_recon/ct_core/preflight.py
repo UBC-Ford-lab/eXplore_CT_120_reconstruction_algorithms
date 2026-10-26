@@ -62,7 +62,7 @@ import math
 from dataclasses import dataclass, field
 
 from .errors import PreflightAbort
-from .utils import query_gpu_memory
+from .utils import gpu_holders, query_gpu_memory
 
 GiB = float(2 ** 30)
 
@@ -558,6 +558,17 @@ def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
         print(f"  GPU:    {report.gpu_name} — "
               f"need ~{gpu_b / GiB:.1f} GiB VRAM, "
               f"{report.vram_free / GiB:.1f} GiB free")
+        # A short figure usually means another process is sitting on the
+        # card (a job the GUI thinks it cancelled, a second driver started by
+        # hand), not a small card. Name it, so the fix is to end that process
+        # rather than to --skip-preflight into a crawl.
+        holders = gpu_holders(gpu_index)
+        if holders:
+            desc = ', '.join(
+                f"{h['name']} (pid {h['pid']})"
+                + (f" {h['bytes'] / GiB:.1f} GiB" if h['bytes'] is not None else '')
+                for h in holders)
+            print(f"  Held by: {desc}")
     if report.ram_free is not None:
         print(f"  RAM:    need ~{host_b / GiB:.1f} GiB, "
               f"{report.ram_free / GiB:.1f} GiB available")
@@ -597,8 +608,10 @@ def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
             logger.abort(reason)
         raise PreflightAbort(reason)
     if report.fatal and skip:
-        print("  (--skip-preflight: continuing anyway — expect an OOM or "
-              "a crash)")
+        print("  (--skip-preflight: continuing anyway — expect an OOM, a "
+              "crash, or a run many times slower than normal: the backends "
+              "size their chunks to the free memory, and a card held by "
+              "another process leaves them crumbs)")
     elif report.verdict == "tight":
         print("  (tight fit — expect heavy memory pressure; consider "
               "--downsample or a smaller FOV)")

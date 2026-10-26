@@ -470,11 +470,20 @@ class LocalExecutor(Executor):
         if not pid or pid < 0:
             return False
         store.update(job.id, status='cancelled')
+        # Ask politely first (the drivers checkpoint on SIGTERM / Ctrl-Break),
+        # then make sure. The interrupt can fail to be delivered at all — on
+        # Windows GenerateConsoleCtrlEvent only reaches processes sharing the
+        # server's console, and a job runs in a hidden one of its own — and
+        # that used to return here with the force kill never scheduled: the
+        # job showed as cancelled, its slot was reused, and the process kept
+        # running on the GPU for the full hour, so the next job found the
+        # card and the RAM full.
         try:
             _interrupt_group(pid)
+            grace = 20.0
         except (ProcessLookupError, OSError):
-            return True
-        threading.Thread(target=self._kill_after, args=(pid, 20.0), daemon=True).start()
+            grace = 0.0
+        threading.Thread(target=self._kill_after, args=(pid, grace), daemon=True).start()
         return True
 
     @staticmethod
