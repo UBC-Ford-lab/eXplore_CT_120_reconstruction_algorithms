@@ -248,7 +248,7 @@ export default function NewJob({ info }: { info: Info | null }) {
         {fromJob && schema && (
           <p className="note">{params.get('resume')
             ? <>Continuing job <span className="mono">{fromJob.id}</span> from its checkpoint: same flags and output, <span className="mono">--gauss-resume</span> added. Training picks up at the iteration the checkpoint records and runs to <span className="mono">--iterations</span>.</>
-            : <>Flags copied from job <span className="mono">{fromJob.id}</span>.</>}</p>
+            : <>Every setting copied from job <span className="mono">{fromJob.id}</span> ({fromJob.status}); submit to run it again, or change anything first.</>}</p>
         )}
         {filtered && <Form schema={filtered} values={values} setValues={setValues} scans={scans} showAll={showAll} machine={machine} afterInput={<>
           {driver === 'learned' && algorithm && DETAIL_ALGORITHMS.includes(algorithm) && schema && (

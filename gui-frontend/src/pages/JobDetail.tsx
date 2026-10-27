@@ -54,6 +54,11 @@ export default function JobDetail() {
         {job.duration != null && <span className="faint">{fmtDuration(job.duration)}{active ? ' so far' : ''}</span>}
         <div className="right actions" style={{ margin: 0 }}>
           {active && <button onClick={() => api.cancel(job.id).then(setJob).catch(e => setError(e.message))}>Cancel</button>}
+          {!active && (
+            <button className={ckpt?.resumable ? undefined : 'primary'}
+              title="open the new-job page with this run's driver, algorithm, machine and every submitted value filled in, ready to submit"
+              onClick={() => nav(`/new?from=${encodeURIComponent(job.id)}`)}>Re-run…</button>
+          )}
           {!active && ckpt?.resumable && ckpt.checkpoint && (
             <button className="primary" title={`continue this run from ${ckpt.checkpoint}: the same flags and output, --gauss-resume added`}
               onClick={() => nav(`/new?from=${encodeURIComponent(job.id)}&resume=${encodeURIComponent(ckpt.checkpoint!)}`)}>Resume…</button>
