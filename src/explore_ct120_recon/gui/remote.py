@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shlex
 import socket
@@ -496,6 +497,94 @@ done
 exit "$_ct120_rc"'''
 
 
+# -- fair share --------------------------------------------------------------
+# Slurm recomputes fair share every PriorityCalcPeriod (5 min on the Alliance
+# clusters), so reading it more often shows nothing new.
+FAIRSHARE_TTL = 300.0
+
+# The user's own accounts, then one row per account (blank user) and one per
+# user of it. RawUsage is decayed billing-seconds; TRESRunMins holds the
+# billing-minutes the running jobs still have to charge.
+FAIRSHARE_COMMAND = (
+    'acc=$(sshare -P -n -U -o Account 2>/dev/null | sort -u | paste -sd, -); '
+    '[ -n "$acc" ] && sshare -P -n -l -A "$acc" '
+    '-o Account,User,NormShares,RawUsage,EffectvUsage,FairShare,LevelFS,TRESRunMins 2>/dev/null')
+HALF_LIFE_COMMAND = "scontrol show config 2>/dev/null | sed -n 's/^PriorityDecayHalfLife *= *//p'"
+
+
+def _slurm_duration_s(text: str) -> Optional[float]:
+    """'7-00:00:00', '12:00:00', '30:00' -> seconds; None if unreadable."""
+    text = (text or '').strip()
+    try:
+        days, _, rest = text.rpartition('-')
+        parts = [float(x) for x in rest.split(':')]
+        while len(parts) < 3:
+            parts.insert(0, 0.0)
+        h, m, sec = parts[-3:]
+        return (float(days) if days else 0.0) * 86400 + h * 3600 + m * 60 + sec
+    except ValueError:
+        return None
+
+
+def _float(text: str) -> Optional[float]:
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_fairshare(text: str, user: str, half_life_s: Optional[float]) -> list[dict]:
+    """One entry per account of ``user`` from :data:`FAIRSHARE_COMMAND`'s output.
+
+    ``level_fs`` is the account's share over its decayed usage (1 = exactly
+    its share; Fair Tree orders accounts by it), ``rank`` is the user's
+    FairShare factor (a rank among all users, 0-1), ``user_level_fs`` the
+    user's standing inside the account. The forecasts assume the rest of the
+    cluster keeps its usage steady, so that the account's usage relative to
+    everyone's decays with the half-life alone: idle, LevelFS doubles every
+    half-life; the running jobs first add their remaining billing.
+    """
+    accounts: dict[str, dict] = {}
+    for line in text.splitlines():
+        f = line.strip().split('|')
+        if len(f) < 8:
+            continue
+        acct, who = f[0].strip(), f[1].strip()
+        tres = dict(kv.split('=', 1) for kv in f[7].split(',') if '=' in kv)
+        row = {'norm_shares': _float(f[2]), 'raw_usage': _float(f[3]), 'effective_usage': _float(f[4]),
+               'fairshare': _float(f[5]), 'level_fs': _float(f[6]),
+               'running_billing_s': (_float(tres.get('billing')) or 0.0) * 60}
+        a = accounts.setdefault(acct, {'account': acct})
+        if not who:
+            a['group'] = row
+        elif who == user:
+            a['user'] = row
+    out = []
+    for acct, a in accounts.items():
+        g, u = a.get('group'), a.get('user')
+        if g is None or u is None:
+            continue
+        level = g['level_fs']
+        level = None if level is None or level != level or level == float('inf') else level
+        e = {'account': acct, 'kind': 'gpu' if acct.endswith('_gpu') else 'cpu' if acct.endswith('_cpu') else '',
+             'level_fs': level, 'rank': u['fairshare'], 'user_level_fs': u['level_fs'],
+             'half_life_days': half_life_s / 86400 if half_life_s else None,
+             'running_share': None, 'fair_in_days_idle': None, 'fair_in_days_after_running': None,
+             'level_fs_after_running': None}
+        used, running = g['raw_usage'] or 0.0, g['running_billing_s']
+        if used > 0:
+            e['running_share'] = running / used
+        if level is not None and half_life_s:
+            T = half_life_s / 86400
+            e['fair_in_days_idle'] = max(0.0, T * math.log2(1.0 / level)) if level > 0 else None
+            after = level * used / (used + running) if used > 0 else level
+            e['level_fs_after_running'] = after
+            e['fair_in_days_after_running'] = max(0.0, T * math.log2(1.0 / after)) if after > 0 else None
+        out.append(e)
+    out.sort(key=lambda e: (e['kind'] != 'gpu', e['account']))
+    return out
+
+
 class SlurmExecutor(RemoteExecutor):
     """Submits drivers with ``sbatch`` from the machine's template."""
 
@@ -504,6 +593,50 @@ class SlurmExecutor(RemoteExecutor):
     def __init__(self, machine: Machine, control_dir: Path, log_dir: Path, env: Optional[dict] = None):
         super().__init__(machine, control_dir, log_dir, env)
         self.slots = 50   # the scheduler queues; the GUI does not need to
+        self._fairshare: tuple[float, Optional[dict]] = (0.0, None)
+        self._half_life_s: Optional[float] = None    # read once, with the remote user name
+        self._user = ''
+        self._fairshare_busy = False
+
+    def describe(self, fresh: bool = False) -> dict:
+        d = super().describe(fresh)
+        if d.get('status') == 'connected':
+            d['fairshare'] = self.fairshare()
+        return d
+
+    def fairshare(self) -> Optional[dict]:
+        """The user's fair-share standing as last read. A read older than
+        :data:`FAIRSHARE_TTL` starts one refresh in the background (an SSH
+        round trip to a login node takes seconds), so the page never waits
+        for it and gets the new value on its next poll. A failed read is
+        kept as None for the same TTL, so a cluster without sshare is not
+        asked again on every poll."""
+        with self._lock:
+            at, cached = self._fairshare
+            due = (not at or time.time() - at >= FAIRSHARE_TTL) and not self._fairshare_busy
+            if due:
+                self._fairshare_busy = True
+        if due:
+            threading.Thread(target=self._read_fairshare, daemon=True).start()
+        return cached
+
+    def _read_fairshare(self) -> None:
+        now, result = time.time(), None
+        try:
+            if self._half_life_s is None:
+                once = self.conn.run(f'id -un; {HALF_LIFE_COMMAND}', timeout=30).stdout.splitlines() + ['', '']
+                self._user = once[0].strip()
+                self._half_life_s = _slurm_duration_s(once[1]) or 0.0
+            r = self.conn.run(FAIRSHARE_COMMAND, timeout=30)
+            accounts = parse_fairshare(r.stdout, self._user, self._half_life_s or None)
+            if accounts:
+                result = {'fetched': now, 'accounts': accounts}
+        except Exception:
+            result = None
+        with self._lock:
+            # keep showing the last good read if this one failed
+            self._fairshare = (now, result if result is not None else self._fairshare[1])
+            self._fairshare_busy = False
 
     def render(self, job: Job) -> str:
         remote_log = f'{self._remote_dir()}/logs/{job.id}.log'

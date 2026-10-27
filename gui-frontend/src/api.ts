@@ -6,6 +6,12 @@ export interface QueueRow {
   id: string; name: string; state: string; elapsed: string; limit: string; nodes: string
   cpus: string; memory: string; gres: string; where: string; partition: string; job?: string | null
 }
+// the user's fair-share standing on a Slurm cluster, per account (see gui/remote.py parse_fairshare)
+export interface FairShareAccount {
+  account: string; kind: 'gpu' | 'cpu' | ''; level_fs: number | null; rank: number | null; user_level_fs: number | null
+  half_life_days: number | null; running_share: number | null; level_fs_after_running: number | null
+  fair_in_days_idle: number | null; fair_in_days_after_running: number | null
+}
 export interface MachineConfig {
   name: string; type: 'local' | 'ssh' | 'slurm'; host: string; python: string; workdir: string; scans_root: string
   slots: number; env: Record<string, string>; sbatch_template: string | null; template_is_default?: boolean; connection?: 'auto' | 'openssh' | 'library'
@@ -17,6 +23,7 @@ export interface Machine {
   gpus: Gpu[]; slots: number; running: string[]; pending: string[]; cwd: string
   package: { version: string | null; commit: string | null; python: string | null }
   queue?: { running: number; pending: number; jobs: QueueRow[] } | null
+  fairshare?: { fetched: number; accounts: FairShareAccount[] } | null
   login_command?: string
   config: MachineConfig
 }

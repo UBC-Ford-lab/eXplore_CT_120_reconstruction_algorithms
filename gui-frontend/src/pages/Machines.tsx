@@ -1,9 +1,40 @@
 import { Link } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { api, Info, Machine, MachineConfig } from '../api'
+import { api, FairShareAccount, Info, Machine, MachineConfig } from '../api'
 import LoginTerminal from '../components/LoginTerminal'
+import Hint from '../components/Hint'
 
 function gib(x: number | null | undefined) { return x == null ? '?' : x.toFixed(1) }
+
+function days(d: number) { return d < 1 ? `${Math.max(1, Math.round(d * 24))} h` : `${d.toFixed(1)} d` }
+function num(x: number) { return x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2) }
+
+function FairShareLine({ a }: { a: FairShareAccount }) {
+  const T = a.half_life_days != null ? `${+a.half_life_days.toFixed(1)}` : '?'
+  const label = a.kind ? a.kind.toUpperCase() : a.account
+  return (
+    <div className="acct">
+      <span>{label} </span>
+      {a.level_fs == null ? <span className="muted">no usage yet</span> : <>
+        <b>{num(a.level_fs)}</b>
+        <Hint text={`Share of ${a.account} divided by its recent usage (Slurm's LevelFS). 1 means the group is using exactly its allocated share. Below 1 it has used more than its share, so its jobs are queued behind groups that have used less. Above 1 it has used less. Usage is counted with a ${T}-day half-life.`} />
+      </>}
+      {a.rank != null && <> · rank {a.rank.toFixed(2)}
+        <Hint text={`Your FairShare priority factor, 0 to 1. It is your position when every user on the cluster is sorted by fair share, with 1 meaning first in line. It is a rank, not a ratio, so 0.5 does not mean fair, and it moves when other groups' usage changes too. It is the part of your job priority that comes from fair share.${a.user_level_fs != null ? ` Inside ${a.account} your own LevelFS is ${num(a.user_level_fs)}, which only matters relative to other members of the group.` : ''}`} />
+      </>}
+      {a.level_fs != null && (a.level_fs >= 1
+        ? <> · <span className="muted">within its share</span></>
+        : <>
+          {a.fair_in_days_idle != null && <> · fair in {days(a.fair_in_days_idle)} if idle
+            <Hint text={`Time until the group's LevelFS climbs back to 1 if nothing more runs from now. Recorded usage halves every ${T} days, so LevelFS doubles every ${T} days. This assumes the rest of the cluster keeps its usage steady; it is an estimate, and the rank above cannot be forecast this way.`} />
+          </>}
+          {a.fair_in_days_after_running != null && (a.running_share ?? 0) > 0.005 && <>, {days(a.fair_in_days_after_running)} after running jobs
+            <Hint text={`The same, but first charging what the group's running jobs still have to use if they run to their time limit: ${Math.round(100 * (a.running_share ?? 0))} % of its current usage, which takes LevelFS down to about ${num(a.level_fs_after_running ?? 0)}. Counted from when those jobs end; jobs that finish early make it shorter. Pending jobs are not counted.`} />
+          </>}
+        </>)}
+    </div>
+  )
+}
 
 const EMPTY: MachineConfig = { name: '', type: 'ssh', host: '', python: 'python', workdir: '~', scans_root: '', slots: 1, env: {}, sbatch_template: null, connection: 'auto' }
 
@@ -111,6 +142,11 @@ function MachineCard({ m, onChanged }: { m: Machine; onChanged: () => void }) {
           <div>Package</div><div>{m.package.version ?? <span className="error">not importable with {m.config.python}</span>}{m.package.commit ? ` (${m.package.commit})` : ''}{m.package.python ? ` · Python ${m.package.python}` : ''}</div>
           <div>Jobs run in</div><div className="mono">{m.cwd}</div>
           {m.kind === 'slurm' && m.queue && <><div>Your queue</div><div>{m.queue.running} running · {m.queue.pending} pending{m.queue.jobs.length > m.queue.running + m.queue.pending ? ` · ${m.queue.jobs.length - m.queue.running - m.queue.pending} other` : ''}</div></>}
+          {m.kind === 'slurm' && m.fairshare && m.fairshare.accounts.length > 0 && <>
+            <div>Fair share<Hint text="Your standing in the scheduler's fair-share ordering, per Slurm account; GPU and CPU jobs are charged to separate accounts with separate shares. Read with sshare at most every 5 minutes, which is how often Slurm recomputes it." /></div>
+            <div className="fairshare">{m.fairshare.accounts.map(a => <FairShareLine key={a.account} a={a} />)}
+              <div className="faint small">read {Math.max(0, Math.round((Date.now() / 1000 - m.fairshare.fetched) / 60))} min ago</div></div>
+          </>}
           <div>Jobs from here</div><div>{m.running.length} running{m.pending.length ? `, ${m.pending.length} pending` : ''}{m.kind !== 'slurm' ? ` of ${m.slots} slots` : ''}</div>
         </div>
       )}

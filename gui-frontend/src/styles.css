@@ -396,3 +396,10 @@ td.note { max-width: 18rem; }
 tr:hover .note-empty, tr:hover .note-pen, .note-cell:hover .note-empty, .note-cell:hover .note-pen { opacity: 1; }
 .note-cell.busy { opacity: 0.5; }
 input.note-input { width: 100%; min-width: 10rem; font: inherit; padding: 0.05rem 0.3rem; margin: -0.05rem 0; }
+
+/* hover help: a "?" with a popover */
+.hint { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 1.05em; height: 1.05em; margin-left: 0.25em; border: 1px solid var(--ink-3); border-radius: 50%; font-size: 0.72rem; line-height: 1; color: var(--ink-2); cursor: help; vertical-align: 0.1em; user-select: none; }
+.hint:hover, .hint:focus { color: var(--ink); border-color: var(--ink-2); outline: none; }
+.hint-pop { display: none; position: absolute; z-index: 20; left: 50%; top: calc(100% + 0.35rem); transform: translateX(-50%); width: max-content; max-width: min(24rem, 80vw); padding: 0.45rem 0.6rem; background: var(--panel); color: var(--ink); border: 1px solid var(--hair); border-radius: 4px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); font-size: 0.82rem; line-height: 1.4; text-align: left; white-space: normal; font-weight: normal; letter-spacing: normal; text-transform: none; }
+.hint:hover .hint-pop, .hint:focus .hint-pop { display: block; }
+.fairshare .acct + .acct { margin-top: 0.1rem; }
