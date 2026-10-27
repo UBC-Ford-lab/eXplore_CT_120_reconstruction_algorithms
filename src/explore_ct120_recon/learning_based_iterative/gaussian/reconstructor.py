@@ -1406,17 +1406,26 @@ class GaussianReconstructor(LearnedReconstructor):
 
     @torch.no_grad()
     def _export(self, cloud, domain) -> np.ndarray:
-        """Query the cloud on the reconstruction grid, in mu mm^-1.
+        """Query the cloud on the EXPORT grid, in mu mm^-1.
 
-        Note this is the grid ``geometry['vol_shape']`` describes — the driver
-        crops it to the export ROI afterwards, exactly as it does for every
-        other backend, so the delivered volume and its slice indices line up
-        with every other algorithm's.
+        The export ROI as a sub-grid of the reconstruction domain
+        (`export_grid_geometry`, the lattice arithmetic of the driver's
+        crop, so the delivered voxels and their slice indices are the ones
+        every other backend delivers). Not the whole domain: a cloud is
+        evaluated wherever it is asked, and the domain at a fine pitch is
+        most of the machine's RAM for voxels nobody keeps (Scan_1959 at
+        50 um: 3.97 G voxels, 14.8 GiB on the host, of which the ROI was
+        1.4 GiB). `crop_to_export_roi` recognises the sub-grid and passes
+        it through. Without an export ROI the two grids are the same.
         """
-        nx, ny, nz = (int(v) for v in self.geometry['vol_shape'])
+        geom = export_grid_geometry(self.geometry)
+        nx, ny, nz = (int(v) for v in geom['vol_shape'])
+        dom = tuple(int(v) for v in self.geometry['vol_shape'])
+        where = ('' if geom is self.geometry
+                 else f" (export ROI of the {dom[0]}x{dom[1]}x{dom[2]} domain)")
         print(f"  exporting {nx}x{ny}x{nz} = {nx*ny*nz/1e6:.1f} M voxels "
-              f"at {float(self.geometry['dx']):.4f} mm")
-        return self._render_grid(cloud, self.geometry)
+              f"at {float(geom['dx']):.4f} mm{where}")
+        return self._render_grid(cloud, geom)
 
     def _render_grid(self, cloud, geom: dict) -> np.ndarray:
         """Query the cloud on the grid ``geom`` describes, in mu mm^-1.

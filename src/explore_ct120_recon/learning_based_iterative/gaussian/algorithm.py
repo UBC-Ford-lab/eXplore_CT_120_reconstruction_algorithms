@@ -575,7 +575,7 @@ def footprint_stages(args, req: MachineRequest) -> dict:
     # Scan_1510's 75 um / ds3 export the preflight under-read the peak by
     # 3.70 GiB and passed a configuration that OOMs at the final step. The
     # sinogram is still resident then, and the cloud is queried in place.
-    slab = (min(int(req.vol_bytes) // 4, DEFAULT_MAX_VOXELS)
+    slab = (min(int(req.export_bytes) // 4, DEFAULT_MAX_VOXELS)
             * BYTES_PER_SLAB_VOXEL)
     export = resident * sino + slab + n * EXPORT_BYTES_PER_GAUSSIAN
     return {'seed': int(seed), 'train': int(train), 'export': int(export)}
@@ -588,7 +588,9 @@ def footprint(args, req: MachineRequest) -> Footprint:
     peak = max(stages.values())
     return Footprint(
         persistent_gpu_bytes=peak,
-        host_bytes=2 * req.sino_bytes + req.vol_bytes,
+        # The host holds the DELIVERED grid, not the domain: the cloud is
+        # rendered on the export ROI directly (`GaussianReconstructor._export`).
+        host_bytes=2 * req.sino_bytes + req.export_bytes,
         gpu_required=True,
         # A splat step consumes a whole view, never a ray batch, so there is no
         # marginal per-sample term for `auto_rays_per_batch` to solve for.
@@ -601,7 +603,8 @@ def footprint(args, req: MachineRequest) -> Footprint:
                f"measured; nvidia-smi will show more, that is the cache).",
                "One full view per step; --rays-per-batch is not used.",
                f"Export: {DEFAULT_MAX_VOXELS/1e6:.0f} M-voxel slabs on the "
-               f"device, {req.vol_bytes/2**30:.2f} GiB assembled on the host; "
+               f"device, {req.export_bytes/2**30:.2f} GiB (the export ROI) "
+               f"assembled on the host; "
                f"the slab halves itself on OOM (the extension's binning "
                f"buffer is not predictable from the slab size).",
                "A cloud checkpoint is written BEFORE the export, so a failed "

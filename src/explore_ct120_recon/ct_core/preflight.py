@@ -190,6 +190,10 @@ class MachineRequest:
     rays_per_batch: int = 0
     samples_per_ray: int = 0
     optimizer: str = "adam"
+    # The delivered grid — the export ROI as a sub-grid of ``vol_shape`` —
+    # for a backend that renders only what it delivers (a Gaussian cloud).
+    # None means the whole domain is materialised (a voxel grid, the FDK).
+    export_shape: tuple | None = None
 
     @property
     def sino_bytes(self) -> int:
@@ -198,6 +202,11 @@ class MachineRequest:
     @property
     def vol_bytes(self) -> int:
         return _vol_bytes(self.vol_shape)
+
+    @property
+    def export_bytes(self) -> int:
+        """The delivered volume; the whole domain when no export grid is known."""
+        return _vol_bytes(self.export_shape or self.vol_shape)
 
     @property
     def param_copies(self) -> int:
@@ -411,7 +420,7 @@ def resolve_footprint(backend, footprint=None):
 
 def estimate(backend: str, *, n_angles: int, n_b: int, n_a: int, vol_shape,
              rays_per_batch: int = 0, samples_per_ray: int = 0,
-             optimizer: str = "adam", footprint=None):
+             optimizer: str = "adam", footprint=None, export_shape=None):
     """(gpu_bytes, host_bytes, gpu_required, notes) for one backend.
 
     ``optimizer`` decides how many resident copies of the parameters the run
@@ -424,7 +433,8 @@ def estimate(backend: str, *, n_angles: int, n_b: int, n_a: int, vol_shape,
     fp = resolve_footprint(backend, footprint)(MachineRequest(
         n_angles=int(n_angles), n_b=int(n_b), n_a=int(n_a),
         vol_shape=tuple(vol_shape), rays_per_batch=int(rays_per_batch),
-        samples_per_ray=int(samples_per_ray), optimizer=str(optimizer)))
+        samples_per_ray=int(samples_per_ray), optimizer=str(optimizer),
+        export_shape=(None if export_shape is None else tuple(export_shape))))
     return (fp.gpu_bytes(rays_per_batch, samples_per_ray),
             fp.host_bytes_safe, bool(fp.gpu_required), list(fp.notes))
 
@@ -529,9 +539,13 @@ def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
     report is printed and logged under.
     """
     n_angles, n_b, n_a = (int(s) for s in ctx.projections.shape)
+    from .support import export_grid_geometry
+    export_shape = None
+    if ctx.geometry.get("export_roi"):
+        export_shape = export_grid_geometry(ctx.geometry)["vol_shape"]
     gpu_b, host_b, gpu_req, notes = estimate(
         backend, n_angles=n_angles, n_b=n_b, n_a=n_a,
-        vol_shape=ctx.geometry["vol_shape"],
+        vol_shape=ctx.geometry["vol_shape"], export_shape=export_shape,
         rays_per_batch=rays_per_batch, samples_per_ray=samples_per_ray,
         optimizer=optimizer, footprint=footprint)
 

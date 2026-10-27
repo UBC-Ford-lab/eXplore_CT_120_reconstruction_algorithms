@@ -247,10 +247,15 @@ def crop_bounds_to_indices(bounds: dict, geometry: dict):
     ox, oy, oz = (float(v) for v in geometry["vol_origin"])
     dx, dz = float(geometry["dx"]), float(geometry["dz"])
 
+    # A bound that sits ON a voxel face (an ROI chosen to match the lattice,
+    # e.g. a benchmark's GT box) must not grow the crop by a voxel because the
+    # offset came out as k - 1e-13 or k + 1e-13: snap within 1e-6 of a voxel.
+    tol = 1e-6
+
     def span(lo, hi, n, origin, d):
         edge = origin - n * d / 2.0
-        i0 = int(np.floor((lo - edge) / d))
-        i1 = int(np.ceil((hi - edge) / d))
+        i0 = int(np.floor((lo - edge) / d + tol))
+        i1 = int(np.ceil((hi - edge) / d - tol))
         i0 = max(0, min(n, i0))
         i1 = max(i0 + 1, min(n, i1))
         return i0, i1
@@ -316,5 +321,18 @@ def crop_to_export_roi(volume, geometry: dict):
         return volume, geometry
 
     (i0, i1), (j0, j1), (k0, k1) = crop_bounds_to_indices(bounds, geometry)
+    domain = tuple(int(v) for v in geometry["vol_shape"])
+    sub_shape = (i1 - i0, j1 - j0, k1 - k0)
+    if tuple(volume.shape) == sub_shape and sub_shape != domain:
+        # Already rendered on the export grid (a representation that can
+        # evaluate itself at arbitrary points renders only the exported
+        # voxels — `export_grid_geometry` — instead of materialising the
+        # whole domain to throw most of it away). Same lattice, so the
+        # geometry is the one the crop would have produced.
+        return volume, export_grid_geometry(geometry, verbose=True)
+    if tuple(volume.shape) != domain:
+        raise ValueError(f"volume {tuple(volume.shape)} is neither the "
+                         f"reconstruction domain {domain} nor its export "
+                         f"grid {sub_shape}")
     vol = np.ascontiguousarray(volume[i0:i1, j0:j1, k0:k1])
     return vol, export_grid_geometry(geometry, verbose=True)
