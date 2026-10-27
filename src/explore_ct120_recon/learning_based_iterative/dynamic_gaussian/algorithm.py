@@ -9,6 +9,7 @@ recipe is restated here.
 """
 from __future__ import annotations
 
+import argparse
 import os
 
 from ...ct_core.preflight import Footprint, MachineRequest
@@ -321,6 +322,48 @@ def add_args(group) -> None:
                         'the vendor gate-0 volume are in); "rest" exports '
                         'the midpoint between the gates, a state the '
                         'animal never occupied. Ignored with one phase.')
+    g.add_argument('--dyn-phase-harmonics', type=int, default=1,
+                   dest='dyn_phase_harmonics', metavar='K',
+                   help='with a CONTINUOUS breathing phase per view (a '
+                        'view_phase.json in the scan folder): the gate axis '
+                        'becomes the Fourier embedding cos/sin(2 pi k phi), '
+                        'k = 1..K, one periodic field per column (default: '
+                        '1 = a sinusoidal breath; 2 adds the asymmetry '
+                        'between inhale and exhale). Ignored for gated scans.')
+    g.add_argument('--dyn-intensity-scale', action='store_true', default=False,
+                   dest='dyn_intensity_scale',
+                   help='fit a per-state INTENSITY SCALE s = 1 + gain . fixed '
+                        'columns (two numbers for a sinusoidal phase axis) that '
+                        'multiplies every rendered projection: a nuisance for '
+                        'data whose calibration drifts with the breathing state '
+                        '(the X2GS cases normalise each phase to its own max). '
+                        'The anatomy stays mass-conserving. Default: off.')
+    g.add_argument('--dyn-intensity-harmonics', type=int, default=1,
+                   dest='dyn_intensity_harmonics', metavar='K',
+                   help='harmonics of that intensity scale on a continuous phase '
+                        'axis (2K numbers; default 1). 4 follows any pattern over '
+                        'ten phase bins (the X2GS cases).')
+    g.add_argument('--dyn-reg-tv', type=float, default=0.0, dest='dyn_reg_tv', metavar='W',
+                   help='weight of a volumetric TV term matched to X2-Gaussian\'s '
+                        '(random --dyn-tv-patch^3 patch at the export voxel size, L1 '
+                        'of neighbour differences, mean, in image units mu / '
+                        '--dyn-tv-mu-ref). For the SSIM comparison only; default 0.')
+    g.add_argument('--dyn-tv-patch', type=int, default=32, dest='dyn_tv_patch', metavar='N')
+    g.add_argument('--dyn-tv-mu-ref', type=float, default=0.02, dest='dyn_tv_mu_ref', metavar='MU',
+                   help='attenuation (/mm) of image value 1 for the TV term (default 0.02 = '
+                        'the NAF import\'s mu_per_unit)')
+    g.add_argument('--dyn-export-phase', type=float, default=None,
+                   dest='dyn_export_phase', metavar='PHI',
+                   help='with a continuous breathing phase: export the volume '
+                        'at phase PHI in [0, 1) instead of the rest (cycle-'
+                        'mean) state; the counterpart of --dyn-export-group.')
+    g.add_argument('--dyn-export-4d-states', default=None,
+                   dest='dyn_export_4d_states', metavar='V1,V2,...',
+                   help='the exact states of the 4-D export along the '
+                        'breathing axis (gate codes in [-1, 1] for a gated '
+                        'scan, phases in [0, 1) for a continuous one), e.g. '
+                        'the phase mid-times a benchmark scores at. Default: '
+                        '--dyn-export-4d equal steps.')
     g.add_argument('--dyn-export-4d', type=int, default=9, dest='dyn_export_4d',
                    metavar='N',
                    help='ALSO write the breathing sequence as a 4-D file '
@@ -446,7 +489,14 @@ def options(args) -> dict:
         holdout_code_lr=float(args.dyn_holdout_code_lr),
         export_view=args.dyn_export_view,
         export_group=args.dyn_export_group,
+        export_phase=args.dyn_export_phase,
+        phase_harmonics=int(args.dyn_phase_harmonics),
+        intensity_scale=bool(args.dyn_intensity_scale),
+        intensity_harmonics=int(args.dyn_intensity_harmonics),
+        reg_tv=float(args.dyn_reg_tv), tv_patch=int(args.dyn_tv_patch),
+        tv_mu_ref=float(args.dyn_tv_mu_ref),
         export_4d=int(args.dyn_export_4d),
+        export_4d_states=_state_list(args.dyn_export_4d_states),
         export_4d_mm=args.dyn_export_4d_mm,
         export_4d_format=args.dyn_export_4d_format,
         export_ventilation=bool(args.dyn_export_ventilation),
@@ -456,6 +506,19 @@ def options(args) -> dict:
                                if getattr(args, f'dyn_lr_{k}', None) is not None},
     )
     return opts
+
+
+def _state_list(text) -> tuple | None:
+    """``--dyn-export-4d-states``: a comma list of floats, or None."""
+    if text is None or str(text).strip() == '':
+        return None
+    try:
+        vals = tuple(float(t) for t in str(text).split(',') if t.strip())
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"--dyn-export-4d-states: {e}") from e
+    if not vals:
+        return None
+    return vals
 
 
 def footprint(args, req: MachineRequest) -> Footprint:

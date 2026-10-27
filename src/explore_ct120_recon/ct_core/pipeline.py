@@ -350,6 +350,11 @@ class ScanContext:
     #: came from, indexing `group_labels`. All zeros for a single phase.
     view_groups: Optional[np.ndarray] = None
     group_labels: tuple = ('00',)
+    #: One float per projection: its position in the breathing cycle in
+    #: [0, 1), read from ``view_phase.json`` in the scan folder (a free-
+    #: breathing scan with a surrogate, or an imported benchmark case);
+    #: None for a gated or static scan.
+    view_phase: Optional[np.ndarray] = None
     detector_psi: Optional[dict] = field(default=None)
     #: provenance of the detector unwarp applied to the projections, or None
     detector_warp: Optional[dict] = None
@@ -862,6 +867,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         downsample=factor,
         view_groups=scan_data.get('view_groups'),
         group_labels=tuple(scan_data.get('group_labels', ('00',))),
+        view_phase=scan_data.get('view_phase'),
         air_normalization=bool(getattr(args, 'air_normalization', True)),
         detector_warp=warp_info,
     )

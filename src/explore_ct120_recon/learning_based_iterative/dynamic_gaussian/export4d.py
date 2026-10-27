@@ -142,6 +142,35 @@ def gate_values(n_states: int) -> np.ndarray:
     return np.zeros(1) if n == 1 else np.linspace(-1.0, 1.0, n)
 
 
+def phase_values(n_states: int) -> np.ndarray:
+    """One breathing cycle in ``n_states`` equal steps from phase 0 (the
+    cycle closes, so 1 is not repeated)."""
+    n = int(n_states)
+    if n < 1:
+        raise ValueError("need at least one state")
+    return np.linspace(0.0, 1.0, n, endpoint=False)
+
+
+def state_values(motion, n_states: int, states=None) -> np.ndarray:
+    """The states of the 4-D export along the breathing axis: ``states`` as
+    given (gate codes or phases), else ``n_states`` equal steps over the
+    axis the model has (`gate_values` / `phase_values`)."""
+    if states is not None:
+        vals = np.asarray([float(v) for v in states], dtype=np.float64)
+        if vals.size == 0:
+            raise ValueError("need at least one state")
+        return vals
+    if getattr(motion, 'fixed_kind', 'gates') == 'phase':
+        return phase_values(n_states)
+    return gate_values(n_states)
+
+
+def state_axis_label(motion) -> str:
+    if getattr(motion, 'fixed_kind', 'gates') == 'phase':
+        return 'breathing phase 0 .. 1 (one cycle), free code 0'
+    return 'gate code -1 (gate 0) .. +1 (gate 1), free code 0, amplitude 0'
+
+
 @torch.no_grad()
 def render_states(cloud, motion, geom: dict, world_scale: float, signal_scale: float,
                   values, max_voxels: int | None = None) -> np.ndarray:
@@ -463,7 +492,7 @@ class LinearHU:
 def export_4d(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: float,
               anchors, base_path: str, *, n_states: int, pitch_mm='auto',
               fmt: str = DEFAULT_FORMAT, max_voxels: int | None = None,
-              log=print) -> str | None:
+              states=None, log=print) -> str | None:
     """Render the sweep and write ``<base>_4d.nrrd`` (``fmt='nrrd'``, the
     default, or ``'nrrd-slicer'``) or ``<base>_4d.nii.gz`` (``fmt='nifti'``)
     + the ``<base>_4d.json`` sidecar. Returns the file's path, or None when the model has no gate
@@ -473,18 +502,22 @@ def export_4d(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: f
         log("  4-D export skipped: no gate axis (single acquisition group)")
         return None
     geom = coarse_geometry(roi_geom, pitch_mm)
-    values = gate_values(n_states)
+    values = state_values(motion, n_states, states)
+    axis = state_axis_label(motion)
     nx, ny, nz = geom['vol_shape']
     same = geom['vol_shape'] == tuple(int(v) for v in roi_geom['vol_shape'])
     log(f"  exporting {len(values)} breathing states of {nx}x{ny}x{nz} = "
         f"{nx * ny * nz / 1e6:.1f} M voxels at {geom['dx']:.4f} mm"
-        + (" (the delivered grid)" if same else "") + ", gate axis -1..+1, one state at a time")
+        + (" (the delivered grid)" if same else "") + f", {axis}, one state at a time")
 
     def states():
         for i, v in enumerate(values):
             shown = motion.displaced_with_code(cloud, gate_code(motion, float(v)))
             mu = render_grid(shown, geom, world_scale, signal_scale, max_voxels)
-            log(f"    state {i + 1}/{len(values)} (gate {v:+.2f}) rendered")
+            # the per-state intensity scale, when the run fitted one: the
+            # states then carry the data's calibration, as the GT does
+            mu = mu * motion.intensity_at(float(v)) if getattr(motion, 'gain', None) is not None else mu
+            log(f"    state {i + 1}/{len(values)} (axis value {v:+.3f}) rendered")
             yield anchors.apply(mu)
 
     base = base_path[:-4] if base_path.lower().endswith('.vff') else base_path
@@ -495,11 +528,14 @@ def export_4d(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: f
     else:
         write_nrrd_4d(path, states(), geom, n_states=len(values), values=values,
                       extra_fields={'hu calibration': f'{float(anchors.scale):.9g} {float(anchors.offset):.9g}',
-                                    'state axis': 'gate code -1 (gate 0) .. +1 (gate 1)'},
+                                    'state axis': axis},
                       fmt=fmt)
     side = {'file': os.path.basename(path), 'format': fmt, 'units': 'HU',
             'states': [float(v) for v in values],
-            'state_axis': 'gate code -1 (gate 0) .. +1 (gate 1), free code 0, amplitude 0',
+            'state_axis': axis,
+            'state_kind': str(getattr(motion, 'fixed_kind', 'gates')),
+            'intensity_scale': ([motion.intensity_at(float(v)) for v in values]
+                                if getattr(motion, 'gain', None) is not None else None),
             'voxel_size_mm': {'xy': float(geom['dx']), 'z': float(geom['dz'])},
             'grid': 'the delivered volume\'s' if same else f'isotropic {float(pitch_mm):g} mm',
             'shape': [int(nx), int(ny), int(nz), len(values)],

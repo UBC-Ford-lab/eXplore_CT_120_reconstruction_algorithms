@@ -257,7 +257,6 @@ carries over unchanged.
 from __future__ import annotations
 
 import math
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -725,6 +724,37 @@ def fixed_features(view_groups, n_views: int) -> torch.Tensor | None:
     return torch.stack(cols, dim=1)
 
 
+def phase_features(view_phase, n_views: int, harmonics: int = 1) -> torch.Tensor:
+    """The per-view FIXED code columns from a CONTINUOUS breathing phase.
+
+    ``view_phase`` is one number per view, the position in the breathing
+    cycle in [0, 1) (0 = 1 = the same state); the columns are the Fourier
+    embedding ``cos 2*pi*k*phi, sin 2*pi*k*phi`` for k = 1..``harmonics``,
+    so the gate field becomes a periodic motion with ``harmonics`` free
+    shapes per axis and the rest cloud is the cycle's mean. The two-gate
+    scan is the special case `fixed_features` keeps: one +-1 column.
+    """
+    phi = torch.as_tensor(np.asarray(view_phase, dtype=np.float64),
+                          dtype=torch.float64).reshape(-1)
+    if phi.numel() != n_views:
+        raise ValueError(f"{phi.numel()} view phases for {n_views} views")
+    if not torch.isfinite(phi).all():
+        raise ValueError("view phases must be finite")
+    h = int(harmonics)
+    if h < 1:
+        raise ValueError("phase_harmonics must be >= 1")
+    cols = []
+    for k in range(1, h + 1):
+        w = 2.0 * math.pi * k * phi
+        cols += [torch.cos(w), torch.sin(w)]
+    return torch.stack(cols, dim=1).to(torch.float32)
+
+
+def phase_code_at(phase: float, harmonics: int) -> torch.Tensor:
+    """The fixed columns of `phase_features` at one phase value."""
+    return phase_features([float(phase)], 1, harmonics)[0]
+
+
 @torch.no_grad()
 def _kmeans(x: torch.Tensor, k: int, iters: int = 50, seed: int = 0) -> torch.Tensor:
     """Plain k-means with k-means++ seeding on (M, D); labels (M,) long."""
@@ -764,7 +794,8 @@ class MotionModel:
     #: LR of 1e-4, one view per step under Adam) the logits moved 2.0 -> 2.16
     #: in 4000 iterations and not one primitive changed part.
     DEFAULT_LR_MULTIPLIERS = {'motion_codes': 10.0, 'motion_basis': 1.0,
-                              'motion_amp': 10.0, 'motion_parts': 100.0}
+                              'motion_amp': 10.0, 'motion_parts': 100.0,
+                              'motion_gain': 10.0}
 
     def __init__(self, n_views: int, n_codes: int, support: MotionSupport,
                  spacing: float, device=None, basis_init_std: float = 0.0,
@@ -773,7 +804,9 @@ class MotionModel:
                  frozen_views=(), mass_preserving: bool = False,
                  det_floor: float = 0.2, n_parts: int = 1,
                  n_primitives: int | None = None, parts_init_std: float = 0.01,
-                 basis_order: int = 1, basis_lung_weight: float = 0.0):
+                 basis_order: int = 1, basis_lung_weight: float = 0.0,
+                 view_phase=None, phase_harmonics: int = 1,
+                 intensity: bool = False, intensity_harmonics: int = 1):
         self.n_views = int(n_views)
         if int(basis_order) not in (1, 2):
             raise ValueError("basis_order must be 1 (strain) or 2 (bending)")
@@ -785,7 +818,20 @@ class MotionModel:
         self.transport_shapes = bool(transport_shapes)
         self._init_mass(bool(mass_preserving), float(det_floor))
         self.support = support.to(device) if device is not None else support
-        fixed = fixed_features(view_groups, self.n_views)
+        # The fixed part of the codes: 'gates' = +-1 contrast columns from
+        # the acquisition groups (two gated phases); 'phase' = the Fourier
+        # embedding of a continuous per-view breathing phase (a free-
+        # breathing scan with a surrogate); None = a single state.
+        self.phase_harmonics = int(phase_harmonics)
+        self.view_phase = None
+        if view_phase is not None:
+            self.view_phase = torch.as_tensor(np.asarray(view_phase, dtype=np.float64),
+                                              dtype=torch.float32).reshape(-1)
+            fixed = phase_features(self.view_phase, self.n_views, self.phase_harmonics)
+            self.fixed_kind = 'phase'
+        else:
+            fixed = fixed_features(view_groups, self.n_views)
+            self.fixed_kind = None if fixed is None else 'gates'
         self.fixed = None if fixed is None else fixed.to(device or 'cpu')
         self.n_fixed = 0 if fixed is None else int(fixed.shape[1])
         self.view_groups = (None if view_groups is None
@@ -804,6 +850,7 @@ class MotionModel:
                                               dtype=torch.float32,
                                               device=device))
         self._init_amplitude(bool(amplitude), device)
+        self._init_gain(bool(intensity), device, int(intensity_harmonics))
         self._init_frozen(frozen_views, device)
         self._init_parts(n_primitives, float(parts_init_std), generator, device)
         self.air_gate = None                     # (n,) per node, or None = free divergence
@@ -904,6 +951,9 @@ class MotionModel:
         self.det_floor = float(det_floor)
 
     def _init_amplitude(self, amplitude: bool, device) -> None:
+        if amplitude and self.fixed_kind == 'phase':
+            raise ValueError("a per-view gate amplitude is defined for gated "
+                             "phases, not for a continuous breathing phase")
         if amplitude and self.n_fixed == 0:
             raise ValueError("a per-view gate amplitude needs gated phases "
                              "(several acquisition groups); this scan has one")
@@ -911,6 +961,48 @@ class MotionModel:
         self.amp = (nn.Parameter(torch.zeros((self.n_views, self.n_fixed),
                                              dtype=torch.float32, device=device))
                     if self.amplitude else None)
+
+    def _init_gain(self, intensity: bool, device, harmonics: int = 1) -> None:
+        """The per-state INTENSITY SCALE (``intensity``): one coefficient per
+        fixed column, s(v) = 1 + fixed[v] . gain, multiplying the rendered
+        projection of view v. A nuisance for data whose calibration drifts
+        with the breathing state -- MEASURED 2026-10-26: the X2GS benchmark
+        normalised every DIR-Lab phase volume to its own maximum, a 0.68x to
+        0.95x per-phase scale (35 % swing in total attenuation) that no
+        anatomy, and no mass-conserving motion, can produce. The fixed columns
+        average to zero over the breathing cycle (cos/sin of a uniformly
+        sampled phase; +-1 on two equal gates), so the global density scale
+        stays in the cloud and the anatomy's mass is still conserved.
+
+        With a continuous phase the scale has its OWN harmonic count
+        (``harmonics``), independent of the motion's: the X2GS calibration
+        follows each phase volume's maximum voxel, irregular from bin to bin
+        on some cases (DIR 4), so it needs more freedom than the breath."""
+        self.gain_harmonics = int(harmonics)
+        self.gain_features = None
+        if intensity and self.n_fixed:
+            if self.fixed_kind == 'phase':
+                self.gain_features = phase_features(self.view_phase, self.n_views,
+                                                    self.gain_harmonics).to(device or 'cpu')
+            else:
+                self.gain_features = self.fixed
+        self.gain = (nn.Parameter(torch.zeros(int(self.gain_features.shape[1]),
+                                              dtype=torch.float32, device=device))
+                     if self.gain_features is not None else None)
+
+    def intensity_scale(self, view: int) -> torch.Tensor | float:
+        """s(v) for a view (1.0 without the intensity model)."""
+        if self.gain is None:
+            return 1.0
+        return 1.0 + (self.gain_features[int(view)].to(self.gain.device) * self.gain).sum()
+
+    def intensity_at(self, value: float) -> float:
+        """s at a state on the breathing axis (see `fixed_at`)."""
+        if self.gain is None:
+            return 1.0
+        f = (phase_code_at(float(value), self.gain_harmonics) if self.fixed_kind == 'phase'
+             else self.fixed_at(value))
+        return float(1.0 + (f.to(self.gain.device) * self.gain.detach()).sum())
 
     def _init_frozen(self, frozen_views, device) -> None:
         frozen = torch.zeros(self.n_views, dtype=torch.bool)
@@ -1104,7 +1196,17 @@ class MotionModel:
         m._init_mass(bool(snap.get('mass_preserving', False)),
                      float(snap.get('det_floor', 0.2)))
         m.support = support.to(device) if device is not None else support
-        fixed = fixed_features(view_groups, m.n_views)
+        m.phase_harmonics = int(snap.get('phase_harmonics', 1))
+        vp = snap.get('view_phase')
+        m.view_phase = None
+        if snap.get('fixed_kind') == 'phase' and vp is not None:
+            m.view_phase = torch.as_tensor(np.asarray(vp, dtype=np.float64),
+                                           dtype=torch.float32).reshape(-1)
+            fixed = phase_features(m.view_phase, m.n_views, m.phase_harmonics)
+            m.fixed_kind = 'phase'
+        else:
+            fixed = fixed_features(view_groups, m.n_views)
+            m.fixed_kind = None if fixed is None else 'gates'
         m.fixed = None if fixed is None else fixed.to(device or 'cpu')
         m.n_fixed = 0 if fixed is None else int(fixed.shape[1])
         m.view_groups = (None if view_groups is None
@@ -1118,6 +1220,10 @@ class MotionModel:
         m.codes = nn.Parameter(torch.zeros((m.n_views, m.n_codes),
                                            dtype=torch.float32, device=device))
         m._init_amplitude(bool(snap.get('amplitude', False)), device)
+        m._init_gain(snap.get('gain') is not None, device, int(snap.get('gain_harmonics', 1)))
+        if m.gain is not None:
+            with torch.no_grad():
+                m.gain.copy_(snap['gain'].to(m.gain.device))
         m._init_frozen(snap.get('frozen_views', ()), device)
         logits = snap.get('parts_logits')
         m._init_parts(None if logits is None else int(logits.shape[0]), 0.0,
@@ -1157,6 +1263,29 @@ class MotionModel:
         if amp is not None:
             fixed = fixed + amp.to(free.device)
         return torch.cat([fixed, free])
+
+    def fixed_at(self, value: float) -> torch.Tensor:
+        """The FIXED columns of one state along the breathing axis: for
+        gates the gate code ``value`` (-1 = gate 0, +1 = gate 1) in the first
+        column, the others 0; for a continuous phase the embedding of the
+        phase ``value`` in [0, 1). Zeros when there is no fixed part."""
+        dev = self.codes.device
+        if self.fixed is None:
+            return torch.zeros(0, device=dev)
+        if self.fixed_kind == 'phase':
+            return phase_code_at(float(value), self.phase_harmonics).to(dev)
+        z = torch.zeros(self.n_fixed, device=dev)
+        z[0] = float(value)
+        return z
+
+    def state_code(self, value: float, free=None) -> torch.Tensor:
+        """A FULL code for one state along the breathing axis (`fixed_at`)
+        with the free part ``free`` (zeros by default)."""
+        dev = self.codes.device
+        z = torch.zeros(self.n_codes, device=dev)
+        if free is not None:
+            z = torch.as_tensor(free, dtype=torch.float32, device=dev).reshape(-1)
+        return torch.cat([self.fixed_at(value), z])
 
     def group_mean_amplitude(self, views) -> torch.Tensor | None:
         """Mean gate amplitude over ``views`` (None when amplitude is off):
@@ -1367,12 +1496,16 @@ class MotionModel:
         if self.parts_logits is not None:
             groups.append({'params': [self.parts_logits],
                            'lr': lr * mul['motion_parts'], 'name': 'motion_parts'})
+        if self.gain is not None:
+            groups.append({'params': [self.gain], 'lr': lr * mul['motion_gain'],
+                           'name': 'motion_gain'})
         return groups
 
     def parameters(self):
         return ([self.codes, self.basis.values]
                 + ([self.amp] if self.amp is not None else [])
-                + ([self.parts_logits] if self.parts_logits is not None else []))
+                + ([self.parts_logits] if self.parts_logits is not None else [])
+                + ([self.gain] if self.gain is not None else []))
 
     @property
     def shape(self):
@@ -1382,6 +1515,9 @@ class MotionModel:
         return {'codes': self.codes.detach().cpu().clone(),
                 'basis': self.basis.values.detach().cpu().clone(),
                 'fixed': None if self.fixed is None else self.fixed.cpu().clone(),
+                'fixed_kind': self.fixed_kind,
+                'view_phase': None if self.view_phase is None else self.view_phase.cpu().clone(),
+                'phase_harmonics': self.phase_harmonics,
                 'grid_shape': tuple(self.shape),
                 'grid_lo': self.basis.lo.detach().cpu().clone(),
                 'grid_hi': self.basis.hi.detach().cpu().clone(),
@@ -1397,6 +1533,8 @@ class MotionModel:
                 'basis_lung_weight': self.basis_lung_weight,
                 'n_parts': self.n_parts,
                 'parts_active': bool(self.parts_active),
+                'gain': None if self.gain is None else self.gain.detach().cpu().clone(),
+                'gain_harmonics': getattr(self, 'gain_harmonics', 1),
                 'parts_logits': (None if self.parts_logits is None
                                  else self.parts_logits.detach().cpu().clone()),
                 'air_gate': (None if self.air_gate is None
@@ -1412,6 +1550,10 @@ class MotionModel:
         if tuple(snap['grid_shape']) != tuple(self.shape):
             raise ValueError(f"motion snapshot grid {tuple(snap['grid_shape'])} "
                              f"!= model grid {tuple(self.shape)}")
+        kind = snap.get('fixed_kind', None if snap.get('fixed') is None else 'gates')
+        if kind != self.fixed_kind:
+            raise ValueError(f"motion snapshot has a {kind!r} breathing axis, "
+                             f"model has {self.fixed_kind!r}")
         if tuple(snap['codes'].shape) != tuple(self.codes.shape):
             raise ValueError(f"motion snapshot has {tuple(snap['codes'].shape)} "
                              f"codes, model has {tuple(self.codes.shape)}")
@@ -1426,6 +1568,8 @@ class MotionModel:
                 raise ValueError(f"motion snapshot has {tuple(snap['amp'].shape)} "
                                  f"amplitudes, model has {tuple(self.amp.shape)}")
             self.amp.copy_(snap['amp'].to(self.amp.device))
+        if self.gain is not None and snap.get('gain') is not None:
+            self.gain.copy_(snap['gain'].to(self.gain.device))
         if self.parts_logits is not None:
             logits = snap.get('parts_logits')
             if logits is None or tuple(logits.shape) != tuple(self.parts_logits.shape):
@@ -1453,6 +1597,8 @@ class MotionModel:
         w = self.support.weight(xyz)
         inside = w > 0
         out = {'motion/code_rms': float(self.codes.pow(2).mean().sqrt()),
+               **({f'motion/gain_{j}': float(self.gain[j]) for j in range(self.gain.numel())}
+                  if self.gain is not None else {}),
                'motion/support_frac': float(inside.float().mean()),
                **({'motion/amp_rms': float(self.amp.pow(2).mean().sqrt()),
                    'motion/amp_max': float(self.amp.abs().max())}

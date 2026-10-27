@@ -357,8 +357,9 @@ def compute(cloud, motion, roi_geom: dict, world_scale: float, signal_scale: flo
     gate's views, by breathing level, that defines the PEAK states.
     ``render_fn(shown, geom, ws, ss, max_voxels)`` -> mu (nx, ny, nz); the
     default is the voxeliser (`export4d.render_grid`, bound at call time)."""
-    if motion is None or not motion.n_fixed:
-        raise ValueError("ventilation needs a gate axis (two acquisition groups)")
+    if motion is None or not motion.n_fixed or getattr(motion, 'fixed_kind', 'gates') != 'gates':
+        raise ValueError("ventilation needs a gate axis (two acquisition groups); "
+                         "a continuous breathing phase has no expiration gate yet")
     if render_fn is None:
         render_fn = export4d.render_grid
     geom = coarse_geometry(roi_geom, pitch_mm)
@@ -818,8 +819,9 @@ def export_ventilation(cloud, motion, roi_geom: dict, world_scale: float,
     (the per-primitive readings for the validation script) and
     ``<base>_ventilation.png``. Returns the map's path, None without a gate
     axis."""
-    if motion is None or not motion.n_fixed:
-        log("  ventilation skipped: no gate axis (single acquisition group)")
+    if motion is None or not motion.n_fixed or getattr(motion, 'fixed_kind', 'gates') != 'gates':
+        log("  ventilation skipped: no gate axis (single acquisition group or a "
+            "continuous breathing phase)")
         return None
     res = compute(cloud, motion, roi_geom, world_scale, signal_scale, anchors,
                   pitch_mm=pitch_mm, reference=reference, max_voxels=max_voxels,

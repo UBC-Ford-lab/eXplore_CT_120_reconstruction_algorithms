@@ -120,7 +120,13 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                  holdout_code_lr: float = 1e-2,
                  export_view: int | None = None,
                  export_group: int | None = None,
+                 export_phase: float | None = None,
+                 phase_harmonics: int = 1,
+                 intensity_scale: bool = False,
+                 intensity_harmonics: int = 1,
+                 reg_tv: float = 0.0, tv_patch: int = 32, tv_mu_ref: float = 0.02,
                  export_4d: int = 9,
+                 export_4d_states=None,
                  export_4d_mm='auto',
                  export_4d_format: str = 'nrrd',
                  export_ventilation: bool = True,
@@ -156,7 +162,14 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
             holdout_code_lr=float(holdout_code_lr),
             export_view=(None if export_view is None else int(export_view)),
             export_group=(None if export_group is None else int(export_group)),
+            export_phase=(None if export_phase is None else float(export_phase)),
+            phase_harmonics=int(phase_harmonics),
+            intensity_scale=bool(intensity_scale),
+            intensity_harmonics=int(intensity_harmonics),
+            reg_tv=float(reg_tv), tv_patch=int(tv_patch), tv_mu_ref=float(tv_mu_ref),
             export_4d=int(export_4d), export_4d_mm=_pitch_option(export_4d_mm),
+            export_4d_states=(None if export_4d_states is None
+                              else tuple(float(v) for v in export_4d_states)),
             export_4d_format=_format_option(export_4d_format),
             export_ventilation=bool(export_ventilation),
             ventilation_mm=float(ventilation_mm),
@@ -167,8 +180,14 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
             raise ValueError("reg_basis_order must be 1 (strain) or 2 (bending)")
         if self.mcfg['air_gate_mm'] <= 0:
             raise ValueError("air_gate_mm must be > 0")
-        if self.mcfg['n_codes'] < 1:
-            raise ValueError("n_codes must be >= 1")
+        # 0 free codes is a model driven by the breathing axis alone (gates or
+        # a continuous phase); without such an axis it would have no motion.
+        has_axis = (getattr(self, 'view_phase', None) is not None
+                    or (getattr(self, 'view_groups', None) is not None
+                        and len(set(np.asarray(self.view_groups).tolist())) > 1))
+        if self.mcfg['n_codes'] < (0 if has_axis else 1):
+            raise ValueError("n_codes must be >= 1 (>= 0 with gated phases or a "
+                             "continuous breathing phase)")
         if self.mcfg['n_parts'] < 1:
             raise ValueError("n_parts must be >= 1")
         if self.mcfg['n_parts'] > 1 and self.cfg['density_control'] != 'fixed':
@@ -180,6 +199,10 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                 f"default) or one part.")
         if export_view is not None and export_group is not None:
             raise ValueError("export_view and export_group are exclusive")
+        if export_phase is not None and export_view is not None:
+            raise ValueError("export_view and export_phase are exclusive")
+        if self.mcfg['phase_harmonics'] < 1:
+            raise ValueError("phase_harmonics must be >= 1")
         self.motion: MotionModel | None = None
         self._motion_from_iter: int = 0
         self._motion_hold_until: int = 0
@@ -228,7 +251,12 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                                 self.mcfg['support_taper_mm'] * self.world_scale)
         gen = torch.Generator().manual_seed(int(self.seed))
         groups = getattr(self, 'view_groups', None)
+        phase = getattr(self, 'view_phase', None)
         model = MotionModel(n_views=len(self.angles),
+                            view_phase=phase,
+                            phase_harmonics=self.mcfg['phase_harmonics'],
+                            intensity=self.mcfg['intensity_scale'],
+                            intensity_harmonics=self.mcfg['intensity_harmonics'],
                             n_codes=self.mcfg['n_codes'], support=support,
                             spacing=self.mcfg['grid_mm'] * self.world_scale,
                             device=device,
@@ -326,19 +354,32 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
         return (self.motion is not None
                 and (self.iterations_run + 1) >= self._motion_from_iter)
 
+    def _scaled(self, out: dict, view: int) -> dict:
+        """The per-state intensity scale (`MotionModel.intensity_scale`),
+        applied to a rendered projection; identity when it is off. Active
+        from the first iteration: the calibration drift is in the data
+        whether or not the motion has started."""
+        if self.motion is None or self.motion.gain is None:
+            return out
+        out = dict(out)
+        out['image'] = out['image'] * self.motion.intensity_scale(view)
+        return out
+
     def _render_train(self, cloud, cameras, view: int) -> dict:
         if not self._motion_active():
-            return super()._render_train(cloud, cameras, view)
-        return kernel.render(self.motion.displaced(cloud, view), cameras[view],
-                             need_screenspace_grad=True)
+            return self._scaled(super()._render_train(cloud, cameras, view), view)
+        return self._scaled(kernel.render(self.motion.displaced(cloud, view), cameras[view],
+                                          need_screenspace_grad=True), view)
 
     def _render_eval(self, cloud, camera, view=None):
+        scale = (1.0 if view is None or self.motion is None
+                 else self.motion.intensity_scale(view))
         if self.motion is None or view is None or not self._motion_active():
-            return super()._render_eval(cloud, camera, view)
+            return super()._render_eval(cloud, camera, view) * scale
         code = self._fitted_codes.get(int(view))
         shown = (self.motion.displaced_with_code(cloud, code) if code is not None
                  else self.motion.displaced(cloud, view))
-        return kernel.render(shown, camera)['image']
+        return kernel.render(shown, camera)['image'] * scale
 
     def _param_groups(self, cloud) -> list:
         groups = super()._param_groups(cloud)
@@ -355,7 +396,32 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
             groups += motion_groups
         return groups
 
+    def _volume_tv(self, cloud, view: int) -> torch.Tensor:
+        """X2-Gaussian's volumetric TV (its train.py, tv_3d_loss with
+        reduction 'mean'): the L1 of neighbour differences on a random
+        ``tv_patch``^3 patch at the export voxel size inside the export box,
+        in the state of the training view, in image units mu / tv_mu_ref.
+        A one-off comparison term (supplement), off by default."""
+        geom = export_grid_geometry(self.geometry)
+        n = int(self.mcfg['tv_patch'])
+        ws = self.world_scale
+        d = np.array([geom['dx'], geom['dx'], geom['dz']], dtype=np.float64)
+        box = np.array(geom['vol_shape'], dtype=np.float64) * d
+        size = np.minimum(n * d, box)
+        lo = np.array(geom['vol_origin'], dtype=np.float64) - box / 2 + size / 2
+        centre = lo + (box - size) * np.random.rand(3)
+        shown = (self.motion.displaced(cloud, view) if (self.motion is not None and self._motion_active())
+                 else cloud)
+        vol = kernel.voxelize(shown, n_voxel=(n, n, n), extent_world=tuple(size * ws),
+                              center_world=tuple(centre * ws))
+        img = vol / (self.signal_scale * float(self.mcfg['tv_mu_ref']))
+        tv = (img.diff(dim=0).abs().sum() + img.diff(dim=1).abs().sum() + img.diff(dim=2).abs().sum())
+        count = 3 * (n - 1) * n * n
+        return tv / count
+
     def _regularise(self, loss, cloud, view: int):
+        if self.mcfg['reg_tv'] > 0:
+            loss = loss + self.mcfg['reg_tv'] * self._volume_tv(cloud, view)
         if not self._motion_active():
             return loss
         if self._gate_wanted() and self.motion.air_gate is None \
@@ -524,6 +590,8 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
             payload['motion_config'] = dict(self.mcfg)
             if getattr(self, 'view_groups', None) is not None:
                 payload['view_groups'] = np.asarray(self.view_groups)
+            if getattr(self, 'view_phase', None) is not None:
+                payload['view_phase'] = np.asarray(self.view_phase)
         return payload
 
     # -- evaluation: the withheld view gets a code of its own --------------
@@ -588,9 +656,9 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
         rest = show.state_slices(cloud, self.motion, geom, ws, ss, hu, 0.0)
         hi = float(np.percentile(rest[0], 99.5))
         window = (0.0, max(hi, 1e-6))
-        slices = {'gate 0 (-1)': show.state_slices(cloud, self.motion, geom, ws, ss, hu, -1.0),
-                  'rest (0)': rest,
-                  'gate 1 (+1)': show.state_slices(cloud, self.motion, geom, ws, ss, hu, 1.0)}
+        slices = {k: (rest if k == 'rest (0)'
+                      else show.state_slices(cloud, self.motion, geom, ws, ss, hu, v))
+                  for k, v in show.breathing_states(self.motion).items()}
         gates = show.gates_figure(slices, window=window,
                                   diff_window=(-0.3 * window[1], 0.3 * window[1]))
         frames = show.breathing_frames(cloud, self.motion, geom, ws, ss, hu,
@@ -619,7 +687,8 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                 opt.zero_grad(set_to_none=True)
                 code = self.motion.full_code_from(free, view, amp)
                 shown = self.motion.displaced_with_code(cloud, code)
-                img = cam_mod.Camera.to_ours(kernel.render(shown, camera)['image'])
+                img = cam_mod.Camera.to_ours(kernel.render(shown, camera)['image']
+                                             * self.motion.intensity_scale(view))
                 b0, b1, a0, a1 = covered_detector_window(self.geometry, *img.shape)
                 pred = img[b0:b1, a0:a1] / scale
                 loss = ((pred - t) ** 2).mean()
@@ -644,6 +713,7 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                          self.signal_scale, anchors, output_path, n_states=n,
                          pitch_mm=self.mcfg['export_4d_mm'],
                          fmt=self.mcfg['export_4d_format'],
+                         states=self.mcfg['export_4d_states'],
                          max_voxels=self._export_chunk, log=log)
 
     def export_ventilation(self, roi_geometry: dict, anchors, output_path: str,
@@ -666,7 +736,15 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
         if v is not None:
             print(f"  exporting the state of view {v}")
             return super()._export(self.motion.displaced(cloud, v), domain)
-        if g is not None and self.motion.fixed is not None:
+        ph = self.mcfg['export_phase']
+        if ph is not None and self.motion.fixed is not None:
+            if self.motion.fixed_kind != 'phase':
+                raise ValueError("export_phase needs a continuous breathing phase "
+                                 "(view_phase.json); this scan has gates -- use export_group")
+            print(f"  exporting the state at breathing phase {ph:.3f}")
+            return super()._export(self.motion.displaced_with_code(
+                cloud, self.motion.state_code(ph)), domain) * self.motion.intensity_at(ph)
+        if g is not None and self.motion.fixed is not None and self.motion.fixed_kind == 'gates':
             sel = self._group_views(g)
             if sel is None or len(sel) == 0:
                 raise ValueError(f"no views in acquisition group {g}")

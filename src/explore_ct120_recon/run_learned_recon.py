@@ -968,6 +968,7 @@ def main(argv=None):
         stop_on=tuple(args.stop_on),
         log_fn=logger.log,
         view_groups=ctx.view_groups,
+        view_phase=ctx.view_phase,
         # The detector key for a noise-weighted data term's calibration
         # cache (ct_core.noise_model): the same serial + scan tag the psi
         # calibration is filed under, so the two live side by side in

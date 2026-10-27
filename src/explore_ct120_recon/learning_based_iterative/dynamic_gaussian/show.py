@@ -118,16 +118,34 @@ def _vff_orientation(slab: np.ndarray) -> np.ndarray:
 
 
 def gate_code(motion, value: float, free=None) -> torch.Tensor:
-    """A full code with the gate column at ``value`` and the free part at
-    ``free`` (zeros by default). For a single-phase run the gate column does
-    not exist and ``value`` is ignored."""
-    dev = motion.codes.device
-    z = torch.zeros(motion.n_fields, device=dev)
-    if free is not None:
-        z[motion.n_fixed:] = torch.as_tensor(free, device=dev)
-    if motion.n_fixed:
-        z[0] = float(value)
-    return z
+    """A full code for the state ``value`` on the breathing axis (a gate
+    code in [-1, 1] for a gated scan, a phase in [0, 1) for a continuous
+    one; see `MotionModel.state_code`) with the free part at ``free`` (zeros
+    by default). For a single-phase run the fixed part does not exist and
+    ``value`` is ignored."""
+    return motion.state_code(float(value), free)
+
+
+def breathing_states(motion) -> dict:
+    """The named states of the breathing axis a figure shows, label ->
+    value: the two gates and the rest state of a gated scan, or the four
+    quarter phases of a continuous cycle (the rest state is the cycle
+    mean, not a phase of it)."""
+    if motion is None or not motion.n_fixed:
+        return {'rest (0)': 0.0}
+    if getattr(motion, 'fixed_kind', 'gates') == 'phase':
+        return {'phase 0.00': 0.0, 'phase 0.25': 0.25, 'phase 0.50': 0.5,
+                'phase 0.75': 0.75}
+    return {'gate 0 (-1)': -1.0, 'rest (0)': 0.0, 'gate 1 (+1)': 1.0}
+
+
+def breathing_extremes(motion) -> tuple:
+    """The two states whose difference is 'the breath': (trough, peak) on
+    the breathing axis -- the gates (-1, +1), or the phases (0, 0.5) of a
+    continuous cycle."""
+    if getattr(motion, 'fixed_kind', 'gates') == 'phase':
+        return 0.0, 0.5
+    return -1.0, 1.0
 
 
 def state_slices(cloud, motion, geom, ws, ss, hu, value: float):
@@ -149,7 +167,10 @@ def gates_figure(slices: dict, window=HU_WINDOW, diff_window=DIFF_WINDOW) -> Fig
     """``window`` / ``diff_window`` are HU by default; a live panel during a
     run (before the HU calibration exists) passes windows in mu."""
     HU_WINDOW, DIFF_WINDOW = window, diff_window
-    keys = [k for k in ('gate 0 (-1)', 'rest (0)', 'gate 1 (+1)') if k in slices]
+    order = ('gate 0 (-1)', 'rest (0)', 'gate 1 (+1)')
+    keys = [k for k in order if k in slices] or list(slices)
+    diff = (keys[2], keys[0]) if len(keys) == 3 else (
+        (keys[2], keys[0]) if len(keys) == 4 else None)   # 4 phases: 0.50 minus 0.00
     fig = Figure(figsize=(5 * (len(keys) + 1), 9.5), dpi=100)
     axes = fig.subplots(2, len(keys) + 1)
     for j, k in enumerate(keys):
@@ -158,13 +179,14 @@ def gates_figure(slices: dict, window=HU_WINDOW, diff_window=DIFF_WINDOW) -> Fig
         axes[1, j].imshow(axi, cmap='gray', vmin=HU_WINDOW[0], vmax=HU_WINDOW[1])
         axes[0, j].set_title(f'{k}, coronal mid')
         axes[1, j].set_title(f'{k}, axial mid')
-    if len(keys) == 3:
-        d_cor = slices[keys[2]][0] - slices[keys[0]][0]
-        d_axi = slices[keys[2]][1] - slices[keys[0]][1]
+    if diff is not None:
+        hi_k, lo_k = diff
+        d_cor = slices[hi_k][0] - slices[lo_k][0]
+        d_axi = slices[hi_k][1] - slices[lo_k][1]
         axes[0, -1].imshow(d_cor, cmap='gray', vmin=DIFF_WINDOW[0], vmax=DIFF_WINDOW[1], aspect='auto')
         axes[1, -1].imshow(d_axi, cmap='gray', vmin=DIFF_WINDOW[0], vmax=DIFF_WINDOW[1])
-        axes[0, -1].set_title('gate 1 minus gate 0, coronal')
-        axes[1, -1].set_title('gate 1 minus gate 0, axial')
+        axes[0, -1].set_title(f'{hi_k} minus {lo_k}, coronal')
+        axes[1, -1].set_title(f'{hi_k} minus {lo_k}, axial')
     for ax in axes.ravel():
         ax.axis('off')
     fig.tight_layout()
@@ -187,8 +209,9 @@ def field_figure(cloud, motion, geom, ws, coronal: np.ndarray, step_mm: float = 
     gx, gz = np.meshgrid(xs, zs, indexing='ij')
     pts = np.stack([gx.ravel(), np.full(gx.size, oy), gz.ravel()], axis=1) * ws
     pts_t = torch.as_tensor(pts, dtype=torch.float32, device=motion.codes.device)
-    d = (motion.displacement(pts_t, gate_code(motion, 1.0))
-         - motion.displacement(pts_t, gate_code(motion, -1.0))) / ws   # mm
+    lo_v, hi_v = breathing_extremes(motion)
+    d = (motion.displacement(pts_t, gate_code(motion, hi_v))
+         - motion.displacement(pts_t, gate_code(motion, lo_v))) / ws   # mm
     d = d.cpu().numpy().reshape(len(ix), len(iz), 3)
     fig = Figure(figsize=(7, 9), dpi=100)
     ax = fig.subplots()
@@ -215,7 +238,10 @@ def breathing_frames(cloud, motion, geom, ws, ss, hu, n: int = 12,
     """(T, H, W) uint8 frames of the coronal slice, gate code swept
     -1 -> +1 -> -1 with a cosine ease. ``window`` is the grey window in the
     units ``hu`` maps to (HU after calibration, mu during a run)."""
-    vals = -np.cos(np.linspace(0, 2 * np.pi, 2 * n, endpoint=False))
+    if getattr(motion, 'fixed_kind', 'gates') == 'phase':
+        vals = np.linspace(0.0, 1.0, 2 * n, endpoint=False)      # one cycle
+    else:
+        vals = -np.cos(np.linspace(0, 2 * np.pi, 2 * n, endpoint=False))
     frames = []
     for v in vals:
         cor, _ = state_slices(cloud, motion, geom, ws, ss, hu, float(v))
@@ -270,10 +296,8 @@ def main(argv=None) -> int:
           f"{geom['dx']:.4f} mm; motion: "
           f"{'none (static run)' if motion is None else f'{motion.n_fixed} fixed + {motion.n_codes} free codes, grid ' + 'x'.join(map(str, motion.shape)) + (f', {motion.n_parts} parts' if motion.n_parts > 1 else '')}")
 
-    slices = {'rest (0)': state_slices(cloud, motion, geom, ws, ss, hu, 0.0)}
-    if motion is not None and motion.n_fixed:
-        slices['gate 0 (-1)'] = state_slices(cloud, motion, geom, ws, ss, hu, -1.0)
-        slices['gate 1 (+1)'] = state_slices(cloud, motion, geom, ws, ss, hu, 1.0)
+    slices = {k: state_slices(cloud, motion, geom, ws, ss, hu, v)
+              for k, v in breathing_states(motion).items()}
     figs = {}
     figs['motion/gates'] = gates_figure(slices)
     figs['motion/gates'].savefig(os.path.join(out, 'gates.png'))

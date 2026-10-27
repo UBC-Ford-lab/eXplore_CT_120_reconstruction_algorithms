@@ -16,8 +16,34 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SUPPORTED_FILTER_TYPES = ('ramp', 'shepp-logan', 'cosine', 'hamming')
 
 
+def filter_fft_length(N_a: int) -> int:
+    """FFT length for filtering a detector row of ``N_a`` pixels: the next
+    power of two >= 2 N_a, so the (linear) convolution with the ramp does not
+    wrap around the row."""
+    n = 1
+    while n < 2 * int(N_a):
+        n *= 2
+    return n
+
+
+def _ramlak_spectrum(n_fft: int, da: float) -> torch.Tensor:
+    """The band-limited ramp sampled in SPACE and transformed (Kak & Slaney
+    eq. 3.61): h[0] = 1/(4 da^2), h[k odd] = -1/(pi k da)^2, h[k even] = 0,
+    times da for the integral. Unlike |f| sampled in frequency, its spectrum
+    keeps the correct low-frequency (DC) response; MEASURED 2026-10-26: the
+    sampled-|f| filter without padding read a uniform cylinder at 0.91 of its
+    mu with negative air around it."""
+    k = torch.arange(n_fft, dtype=torch.float64)
+    k = torch.where(k > n_fft // 2, k - n_fft, k)
+    h = torch.zeros(n_fft, dtype=torch.float64)
+    h[k == 0] = 1.0 / (4.0 * da * da)
+    odd = (k.abs() % 2) == 1
+    h[odd] = -1.0 / (np.pi * k[odd] * da) ** 2
+    return (torch.fft.rfft(h) * da).real.float()
+
+
 def _build_filter_kernel(N_a, da, filter_cutoff, filter_type,
-                         physical_normalization, device):
+                         physical_normalization, device, n_fft=None):
     """Build a windowed ramp filter kernel in the frequency domain.
 
     All kernels are |f| × W(f), zeroed beyond f_cutoff.
@@ -31,9 +57,13 @@ def _build_filter_kernel(N_a, da, filter_cutoff, filter_type,
     Returns:
         (kernel, f_cutoff) where kernel has shape (1, N_a//2+1).
     """
-    freqs = torch.fft.rfftfreq(N_a, d=da).to(device)
+    n_fft = int(n_fft or N_a)
+    freqs = torch.fft.rfftfreq(n_fft, d=da).to(device)
     f_cutoff = filter_cutoff * freqs.abs().max()
-    ramp = torch.abs(freqs)
+    # the ramp from the spatial Ram-Lak kernel when the row is zero-padded
+    # (n_fft > N_a); the sampled |f| only for the legacy unpadded call
+    ramp = (_ramlak_spectrum(n_fft, float(da)).to(device) if n_fft > N_a
+            else torch.abs(freqs))
     mask = (freqs.abs() <= f_cutoff).float()
 
     if filter_type == 'ramp':
@@ -429,9 +459,10 @@ class FDKReconstructor:
         cone_weight = self.SDD / (torch.sqrt(self.SDD**2 + A**2 + B**2) + 1e-8)  # (N_b, N_a)
 
         # Ramp filter kernel (windowed)
+        n_fft = filter_fft_length(self.N_a)
         filter_kernel, f_cutoff = _build_filter_kernel(
             self.N_a, self.da, self.filter_cutoff, self.filter_type,
-            self.physical_normalization, device,
+            self.physical_normalization, device, n_fft=n_fft,
         )
         print(f"Filter: {self.filter_type}, cutoff: {self.filter_cutoff:.2f} × f_Nyquist = {float(f_cutoff):.4f} mm⁻¹")
         if self.physical_normalization:
@@ -565,7 +596,15 @@ class FDKReconstructor:
                                           self.N_angles)
 
         # ---- Pass 2: cone-beam weighting + ramp filter + Parker ------------
-        print(f"  Pass 2 (weighting + filtering): chunk_size={chunk_size}")
+        # The rows are zero-padded to n_fft for the filter, so a view's working
+        # set is the input plus ~3 buffers of the PADDED length (the complex
+        # spectrum and the inverse transform before cropping).
+        pad = n_fft / float(self.N_a)
+        b2 = self._gpu_free_bytes()
+        if b2 != float('inf'):
+            chunk_size = max(1, min(chunk_size, _chunk_that_fits(
+                b2 - 2 * pad * bytes_per_proj, (2.0 + 3.0 * pad) * bytes_per_proj, self.N_angles)))
+        print(f"  Pass 2 (weighting + filtering): chunk_size={chunk_size}, rows zero-padded {self.N_a} -> {n_fft}")
         for start in range(0, self.N_angles, chunk_size):
             end = min(start + chunk_size, self.N_angles)
             report('filter', start, self.N_angles)
@@ -574,9 +613,10 @@ class FDKReconstructor:
             ).to(device)
 
             chunk = chunk * cone_weight
-            chunk = torch.fft.rfft(chunk, dim=2, norm='forward')
+            # zero-padded to n_fft: a linear (not circular) convolution
+            chunk = torch.fft.rfft(chunk, n=n_fft, dim=2, norm='forward')
             chunk = chunk * filter_kernel
-            chunk = torch.fft.irfft(chunk, n=self.N_a, dim=2, norm='forward')
+            chunk = torch.fft.irfft(chunk, n=n_fft, dim=2, norm='forward')[..., :self.N_a]
             if parker_weight_gpu is not None:
                 chunk = chunk * parker_weight_gpu[start:end].unsqueeze(1)
 
@@ -782,7 +822,14 @@ class FDKReconstructor:
         # Without this, reconstructions with different numbers of projections
         # would have different intensity scales (proportional to N_angles)
         if self.N_angles > 1:
-            angle_range = float(self.angles[-1] - self.angles[0])
+            ang = np.asarray(self.angles.detach().cpu() if hasattr(self.angles, 'detach') else self.angles,
+                             dtype=np.float64)
+            d_ang = np.diff(ang)
+            # views in acquisition order sweep monotonically; a set stored in
+            # another order (a benchmark's views sorted by time) does not, and
+            # last - first is then meaningless: use the span the views cover
+            angle_range = (float(ang[-1] - ang[0]) if (np.all(d_ang >= 0) or np.all(d_ang <= 0))
+                           else float(np.ptp(ang)))
             # Handle angle wraparound (e.g., when angles are modulo 360 and span ~360°)
             # If computed range is very small (<1°) but we have many projections,
             # this indicates the angles wrapped around - assume full 360° scan
@@ -815,6 +862,18 @@ class FDKReconstructor:
                 print(f"Applied angular normalization (short scan, no Parker, no 1/2): Δβ = {float(delta_beta):.6f}")
         else:
             self.reconstructed_volume *= delta_beta
+        if self.physical_normalization:
+            # The ramp filter runs in PHYSICAL detector coordinates (pitch da at
+            # distance SDD) and the backprojection weight is (R_s/U)^2; the
+            # detector-plane FDK then carries one more factor SDD/R_s (the
+            # magnification) to give mu in 1/mm. MEASURED 2026-10-26: without it
+            # the absolute mu was R_s/SDD of the truth -- 0.664 on the X2GS DIR 1
+            # case (magnification 1.5, against its GT) and 0.888 on Scan_1510
+            # (FDK mu_water 0.0213 vs the forward-model Gaussian's 0.0240, ratio
+            # R_s/SDD = 0.884). The two-anchor HU calibration rescales every
+            # volume, so HU output was and is unaffected; only raw mu changes.
+            self.reconstructed_volume *= self.SDD / self.R_s
+            print(f"Applied magnification SDD/R_s = {self.SDD / self.R_s:.4f} (detector-plane filtering)")
         print(f"Angular step: Δβ = {float(delta_beta):.6f} rad ({float(delta_beta) * 180 / np.pi:.4f}°)")
 
     def finalize_volume(self):

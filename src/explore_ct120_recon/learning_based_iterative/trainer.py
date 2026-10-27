@@ -195,6 +195,7 @@ class LearnedReconstructor:
                  grad_clip_norm: float = 0.0,
                  log_fn=None, diag_fn=None,
                  view_groups=None,
+                 view_phase=None,
                  noise_calibration=None):
         self.projections = projections
         # Which DETECTOR (and scan) this data came from, for a data term that
@@ -212,6 +213,15 @@ class LearnedReconstructor:
         # model ignores it, a motion-aware one conditions on it.
         self.view_groups = (None if view_groups is None
                             else np.asarray(view_groups, dtype=np.int64))
+        # One float per projection: its position in the breathing cycle in
+        # [0, 1) when the scan carries a continuous surrogate
+        # (``view_phase.json`` in the scan folder), else None. Like
+        # ``view_groups`` a fact about the data; a static model ignores it.
+        self.view_phase = (None if view_phase is None
+                           else np.asarray(view_phase, dtype=np.float64))
+        if self.view_phase is not None and self.view_phase.shape != (len(projections),):
+            raise ValueError(f"view_phase has shape {self.view_phase.shape} for "
+                             f"{len(projections)} projections")
         # `angles` may be None when a prebuilt Scene is supplied — it carries
         # its own. Resolved in reconstruct() once the scene is known.
         self.angles = None if angles is None else np.asarray(angles)

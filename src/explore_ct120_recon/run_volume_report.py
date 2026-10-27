@@ -290,6 +290,14 @@ def _apply_vendor_conventions(args, volume_path):
         args.flip = list(args.flip) + ['x']
     print("  --vendor: GE axis conventions (no y-flip undo, x mirrored)")
 
+    if args.origin is not None:
+        # The caller placed the volume (a full-field vendor reconstruction has
+        # no SubVolumeCoordinates.xml to derive it from, e.g. Scan_2005);
+        # --scan-folder is then only the tag the alignment is filed under.
+        print(f"    origin given: ({float(args.origin[0]):+.3f}, {float(args.origin[1]):+.3f}, "
+              f"{float(args.origin[2]):+.3f}) mm")
+        return
+
     scan_folder = Path(args.scan_folder) if args.scan_folder else None
     if scan_folder is None or not scan_folder.is_dir():
         raise ScanDataError(

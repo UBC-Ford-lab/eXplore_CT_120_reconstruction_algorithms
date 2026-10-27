@@ -208,6 +208,7 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
     projections = dataset.projections  # shape (N_angles, N_b, N_a)
     angles = dataset.angles_rad        # shape (N_angles,)
     view_groups, group_labels = view_groups_for(dataset.paths, phases)
+    view_phase = view_phase_for(data_folder, dataset.paths)
 
     print(f"Loaded {len(angles)} projections, shape: {projections.shape}")
     if len(group_labels) > 1:
@@ -228,7 +229,51 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
         # single-phase load.
         'view_groups': view_groups,
         'group_labels': group_labels,
+        # One float per projection in [0, 1), the breathing phase from
+        # view_phase.json, or None when the scan has no such file.
+        'view_phase': view_phase,
     }
+
+
+VIEW_PHASE_FILE = 'view_phase.json'
+
+
+def view_phase_for(data_folder, paths):
+    """The per-view breathing phase of the loaded files, or None.
+
+    ``<scan>/view_phase.json`` maps each projection file name to its
+    position in the breathing cycle in [0, 1) (``{"phase": {"acq-00-0000.vff":
+    0.12, ...}}``; a ``"cycle_s"`` and a ``"source"`` beside it are kept for
+    the record and ignored here). Every loaded file must be listed; a file
+    the map does not know stops the load rather than guessing. A gated scan
+    has no such file and gets None.
+    """
+    import json
+    path = os.path.join(data_folder, VIEW_PHASE_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        doc = json.load(f)
+    table = doc.get('phase', doc) if isinstance(doc, dict) else None
+    if not isinstance(table, dict):
+        raise ScanDataError(f"{path}: expected {{'phase': {{file: value}}}}")
+    out = []
+    missing = []
+    for p in paths:
+        name = Path(p).name
+        if name not in table:
+            missing.append(name)
+            continue
+        v = float(table[name])
+        if not np.isfinite(v):
+            raise ScanDataError(f"{path}: {name} has a non-finite phase")
+        out.append(v % 1.0)
+    if missing:
+        raise ScanDataError(f"{path} lists no phase for {len(missing)} loaded "
+                            f"file(s), e.g. {missing[0]}")
+    print(f"  breathing phase per view from {VIEW_PHASE_FILE} "
+          f"({len(out)} views, {min(out):.3f}..{max(out):.3f} of the cycle)")
+    return np.asarray(out, dtype=np.float64)
 
 
 def phase_tokens(sub_scan) -> list:
