@@ -110,6 +110,14 @@ def add_args(group) -> None:
                    help='keep the amplitude fixed under transport (the '
                         'pre-2026-09-19 behaviour; needed with '
                         '--dyn-no-transport-shapes).')
+    g.add_argument('--dyn-mass-detach', action='store_true',
+                   dest='dyn_mass_detach', default=False,
+                   help='METHOD TEST (default off): keep the mass-preserving '
+                        'forward pass but stop the gradient through the '
+                        '1/|det F| amplitude, so the brightness does not pull '
+                        'on the field\'s divergence; the geometry is learned '
+                        'from positions and covariances alone. Needs '
+                        '--dyn-mass-preserving.')
     g.add_argument('--dyn-det-floor', type=float, default=0.2,
                    dest='dyn_det_floor', metavar='D',
                    help='|det F| is clamped to this before the amplitude is '
@@ -228,6 +236,53 @@ def add_args(group) -> None:
     g.add_argument('--dyn-air-gate-mm', type=float, default=0.5, dest='dyn_air_gate_mm',
                    metavar='MM', help='pitch of the rest-state render the air gate '
                                       'is read from (default: 0.5 mm).')
+    g.add_argument('--dyn-basis-init', default=None, dest='dyn_basis_init', metavar='NPZ',
+                   help='DIAGNOSTIC: replace the motion basis by the fields in '
+                        'NPZ (values, grid_shape, grid_lo, grid_hi; world units, '
+                        'this run\'s control grid) at the iteration the motion '
+                        'starts, air-gate projected once. Default: the random '
+                        'small-std init.')
+    g.add_argument('--dyn-parts-init', default='kmeans', choices=('kmeans', 'anatomy', 'anatomy-mask', 'ribcage', 'ribcage3'), dest='dyn_parts_init',
+                   help='how the parts are labelled when they activate: kmeans (default) on the '
+                        'single field\'s motion, or anatomy = lung / wall + mediastinum / below the '
+                        'lung base from the rest render (needs --dyn-parts 3), or anatomy-mask = the same with the '
+                        'lung part taken as every primitive in the lung mask dilated by one voxel, whatever '
+                        'its air fraction, or ribcage = two parts, contents (lung + below the lung base, '
+                        'not bone) vs rib cage (everything else); ribcage3 = the same with the mediastinum '
+                        '(medial to both lungs, not bone) as a third part.')
+    g.add_argument('--dyn-parts-freeze-membership', action='store_true', dest='dyn_parts_freeze_membership',
+                   help='DIAGNOSTIC: the membership is fixed at the labels set when the parts '
+                        'activate (one-hot, e.g. --dyn-parts-init anatomy) for the whole run: '
+                        'its gradient is dropped and the membership smoothness and commitment '
+                        'terms are off.')
+    g.add_argument('--dyn-parts-smooth-gate', type=float, default=0.0, dest='dyn_parts_smooth_gate',
+                   metavar='SIGMA', help='weight every membership-smoothness edge by '
+                   'exp(-(g_i - g_j)^2 / SIGMA), g = the air-bearing fraction of the rest '
+                   'render at activation, so the smoothing does not cross the pleura; '
+                   '0 (default) = off.')
+    g.add_argument('--dyn-parts-free-lung', action='store_true', dest='dyn_parts_free_lung',
+                   help='DIAGNOSTIC: part 0 (the lung part of --dyn-parts-init anatomy) is exempt '
+                        'from the air-sourced divergence projection (its gate row is 1); the '
+                        'other parts are projected as before.')
+    g.add_argument('--dyn-parts-inferior', default='auto', choices=('auto', 'low', 'high'), dest='dyn_parts_inferior',
+                   help='which end of the z axis is inferior (the lung base) for the anatomy labellers: auto '
+                        '(default) = the lung end with the larger SI motion of the single field at activation; '
+                        'low / high force it (a scan with no measurable motion at activation).')
+    g.add_argument('--dyn-parts-band-mm', type=float, default=0.0, dest='dyn_parts_band_mm', metavar='MM',
+                   help='anatomy-mask / ribcage labellers: the lung part (contents) takes the lung mask dilated by MM '
+                        '(rounded to the gate pitch); 0 (default) = one voxel of the gate pitch.')
+    g.add_argument('--dyn-freeze-basis-until', type=int, default=0, dest='dyn_freeze_basis_until',
+                   metavar='N', help='DIAGNOSTIC: keep the motion basis and codes '
+                   'fixed (gradients dropped) until iteration N while everything '
+                   'else trains; 0 (default) = off.')
+    g.add_argument('--dyn-static-phase-window', type=float, nargs=2, default=None,
+                   dest='dyn_static_phase_window', metavar=('CENTRE', 'HALF'),
+                   help='before the motion starts, train the static cloud only on '
+                        'views whose breathing phase is within HALF of CENTRE '
+                        '(circular, phase in 0..1), so the canonical is one '
+                        'breathing state rather than the blur of the cycle; '
+                        'every view once the motion starts. Needs a phase '
+                        'axis (view_phase). Default: all views throughout.')
     g.add_argument('--dyn-freeze-views', default='', dest='dyn_freeze_views',
                    metavar='V,V,...',
                    help='views whose renders train the CLOUD and the '
@@ -465,9 +520,19 @@ def options(args) -> dict:
         transport_shapes=bool(args.dyn_transport_shapes),
         mass_preserving=bool(args.dyn_mass_preserving),
         det_floor=float(args.dyn_det_floor),
+        mass_detach=bool(args.dyn_mass_detach),
         reg_fold=float(args.dyn_reg_fold),
         amplitude=bool(args.dyn_amplitude),
         frozen_views=_parse_views(args.dyn_freeze_views),
+        static_phase_window=args.dyn_static_phase_window,
+        basis_init=args.dyn_basis_init,
+        freeze_basis_until=int(args.dyn_freeze_basis_until),
+        parts_init=str(args.dyn_parts_init),
+        parts_freeze_membership=bool(args.dyn_parts_freeze_membership),
+        parts_smooth_gate=float(args.dyn_parts_smooth_gate),
+        parts_free_lung=bool(args.dyn_parts_free_lung),
+        parts_inferior=str(args.dyn_parts_inferior),
+        parts_band_mm=float(args.dyn_parts_band_mm),
         n_parts=int(args.dyn_parts),
         parts_from=float(args.dyn_parts_from),
         parts_volume_weight=float(args.dyn_parts_volume_weight),

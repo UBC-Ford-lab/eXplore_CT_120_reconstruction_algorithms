@@ -359,6 +359,16 @@ def add_args(group) -> None:
                         'truncated animal and the bed, where fineness is '
                         'never delivered. Prune, floor and ceiling still act '
                         'everywhere.')
+    g.add_argument('--gauss-resume-continue', action='store_true',
+                   dest='gauss_resume_continue', default=False,
+                   help='with --gauss-resume on the checkpoint of a FINISHED '
+                        'run: continue it at the iteration it records (as a '
+                        'partial checkpoint would) instead of warm-starting '
+                        'at one, so a schedule defined by fractions of '
+                        '--iterations (motion, parts) stays past its '
+                        'switches; raise --iterations by the extra budget. '
+                        'The LR then follows this run\'s schedule from that '
+                        'iteration on (a two-stage fine-tune).')
     g.add_argument('--gauss-resume', default=None, metavar='PATH',
                    dest='gauss_resume',
                    help='start from the cloud a previous run wrote with '
@@ -489,6 +499,7 @@ def options(args) -> dict:
         max_sigma_spacing=float(args.gauss_max_sigma_spacing),
         view_every_evals=int(args.gauss_view_every_evals),
         resume_from=args.gauss_resume,
+        resume_continue=bool(args.gauss_resume_continue),
         densify_roi_margin_mm=args.gauss_densify_roi_margin,
         split_mode=str(args.gauss_split),
         density_control=('mcmc' if args.gauss_mcmc

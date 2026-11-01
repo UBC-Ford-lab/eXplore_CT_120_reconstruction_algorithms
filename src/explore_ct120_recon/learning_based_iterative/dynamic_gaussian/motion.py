@@ -81,6 +81,11 @@ det F -> 0, and on run z708w98r the minimum over the cloud was already 0.214.
 The CLI default is ON since 2026-09-19 (A/B muqojfqg vs t805g3zw: held-out
 tie, lung volume ratio 0.84 vs 0.60 with the amplitude held); the class
 default stays False so a bare `MotionModel` is the literature model.
+``mass_detach`` (method test, default off) keeps the forward pass identical
+but stops the gradient through the 1/|det F| amplitude: the brightness no
+longer pulls on the field's divergence, so the geometry is learned from the
+transported positions and covariances alone (the fold guard keeps its
+gradient).
 
 PARTS (``n_parts`` > 1): sliding interfaces. One smooth field cannot let
 the lung slide along the chest wall or past the heart: a smoothness prior
@@ -803,6 +808,7 @@ class MotionModel:
                  transport_shapes: bool = False, amplitude: bool = False,
                  frozen_views=(), mass_preserving: bool = False,
                  det_floor: float = 0.2, n_parts: int = 1,
+                 mass_detach: bool = False,
                  n_primitives: int | None = None, parts_init_std: float = 0.01,
                  basis_order: int = 1, basis_lung_weight: float = 0.0,
                  view_phase=None, phase_harmonics: int = 1,
@@ -816,7 +822,7 @@ class MotionModel:
         self.basis_lung_weight = float(basis_lung_weight)
         self.n_codes = int(n_codes)                     # free codes per view
         self.transport_shapes = bool(transport_shapes)
-        self._init_mass(bool(mass_preserving), float(det_floor))
+        self._init_mass(bool(mass_preserving), float(det_floor), bool(mass_detach))
         self.support = support.to(device) if device is not None else support
         # The fixed part of the codes: 'gates' = +-1 contrast columns from
         # the acquisition groups (two gated phases); 'phase' = the Fourier
@@ -938,7 +944,8 @@ class MotionModel:
         g = torch.where(den > 1e-6, num / den.clamp_min(1e-6), torch.full_like(num, float(empty)))
         return g.clamp(0.0, 1.0) if parts is not None else g[0].clamp(0.0, 1.0)
 
-    def _init_mass(self, mass_preserving: bool, det_floor: float) -> None:
+    def _init_mass(self, mass_preserving: bool, det_floor: float,
+                   mass_detach: bool = False) -> None:
         """The mass-preserving amplitude and its floor (see the module docstring)."""
         if mass_preserving and not self.transport_shapes:
             raise ValueError(
@@ -947,8 +954,11 @@ class MotionModel:
                 "dividing the amplitude by |det F| would break it")
         if det_floor <= 0:
             raise ValueError("det_floor must be > 0")
+        if mass_detach and not mass_preserving:
+            raise ValueError("mass_detach only changes the mass-preserving amplitude")
         self.mass_preserving = bool(mass_preserving)
         self.det_floor = float(det_floor)
+        self.mass_detach = bool(mass_detach)
 
     def _init_amplitude(self, amplitude: bool, device) -> None:
         if amplitude and self.fixed_kind == 'phase':
@@ -1025,6 +1035,7 @@ class MotionModel:
         self.parts_active = False                # False = tied (single-field) phase
         self.graph = None                        # (N, k) neighbour indices
         self.graph_weight = None                 # (N,) support weight at build
+        self.graph_gate = None                   # (N, k) per-edge weight (set_graph_gate)
         self._graph_xyz = None                   # (N, 3) rest positions at build
         if self.n_parts == 1:
             return
@@ -1054,7 +1065,8 @@ class MotionModel:
     @torch.no_grad()
     def activate_parts(self, xyz: torch.Tensor, code: torch.Tensor | None = None,
                        logit: float = 2.0, seed: int = 0,
-                       volume_weight: float = 2.0) -> dict | None:
+                       volume_weight: float = 2.0,
+                       labels: torch.Tensor | None = None) -> dict | None:
         """End the tied phase: label the primitives by k-means on the local
         motion of the (single) field and set the membership from the labels.
 
@@ -1078,7 +1090,9 @@ class MotionModel:
         rendered state does not change at the switch. Returns the cluster
         shares, the rms displacement (world units) and each part's mean
         displacement and log det; None if there are no parts or they are
-        already active."""
+        already active. ``labels`` (n,) in [0, K) replaces the k-means
+        labelling (an anatomical initialisation, see the reconstructor's
+        ``parts_init``); the rest is unchanged."""
         if self.parts_logits is None or self.parts_active:
             return None
         n = int(xyz.shape[0])
@@ -1106,13 +1120,19 @@ class MotionModel:
         x = torch.cat([d, (float(volume_weight) * cell * logdet)[:, None]], dim=1)[inside]
         rms = d[inside].norm(dim=1).pow(2).mean().sqrt() if inside.numel() else d.new_zeros(())
         x = x / rms.clamp_min(1e-12)
-        labels = _kmeans(x, self.n_parts, seed=seed)
-        # part 0 = the largest cluster, so the label order is reproducible
-        counts = torch.bincount(labels, minlength=self.n_parts)
-        order = torch.argsort(counts, descending=True)
-        remap = torch.empty_like(order)
-        remap[order] = torch.arange(self.n_parts, device=dev)
-        labels = remap[labels]
+        if labels is None:
+            labels = _kmeans(x, self.n_parts, seed=seed)
+            # part 0 = the largest cluster, so the label order is reproducible
+            counts = torch.bincount(labels, minlength=self.n_parts)
+            order = torch.argsort(counts, descending=True)
+            remap = torch.empty_like(order)
+            remap[order] = torch.arange(self.n_parts, device=dev)
+            labels = remap[labels]
+        else:
+            labels = torch.as_tensor(labels, device=dev).long().reshape(-1)
+            if labels.numel() != n or int(labels.min()) < 0 or int(labels.max()) >= self.n_parts:
+                raise ValueError(f"parts labels must be {n} values in [0, {self.n_parts})")
+            labels = labels[inside]
         self.parts_logits.zero_()
         self.parts_logits[:, 0] = float(logit)             # outside the support
         self.parts_logits[inside, 0] = 0.0
@@ -1158,6 +1178,20 @@ class MotionModel:
         self._graph_xyz = xyz.detach().to(dev).clone()
         self.graph_weight = self.support.weight(self._graph_xyz)
 
+    @torch.no_grad()
+    def set_graph_gate(self, g: torch.Tensor, sigma: float) -> None:
+        """Weight every membership-graph edge by exp(-(g_i - g_j)^2 / sigma),
+        with ``g`` (N,) a per-primitive scalar (the air-bearing fraction), so
+        the membership smoothness does not act across a step in ``g`` (the
+        pleura: lung parcels are few, and an ungated graph lets the wall's
+        memberships win across it). Needs the graph (`build_graph`)."""
+        if self.graph is None:
+            raise ValueError("set_graph_gate needs the membership graph (build_graph)")
+        g = torch.as_tensor(g, dtype=torch.float32, device=self.graph.device).reshape(-1)
+        if g.numel() != int(self.graph.shape[0]):
+            raise ValueError(f"graph gate for {g.numel()} primitives, graph has {int(self.graph.shape[0])}")
+        self.graph_gate = torch.exp(-(g[:, None] - g[self.graph]) ** 2 / float(sigma))
+
     def part_priors(self, eps: float = 0.05) -> dict:
         """``part_commit``: mean normalised entropy of the membership over
         the support (1 = uniform, 0 = every primitive committed to one part).
@@ -1179,6 +1213,8 @@ class MotionModel:
         diff = (p[:, None, :] - q).norm(dim=2)               # (N, k)
         rho = torch.sqrt(diff * diff + eps * eps) - eps
         ew = w[:, None] * w[self.graph]                      # (N, k)
+        if self.graph_gate is not None:
+            ew = ew * self.graph_gate
         smooth = (rho * ew).sum() / ew.sum().clamp_min(1.0)
         return {'part_commit': commit, 'part_smooth': smooth}
 
@@ -1194,7 +1230,8 @@ class MotionModel:
         m.n_codes = int(n_codes)
         m.transport_shapes = bool(snap.get('transport_shapes', False))
         m._init_mass(bool(snap.get('mass_preserving', False)),
-                     float(snap.get('det_floor', 0.2)))
+                     float(snap.get('det_floor', 0.2)),
+                     bool(snap.get('mass_detach', False)))
         m.support = support.to(device) if device is not None else support
         m.phase_harmonics = int(snap.get('phase_harmonics', 1))
         vp = snap.get('view_phase')
@@ -1383,7 +1420,8 @@ class MotionModel:
             # |Sigma'|^{1/2} = |det F| |Sigma|^{1/2}, so this is the amplitude
             # that leaves a (2 pi)^{3/2} |Sigma|^{1/2} — the primitive's mass —
             # exactly where it was.
-            scale = 1.0 / self.last_det.abs().clamp_min(self.det_floor)
+            det = self.last_det.detach() if self.mass_detach else self.last_det
+            scale = 1.0 / det.abs().clamp_min(self.det_floor)
         return DisplacedCloud(cloud, d, cov6.contiguous(), density_scale=scale)
 
     def displaced(self, cloud, view: int, detach: bool | None = None) -> DisplacedCloud:
@@ -1527,6 +1565,7 @@ class MotionModel:
                 'transport_shapes': self.transport_shapes,
                 'mass_preserving': self.mass_preserving,
                 'det_floor': self.det_floor,
+                'mass_detach': self.mass_detach,
                 'amplitude': self.amplitude,
                 'amp': None if self.amp is None else self.amp.detach().cpu().clone(),
                 'frozen_views': self.frozen.nonzero(as_tuple=True)[0].tolist(),

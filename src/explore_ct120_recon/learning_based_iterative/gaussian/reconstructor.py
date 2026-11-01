@@ -117,6 +117,7 @@ class GaussianReconstructor(LearnedReconstructor):
                  max_sigma_spacing: float = 1.0,
                  view_every_evals: int = 0,
                  resume_from: str | None = None,
+                 resume_continue: bool = False,
                  densify_roi_margin_mm: float | None = None,
                  split_mode: str = 'preserving',
                  densify_gate_z: float | None = 3.0,
@@ -162,6 +163,7 @@ class GaussianReconstructor(LearnedReconstructor):
             max_sigma_spacing=float(max_sigma_spacing),
             view_every_evals=int(view_every_evals),
             resume_from=(None if resume_from is None else str(resume_from)),
+            resume_continue=bool(resume_continue),
             densify_roi_margin_mm=(None if densify_roi_margin_mm is None
                                    else float(densify_roi_margin_mm)),
             split_mode=str(split_mode),
@@ -554,7 +556,7 @@ class GaussianReconstructor(LearnedReconstructor):
                     staged = True
 
                 if cursor >= len(order):
-                    order = list(rng.permutation(train_views))
+                    order = list(rng.permutation(self._epoch_views(train_views)))
                     cursor = 0
                 view = int(order[cursor]); cursor += 1
 
@@ -596,6 +598,7 @@ class GaussianReconstructor(LearnedReconstructor):
                 with torch.no_grad():
                     cloud.record_gradients(out['screenspace'], out['visible'],
                                            out['radii'])
+                self._before_step()
                 optimizer.step()
                 # A projection, applied where the voxel backend applies its own
                 # non-negativity projection: a constraint on the solution set, not
@@ -1081,6 +1084,15 @@ class GaussianReconstructor(LearnedReconstructor):
     # the loop: the cloud handed to the kernel for a given view, the parameter
     # groups, extra priors, and what a snapshot / checkpoint carries. The base
     # answers are the static cloud's, so this class behaves exactly as before.
+    def _before_step(self) -> None:
+        """Between backward and the optimiser step; a subclass may drop
+        gradients here (a parameter whose .grad is None is not stepped)."""
+
+    def _epoch_views(self, train_views) -> list:
+        """The views the next pass over the data draws from (all training views; a
+        subclass may narrow it for a stage of the run)."""
+        return list(train_views)
+
     def _render_train(self, cloud, cameras, view: int) -> dict:
         """The training render of ``view``: the kernel on the cloud as is."""
         return kernel.render(cloud, cameras[view], need_screenspace_grad=True)
@@ -1254,7 +1266,7 @@ class GaussianReconstructor(LearnedReconstructor):
         cloud.restore(state['cloud'])
         if self.photo is not None and state.get('photometric') is not None:
             self.photo.restore(state['photometric'])
-        if state.get('partial'):
+        if state.get('partial') or self.cfg['resume_continue']:
             done = int(state.get('iteration', 0))
             if done >= self.iterations:
                 raise ValueError(
@@ -1266,7 +1278,7 @@ class GaussianReconstructor(LearnedReconstructor):
             self._resume_plateau = state.get('lr_plateau')
             self.crossval_history = list(state.get('crossval_history') or [])
             print(f"    resumed {len(cloud):,} primitives from {path}: a "
-                  f"partial run stopped at iteration {done}"
+                  f"{'partial' if state.get('partial') else 'finished'} run stopped at iteration {done}"
                   + (f" by {state['stop_signal']}" if state.get('stop_signal')
                      else "")
                   + f"; continuing to {self.iterations}")

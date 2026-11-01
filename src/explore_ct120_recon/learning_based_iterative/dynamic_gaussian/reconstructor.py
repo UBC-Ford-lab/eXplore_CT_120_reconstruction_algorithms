@@ -82,6 +82,12 @@ def _format_option(value) -> str:
     return check_format(value)
 
 
+
+# --dyn-parts-init ribcage: canonical HU above which a primitive below the lung base is bone (rib cage, spine)
+RIBCAGE_BONE_HU = 300.0
+# the anatomy labellers' inferior-end decision: relative |dz| margin below which the activation line says LOW
+ORIENTATION_MARGIN_FLOOR = 0.1
+
 class DynamicGaussianReconstructor(GaussianReconstructor):
 
     def __init__(self, projections, angles, geometry, *,
@@ -96,6 +102,7 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                  transport_shapes: bool = True,
                  mass_preserving: bool = False,
                  det_floor: float = 0.2,
+                 mass_detach: bool = False,
                  reg_fold: float = 1.0,
                  amplitude: bool = False,
                  frozen_views=(),
@@ -132,6 +139,15 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                  export_ventilation: bool = True,
                  ventilation_mm: float = 0.5,
                  motion_lr_multipliers: dict | None = None,
+                 static_phase_window=None,
+                 basis_init: str | None = None,
+                 freeze_basis_until: int = 0,
+                 parts_init: str = 'kmeans',
+                 parts_freeze_membership: bool = False,
+                 parts_smooth_gate: float = 0.0,
+                 parts_free_lung: bool = False,
+                 parts_inferior: str = 'auto',
+                 parts_band_mm: float = 0.0,
                  **kwargs):
         super().__init__(projections, angles, geometry, **kwargs)
         self.mcfg = dict(
@@ -143,9 +159,20 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
             basis_init_vox=float(basis_init_vox),
             transport_shapes=bool(transport_shapes),
             mass_preserving=bool(mass_preserving),
-            det_floor=float(det_floor), reg_fold=float(reg_fold),
+            det_floor=float(det_floor), mass_detach=bool(mass_detach),
+            reg_fold=float(reg_fold),
             amplitude=bool(amplitude),
             frozen_views=tuple(sorted({int(v) for v in (frozen_views or ())})),
+            static_phase_window=(None if static_phase_window is None
+                                 else tuple(float(v) for v in static_phase_window)),
+            basis_init=(None if basis_init is None else str(basis_init)),
+            freeze_basis_until=int(freeze_basis_until),
+            parts_init=str(parts_init),
+            parts_freeze_membership=bool(parts_freeze_membership),
+            parts_smooth_gate=float(parts_smooth_gate),
+            parts_free_lung=bool(parts_free_lung),
+            parts_inferior=str(parts_inferior),
+            parts_band_mm=float(parts_band_mm),
             n_parts=int(n_parts), parts_from=float(parts_from),
             parts_volume_weight=float(parts_volume_weight),
             part_knn=int(part_knn),
@@ -205,6 +232,7 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
             raise ValueError("phase_harmonics must be >= 1")
         self.motion: MotionModel | None = None
         self._motion_from_iter: int = 0
+        self._basis_init_done = False          # --dyn-basis-init: loaded once, at the motion start
         self._motion_hold_until: int = 0
         self._parts_from_iter: int = 0
         self._parts_hold_until: int = 0
@@ -266,6 +294,7 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                             transport_shapes=self.mcfg['transport_shapes'],
                             mass_preserving=self.mcfg['mass_preserving'],
                             det_floor=self.mcfg['det_floor'],
+                            mass_detach=self.mcfg['mass_detach'],
                             amplitude=self.mcfg['amplitude'],
                             frozen_views=self.mcfg['frozen_views'],
                             n_parts=self.mcfg['n_parts'],
@@ -300,7 +329,9 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
               f"(+{self.mcfg['support_taper_mm']:g} mm taper); shapes "
               f"{'transported by the Jacobian' if model.transport_shapes else 'kept'}"
               + (f", amplitude / |det F| (mass preserving, det floor "
-                 f"{model.det_floor:g})" if model.mass_preserving else "")
+                 f"{model.det_floor:g}"
+                 + (", gradient stopped through 1/|det F|" if model.mass_detach else "")
+                 + ")" if model.mass_preserving else "")
               + (f"; {model.n_parts} PARTS (independent fields, learned "
                  f"per-primitive membership over {len(cloud):,} primitives, "
                  f"{self.mcfg['part_knn']}-NN membership graph; tied until "
@@ -340,8 +371,12 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
         if self.motion is None or snap is None:
             return state
         self.motion.restore(snap)
+        if self._resume_iter + 1 >= self._motion_from_iter:
+            self._basis_init_done = True       # the restored basis already carries the motion
         if self.motion.parts_active and self.motion.graph is None:
             self.motion.build_graph(cloud.xyz.detach(), k=self.mcfg['part_knn'])
+            if self.mcfg['parts_smooth_gate'] > 0:
+                self._set_graph_gate(cloud)
         print(f"    resumed the motion model: {tuple(snap['codes'].shape)} codes, "
               f"grid {tuple(snap['grid_shape'])}"
               + (f", {self.motion.n_parts} parts active" if self.motion.parts_active
@@ -350,6 +385,22 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
         return state
 
     # -- the seams ----------------------------------------------------------
+    def _epoch_views(self, train_views) -> list:
+        """Before the motion starts, only the views whose breathing phase lies
+        within ``static_phase_window`` = (centre, half-width) when one is set: the
+        static cloud is fitted to one breathing state instead of the blur of all
+        of them. Every view from the first pass after the motion starts."""
+        win = self.mcfg['static_phase_window']
+        if win is None or self._motion_active() or self.motion is None or self.motion.view_phase is None:
+            return list(train_views)
+        c, hw = win
+        ph = self.motion.view_phase.detach().cpu().numpy()
+        d = np.abs(((ph - c) + 0.5) % 1.0 - 0.5)                  # circular phase distance
+        kept = [v for v in train_views if d[int(v)] <= hw]
+        if not kept:
+            raise ValueError(f"static phase window {win} keeps no training view")
+        return kept
+
     def _motion_active(self) -> bool:
         return (self.motion is not None
                 and (self.iterations_run + 1) >= self._motion_from_iter)
@@ -365,7 +416,58 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
         out['image'] = out['image'] * self.motion.intensity_scale(view)
         return out
 
+    @torch.no_grad()
+    def _load_basis_init(self) -> None:
+        """--dyn-basis-init: replace the basis by the fields in an .npz at the
+        moment the motion starts (``values`` (n_fields or parts x n_fields,
+        n_points, 3), world units, on this run's control grid: ``grid_shape``,
+        ``grid_lo``, ``grid_hi`` are checked). A single set of fields is
+        repeated over the (still tied) parts; the air gate's divergence
+        projection is applied once, so the start is an admissible field.
+        Codes, the free columns and everything else stay as they are."""
+        path = self.mcfg['basis_init']
+        z = np.load(path)
+        b = self.motion.basis
+        if tuple(int(v) for v in z['grid_shape']) != tuple(b.shape):
+            raise ValueError(f"basis init {path}: grid {tuple(z['grid_shape'])} != model grid {tuple(b.shape)}")
+        for key, mine in (('grid_lo', b.lo), ('grid_hi', b.hi)):
+            if not np.allclose(np.asarray(z[key], dtype=np.float64), mine.detach().cpu().numpy(), atol=1e-4):
+                raise ValueError(f"basis init {path}: {key} {z[key]} != model {mine.tolist()}")
+        v = torch.as_tensor(np.asarray(z['values'], dtype=np.float32), device=b.values.device)
+        rows, k = int(b.values.shape[0]), int(self.motion.n_fields)
+        if v.shape[0] == k and rows != k:
+            v = v.repeat(rows // k, 1, 1)
+        if tuple(v.shape) != tuple(b.values.shape):
+            raise ValueError(f"basis init {path}: values {tuple(v.shape)} != model {tuple(b.values.shape)}")
+        gate = self.motion._field_gate()
+        if gate is not None:
+            v = b.gated(gate, v)
+        b.values.copy_(v)
+        self._basis_init_done = True
+        print(f"  basis initialised from {path} at iteration {self.iterations_run + 1}: "
+              f"rms {float(v.pow(2).sum(-1).mean().sqrt()) / self.world_scale:.3f} mm"
+              + (", air-gated" if gate is not None else ""))
+
+    def _before_step(self) -> None:
+        """--dyn-freeze-basis-until N: the basis and the codes keep the values
+        they have (e.g. a --dyn-basis-init field) until iteration N: their
+        gradients are dropped, so Adam neither steps them nor builds moments,
+        while the cloud, the membership, the gain and every other group train.
+        --dyn-parts-freeze-membership drops the membership logits' gradient for
+        the whole run in the same way."""
+        n = self.mcfg['freeze_basis_until']
+        if self.motion is not None and n > 0 and (self.iterations_run + 1) < n:
+            self.motion.basis.values.grad = None
+            self.motion.codes.grad = None
+        # --dyn-parts-freeze-membership: the labels set at activation stay for the whole run
+        if (self.motion is not None and self.mcfg['parts_freeze_membership']
+                and self.motion.parts_logits is not None):
+            self.motion.parts_logits.grad = None
+
     def _render_train(self, cloud, cameras, view: int) -> dict:
+        if (self.mcfg['basis_init'] and not self._basis_init_done
+                and self._motion_active()):
+            self._load_basis_init()
         if not self._motion_active():
             return self._scaled(super()._render_train(cloud, cameras, view), view)
         return self._scaled(kernel.render(self.motion.displaced(cloud, view), cameras[view],
@@ -431,12 +533,13 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                 and (self.iterations_run + 1) >= self._parts_from_iter):
             self._activate_parts(cloud)
         p = self.motion.priors(unit=self._voxel_world)
+        part_w = 0.0 if self.mcfg['parts_freeze_membership'] else 1.0   # frozen labels: no membership terms
         loss = (loss + self.mcfg['reg_code'] * p['code_norm']
                 + self.mcfg['reg_code_smooth'] * p['code_smooth']
                 + self.mcfg['reg_amp'] * p['amp_norm']
                 + self.mcfg['reg_basis'] * p['basis_smooth']
-                + self.mcfg['reg_part_smooth'] * p['part_smooth']
-                + self.mcfg['reg_part_commit'] * p['part_commit'])
+                + part_w * (self.mcfg['reg_part_smooth'] * p['part_smooth']
+                            + self.mcfg['reg_part_commit'] * p['part_commit']))
         if self.mcfg['reg_disp'] > 0 and self.mcfg['max_disp_mm'] > 0:
             excess = self.motion.displacement_excess(
                 self.mcfg['max_disp_mm'] * self.world_scale)
@@ -500,7 +603,13 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
             # the divergence reads the gate only when it is air-sourced; the
             # bending weight reads it either way (prior_gate, or the air gate
             # itself in region 'air')
-            self.motion.set_air_gate(gate if self.mcfg['air_sourced'] else None)
+            div_gate = gate
+            if self.mcfg['parts_free_lung'] and gate.dim() == 2:
+                # --dyn-parts-free-lung: part 0's (the lung's) field is not projected (its divergence is
+                # free); the other parts keep their air gate; the bending weight below reads the gate as is
+                div_gate = gate.clone()
+                div_gate[0] = 1.0
+            self.motion.set_air_gate(div_gate if self.mcfg['air_sourced'] else None)
             g = gate
             pitch = float(self.mcfg['air_gate_mm'])
             mode = self.mcfg['reg_basis_lung_region']
@@ -548,10 +657,16 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
         xyz = cloud.xyz.detach()
         if self.motion.graph is None:
             self.motion.build_graph(xyz, k=self.mcfg['part_knn'])
+        labels = self._anatomy_labels(cloud) if self.mcfg['parts_init'] in ('anatomy', 'anatomy-mask', 'ribcage', 'ribcage3') else None
+        # frozen membership: one-hot labels (softmax of 30 vs 0 leaves 1e-13 to the other parts)
+        logit = 30.0 if self.mcfg['parts_freeze_membership'] else 2.0
         stats = self.motion.activate_parts(xyz, seed=int(self.seed),
-                                           volume_weight=self.mcfg['parts_volume_weight'])
+                                           volume_weight=self.mcfg['parts_volume_weight'],
+                                           labels=labels, logit=logit)
         if stats is None:
             return
+        if self.mcfg['parts_smooth_gate'] > 0:
+            self._set_graph_gate(cloud)
         if self._gate_wanted():
             self._refresh_air_gate(cloud)          # the gate becomes per part
         share = '; '.join(f"part {j}: {100 * v:.1f} %, |d| {stats['part_disp'][j] / self.world_scale:.3f} mm, "
@@ -571,6 +686,205 @@ class DynamicGaussianReconstructor(GaussianReconstructor):
                          **{f'diag/motion/parts_init_disp_mm_{j}': float(v) / self.world_scale
                             for j, v in enumerate(stats['part_disp'])}},
                         step=int(self.iterations_run))
+
+    @torch.no_grad()
+    def _rest_air_fraction(self, cloud):
+        """The rest render at the air-gate pitch in HU, its geometry, the
+        primitives' rest positions (mm) and their air-bearing fraction
+        (`ventilation.air_bearing` sampled at those positions)."""
+        from . import export4d, ventilation
+        geom = export4d.coarse_geometry(export_grid_geometry(self.geometry), self.mcfg['air_gate_mm'])
+        mu = export4d.render_grid(cloud, geom, self.world_scale, self.signal_scale, self._export_chunk)
+        anchors = resolve_anchors(mu, 'auto')
+        hu = mu * float(anchors.scale) + float(anchors.offset)
+        xyz_mm = (cloud.xyz.detach() / self.world_scale).cpu().numpy()
+        a = ventilation.air_bearing(ventilation.sample(hu, geom, xyz_mm, order=1))
+        return hu, geom, xyz_mm, a
+
+    @torch.no_grad()
+    def _set_graph_gate(self, cloud) -> None:
+        """--dyn-parts-smooth-gate SIGMA: the membership-smoothness edges
+        weighted by exp(-(g_i - g_j)^2 / SIGMA), g the air-bearing fraction of
+        the rest render, so the smoothing does not cross the pleura."""
+        _, _, _, a = self._rest_air_fraction(cloud)
+        self.motion.set_graph_gate(torch.as_tensor(a, device=cloud.xyz.device),
+                                   self.mcfg['parts_smooth_gate'])
+        gate = self.motion.graph_gate
+        print(f"  membership graph gated by the air fraction (sigma {self.mcfg['parts_smooth_gate']:g}): "
+              f"{100 * float((gate < 0.5).float().mean()):.1f} % of the edges below 0.5")
+
+    @torch.no_grad()
+    def _inferior_is_low(self, cloud, xyz_mm, in_lung, lung, zs, hu=None, geom=None) -> bool:
+        """Which end of the z axis is INFERIOR (the lung base), for the
+        anatomy labellers. --dyn-parts-inferior low|high forces it; 'auto'
+        (default) reads it from the single field's SI motion at activation,
+        three signals in order, all logged:
+
+        1. SLAB: mean |dz| of the NON-lung soft-tissue primitives (HU <
+           `RIBCAGE_BONE_HU`, in lung-bearing columns) in the slab beyond each
+           lung end, 15 % of the lung's z extent high: the abdomen beyond the
+           base moves with the diaphragm, the tissue beyond the apex barely
+           moves. It needs a FORMED single field: with the parts activating
+           at the motion start the field is its random init and every signal
+           is a coin flip (MEASURED, DIR 1 / DIR 4 at parts_from 0.3 =
+           motion_from: margins 0.00-0.06, the apex chosen on two runs). With
+           6,400 iterations of motion first (parts_from 0.4, motion_from
+           0.3): margin 0.92 DIR 1, 0.78 DIR 4, both the true base;
+        2. LUNG-END: mean |dz| of the lung primitives in the lowest / highest
+           15 % of their z (thin on DIR 4: 0.01 to 0.16 between replicates);
+        3. AREA: the end with the larger lung cross-section (picks the apex on
+           Scan_1510 and DIR 4).
+
+        A signal is used when both of its ends hold >= 20 primitives and the
+        larger |dz| is >= 0.01 mm; otherwise the next one. The used signal's
+        relative margin |a - b| / max is logged, with "orientation margin LOW"
+        below `ORIENTATION_MARGIN_FLOOR` (the choice stands; the scorer's
+        audit flags the row for review)."""
+        area = lung.sum((0, 1))
+        k = max(1, zs.size // 3)
+        by_area = bool(area[zs[:k]].sum() > area[zs[-k:]].sum())
+        mode = self.mcfg['parts_inferior']
+        if mode in ('low', 'high'):
+            print(f"  inferior end of z: {mode} (--dyn-parts-inferior); the area rule says "
+                  f"{'low' if by_area else 'high'}")
+            return mode == 'low'
+        m = self.motion
+        xyz = cloud.xyz.detach()
+        code = torch.zeros(m.n_fields, device=xyz.device)
+        if m.n_fixed:
+            code[0] = 1.0                       # the gate / breathing contrast, as activate_parts
+        else:
+            code = torch.stack([m.full_code(v) for v in range(m.n_views)]).mean(dim=0)
+        dz = m.displacement(xyz, code.to(xyz.device), parts=None)[:, 2].abs().cpu().numpy() / self.world_scale
+        z = xyz_mm[:, 2]
+
+        def ends(sel_lo, sel_hi):
+            if int(sel_lo.sum()) < 20 or int(sel_hi.sum()) < 20:
+                return None
+            d_lo, d_hi = float(dz[sel_lo].mean()), float(dz[sel_hi].mean())
+            return None if max(d_lo, d_hi) < 0.01 else (d_lo, d_hi)
+
+        signals = {}
+        zl = z[in_lung]
+        if zl.size >= 20:
+            if hu is not None and geom is not None:
+                from . import ventilation
+                nx, ny = (int(v) for v in geom['vol_shape'][:2])
+                dx = float(geom['dx']); ox, oy = float(geom['vol_origin'][0]), float(geom['vol_origin'][1])
+                ix = np.clip(np.round((xyz_mm[:, 0] - ox) / dx + (nx - 1) / 2.0).astype(int), 0, nx - 1)
+                iy = np.clip(np.round((xyz_mm[:, 1] - oy) / dx + (ny - 1) / 2.0).astype(int), 0, ny - 1)
+                soft = ~in_lung & (ventilation.sample(hu, geom, xyz_mm, order=1) < RIBCAGE_BONE_HU) & lung.any(2)[ix, iy]
+                z0, z1 = float(zl.min()), float(zl.max()); h = 0.15 * (z1 - z0)
+                signals['slab'] = ends(soft & (z < z0) & (z >= z0 - h), soft & (z > z1) & (z <= z1 + h))
+            lo, hi = np.percentile(zl, [15, 85])
+            signals['lung-end'] = ends(in_lung & (z <= lo), in_lung & (z >= hi))
+        desc = '; '.join(f"{k} " + (f"{v[0]:.3f} low vs {v[1]:.3f} high" if v else "n/a") for k, v in signals.items())
+        used = next((k for k in ('slab', 'lung-end') if signals.get(k)), None)
+        if used is None:
+            print(f"  WARNING: no measurable SI motion at the lung ends ({desc or 'no lung'}): inferior end "
+                  f"by the area rule, {'low' if by_area else 'high'}; set --dyn-parts-inferior if that is wrong")
+            return by_area
+        d_lo, d_hi = signals[used]
+        by_motion = d_lo > d_hi
+        margin = abs(d_lo - d_hi) / max(d_lo, d_hi)
+        print(f"  inferior end of z: {'low' if by_motion else 'high'} by the {used} signal ({desc}); the area rule says "
+              f"{'low' if by_area else 'high'}; relative margin {margin:.2f}"
+              + (f"  orientation margin LOW (< {ORIENTATION_MARGIN_FLOOR:g})" if margin < ORIENTATION_MARGIN_FLOOR else "")
+              + ("  WARNING: the rules disagree, the motion rule is used" if by_motion != by_area else ""))
+        return by_motion
+
+    @torch.no_grad()
+    def _anatomy_labels(self, cloud) -> torch.Tensor:
+        """--dyn-parts-init anatomy: the parts from the anatomy of the rest
+        state instead of from the field's motion (k-means on a mass-preserving
+        field isolates its few high-divergence primitives and the parts never
+        form). On the rest render at the air-gate pitch: part 0 = air-bearing
+        (fraction > 0.5) inside the lung mask; part 2 = the rest INFERIOR to
+        the lung base of its column (below the diaphragm), or beyond the
+        lungs' inferior extent where a column has no lung; part 1 = all else
+        (chest wall, mediastinum, outside air). The inferior end of the z axis
+        is the one where the lung cross-section is larger (the lung base).
+        'anatomy-mask': part 0 = every primitive centred in the lung mask
+        dilated by one voxel, whatever its air fraction.
+        'ribcage' (two parts, any --dyn-parts >= 2, the others stay empty):
+        part 0 = the CONTENTS, every primitive in the lung mask dilated by one
+        voxel plus every primitive of a lung-bearing column inferior to that
+        column's lung base with HU < `RIBCAGE_BONE_HU` (diaphragm, liver,
+        abdomen); part 1 = the RIB CAGE, everything else (bone, chest wall,
+        mediastinum and heart, which sit above the lung base, and every column
+        without lung). The lung slides against the rib cage, not against the
+        diaphragm: cutting the lung from the diaphragm leaves its low-contrast
+        interior free to expand about any anchor (MEASURED, DIR 1 arm F: the
+        right volume change, the wrong SI direction).
+        'ribcage3' (--dyn-parts 3): as 'ribcage', with part 2 = the
+        MEDIASTINUM taken out of the rib cage: non-bone primitives (HU <
+        `RIBCAGE_BONE_HU`) in lung-free columns that have lung-bearing columns
+        on BOTH sides along the left-right axis (medial to both lungs), within
+        the lungs' z extent. The left-right axis is the in-plane axis along
+        which the two largest lung components' centroids differ most."""
+        from scipy import ndimage as ndi
+        from . import ventilation
+        n = self.motion.n_parts
+        ribcage = self.mcfg['parts_init'] in ('ribcage', 'ribcage3')
+        if n != 3 and not (self.mcfg['parts_init'] == 'ribcage' and n >= 2):
+            raise ValueError("--dyn-parts-init anatomy needs --dyn-parts 3 (ribcage: >= 2)")
+        hu, geom, xyz_mm, a = self._rest_air_fraction(cloud)
+        lung = ventilation.lung_mask(hu, float(self.mcfg['air_gate_mm']))
+        mask_only = self.mcfg['parts_init'] in ('anatomy-mask', 'ribcage', 'ribcage3')
+        # anatomy-mask: the lung part = every primitive centred in the lung mask dilated by one voxel, whatever
+        # its air fraction (MEASURED, DIR 1: the air > 0.5 rule carries only ~40 % of the rendered lung interior;
+        # vessels, airway walls and wide primitives fall to the wall part)
+        # --dyn-parts-band-mm: the contents take the lung dilated by that distance (0 = one voxel at the gate pitch)
+        n_dil = max(1, int(round(self.mcfg['parts_band_mm'] / float(self.mcfg['air_gate_mm'])))) if self.mcfg['parts_band_mm'] > 0 else 1
+        region = ndi.binary_dilation(lung, iterations=n_dil) if mask_only else lung
+        in_lung = ventilation.sample(region.astype(np.float32), geom, xyz_mm, order=0) > 0.5
+        nx, ny, nz = (int(v) for v in geom['vol_shape'])
+        zs = np.where(lung.any((0, 1)))[0]
+        if zs.size == 0:
+            raise ValueError("--dyn-parts-init anatomy: no lung in the rest render")
+        area = lung.sum((0, 1))
+        inf_low = self._inferior_is_low(cloud, xyz_mm, in_lung, lung, zs, hu=hu, geom=geom)
+        has = lung.any(2)
+        base = np.where(has, np.argmax(lung, 2) if inf_low else nz - 1 - np.argmax(lung[:, :, ::-1], 2), -1)
+        dx, dz = float(geom['dx']), float(geom['dz']); ox, oy, oz = (float(v) for v in geom['vol_origin'])
+        ix = np.clip(np.round((xyz_mm[:, 0] - ox) / dx + (nx - 1) / 2.0).astype(int), 0, nx - 1)
+        iy = np.clip(np.round((xyz_mm[:, 1] - oy) / dx + (ny - 1) / 2.0).astype(int), 0, ny - 1)
+        iz = (xyz_mm[:, 2] - oz) / dz + (nz - 1) / 2.0
+        b = base[ix, iy].astype(np.float64)
+        glob = float(zs.min() if inf_low else zs.max())
+        b = np.where(b < 0, glob, b)
+        inferior = (iz < b) if inf_low else (iz > b)
+        if ribcage:
+            soft = ventilation.sample(hu, geom, xyz_mm, order=1) < RIBCAGE_BONE_HU
+            contents = in_lung | ((base[ix, iy] >= 0) & inferior & soft)
+            labels = np.where(contents, 0, 1)
+            if self.mcfg['parts_init'] == 'ribcage3':
+                comp, k = ndi.label(has)
+                if k < 2:
+                    raise ValueError("--dyn-parts-init ribcage3: fewer than two lung components in projection")
+                sizes = ndi.sum(has, comp, index=np.arange(1, k + 1))
+                big = np.argsort(sizes)[::-1][:2] + 1
+                cen = np.array([np.argwhere(comp == c).mean(axis=0) for c in big])
+                lr = int(np.argmax(np.abs(cen[0] - cen[1])))          # in-plane left-right axis (0 or 1)
+                lo_side = np.maximum.accumulate(has, axis=lr)          # lung at or below this index along lr
+                hi_side = np.flip(np.maximum.accumulate(np.flip(has, axis=lr), axis=lr), axis=lr)
+                medial = lo_side & hi_side & ~has
+                at_level = (iz >= zs.min()) & (iz <= zs.max())
+                medi = ~contents & soft & medial[ix, iy] & at_level
+                labels = np.where(medi, 2, labels)
+                print(f"  rib-cage parts (3): contents {100 * (labels == 0).mean():.1f} %, rib cage "
+                      f"{100 * (labels == 1).mean():.1f} %, mediastinum {100 * (labels == 2).mean():.1f} % "
+                      f"(left-right = grid axis {lr})")
+                return torch.as_tensor(labels, device=cloud.xyz.device)
+            print(f"  rib-cage parts: contents (lung + below the lung base, HU < {RIBCAGE_BONE_HU:g}) "
+                  f"{100 * (labels == 0).mean():.1f} %, rib cage {100 * (labels == 1).mean():.1f} % "
+                  f"(inferior end of z: {'low' if inf_low else 'high'})")
+            return torch.as_tensor(labels, device=cloud.xyz.device)
+        labels = np.where(((a > 0.5) | mask_only) & in_lung, 0, np.where(inferior, 2, 1))
+        print(f"  anatomical parts: lung {100 * (labels == 0).mean():.1f} %, wall + mediastinum "
+              f"{100 * (labels == 1).mean():.1f} %, below the lung base {100 * (labels == 2).mean():.1f} % "
+              f"(inferior end of z: {'low' if inf_low else 'high'})")
+        return torch.as_tensor(labels, device=cloud.xyz.device)
 
     def _state(self, cloud) -> dict:
         s = super()._state(cloud)
