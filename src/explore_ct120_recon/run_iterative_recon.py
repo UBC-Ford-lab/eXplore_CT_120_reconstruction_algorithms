@@ -501,6 +501,13 @@ def main():
             log_fn=logger.log,
         )
     elif args.backend == 'tigre':
+        # Frames unwarped with the same-epoch vendor field carry the in-plane
+        # rotation already; resolve_or_measure_detector_psi returned None for
+        # that reason, NOT because no calibration exists — so the inline
+        # conjugate fallback must not run either (it applied psi -0.033 deg
+        # to Scan_1988 wave 1, where every other backend used psi = 0).
+        tigre_autocal = (args.geometry_autocal and
+                         (ctx.detector_warp or {}).get('mode') != 'full')
         reconstructor = TIGREReconstructor(
             detector_psi_deg=ext_psi,
             projections=ctx.projections,
@@ -518,7 +525,7 @@ def main():
             air_normalization=args.air_normalization,
             soft_clip_sharpness=args.soft_clip_sharpness,
             ring_median_width=args.ring_median_width,
-            geometry_autocal=args.geometry_autocal,
+            geometry_autocal=tigre_autocal,
             crossval=not args.no_crossval,
             holdout_index=holdout_arg,
             withhold_eval=args.withhold_eval,

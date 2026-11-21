@@ -82,7 +82,7 @@ def fdk_angles_to_tigre(angles_fdk):
 
 
 def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None,
-                         cpa_raw=None, min_nxy=None):
+                         cpa_raw=None, min_nxy=None, cpb_raw=None):
     """
     Build a TIGRE Geometry object from the FDK geometry dict.
 
@@ -176,24 +176,38 @@ def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None,
     #                     projected image by -D/dDetector columns, so the iso
     #                     ray lands at centre - D/d. To put it at cpa_raw:
     #                         offDetector[1] = (centre_raw - cpa_raw) * da_raw
+    #   offDetector[0]  = detector-space ROW shift in mm, same form: +D mm
+    #                     moves the image by -D/dDetector rows (measured
+    #                     2026-11-21: +1 mm -> -2.00 rows at 0.5 mm pitch), so
+    #                         offDetector[0] = (centre_raw - cpb_raw) * db_raw
+    #                     Rows are NOT flipped for TIGRE, so cpb needs no
+    #                     mirror. tests/test_tigre_cor_convention.py pins both.
     #   (COR is an OBJECT-space axis shift and comes out magnified by DSD/DSO —
     #    measured -5.61 px for +2 mm vs offDetector's -5.00 — so it is NOT the
     #    right knob for a detector-referenced column centre.)
     #
-    # detector_psi_deg / cpa_raw of None reproduce the pre-2026-08-11 behaviour
-    # EXACTLY (both terms zero) — that is the revert path.
+    # detector_psi_deg / cpa_raw / cpb_raw of None reproduce the
+    # pre-2026-08-11 behaviour EXACTLY (all terms zero) — that is the revert
+    # path. cpa_raw is in TIGRE's column-flipped frame; cpb_raw is not.
     psi = float(detector_psi_deg or 0.0)
     geo.rotDetector = np.array([np.radians(psi), 0.0, 0.0])
     if psi:
         print(f"  Detector in-plane rotation: psi = {psi:+.4f} deg "
               f"(rotDetector[0])")
+    off_row_mm, off_col_mm = 0.0, 0.0
     if cpa_raw is not None:
         centre_raw = (N_a - 1) / 2.0
         off_col_mm = (centre_raw - float(cpa_raw)) * float(geometry['da'])
-        geo.offDetector = np.array([0.0, off_col_mm])
         print(f"  Column CoR: cpa {float(cpa_raw):.2f} raw "
               f"({float(cpa_raw) - centre_raw:+.2f} from centre) -> "
               f"offDetector[1] = {off_col_mm:+.5f} mm")
+    if cpb_raw is not None:
+        centre_b = (N_b - 1) / 2.0
+        off_row_mm = (centre_b - float(cpb_raw)) * float(geometry['db'])
+        print(f"  Central row: cpb {float(cpb_raw):.2f} raw "
+              f"({float(cpb_raw) - centre_b:+.2f} from centre) -> "
+              f"offDetector[0] = {off_row_mm:+.5f} mm")
+    geo.offDetector = np.array([off_row_mm, off_col_mm])
 
     # Accuracy for ray-tracing interpolation
     geo.accuracy = 0.5
@@ -218,6 +232,31 @@ def _restore_geo_scalars(geo, scalars):
     geo.offDetector = scalars['offDetector'].copy()
     geo.rotDetector = scalars['rotDetector'].copy()
     geo.COR = scalars['COR']
+
+
+def tigre_detector_terms(geometry, N_a, N_b, psi_deg=None):
+    """psi and the centre of rotation, mapped into TIGRE's detector frame.
+
+    ``geometry['central_pixel_a' / 'central_pixel_b']`` are the detector column
+    / row the source-to-isocentre ray hits in the ct_core (unflipped) frame —
+    the one definition every backend shares (tests/test_cor_convention.py).
+    Missing keys fall back to the geometric centre. ``psi_deg`` is measured on
+    the unflipped sinogram too (None = 0).
+
+    The sinogram is column-flipped for TIGRE (``sinogram[:, :, ::-1]``), so
+    under c -> (N_a-1)-c:
+        psi_tigre = -psi           (a mirror reverses an in-plane rotation)
+        cpa_tigre = (N_a-1) - cpa  (the centre reflects about itself)
+        cpb       unchanged        (rows are not flipped)
+    Skipping the mirror would apply both column terms BACKWARDS — doubling
+    the error rather than removing it.
+
+    Returns (psi_tigre_deg, cpa_tigre, cpb) for ``build_tigre_geometry``.
+    """
+    cpa = float(geometry.get('central_pixel_a', (N_a - 1) / 2.0))
+    cpb = float(geometry.get('central_pixel_b', (N_b - 1) / 2.0))
+    psi = float(psi_deg or 0.0)
+    return -psi, (N_a - 1) - cpa, cpb
 
 
 def geometric_row_weights(geo, angles, gpuids=None,
@@ -719,18 +758,27 @@ class TIGREReconstructor:
         Nx_orig, Ny_orig, Nz_orig = self.geometry['vol_shape']
         print("\nBuilding TIGRE geometry...")
         # ---- geometry auto-calibration (reference-free, ~1 s) ---------------
-        # Measures the detector in-plane rotation psi and the column centre of
-        # rotation from THIS scan's conjugate rays, before reconstructing. Both
-        # were hard-zero here before 2026-08-11. Set geometry_autocal=False to
-        # reproduce that exactly.
-        _psi_deg, _cpa_raw = None, None
+        # Measures the detector in-plane rotation psi from THIS scan's
+        # conjugate rays, before reconstructing. Set geometry_autocal=False to
+        # skip it (psi = 0) — the driver does so for frames unwarped with the
+        # same-epoch vendor field, which already carry the rotation.
+        #
+        # The CENTRE OF ROTATION is never measured here: it is the loader's
+        # central_pixel_a / central_pixel_b (ct_core.pipeline.apply_cor_policy
+        # — vendor values or the geometric centre, per --cor-mode), the same
+        # axis FDK, the voxel/INR ray sampler and the Gaussian camera use.
+        # Until 2026-11-21 this backend ignored both and always put the axis
+        # at the detector centre (offDetector [0, 0]): on the 2026-epoch
+        # vendor-CoR scans that is a 0.1-0.3 mm column and 0.3-0.7 mm row
+        # error (Scan_1510 / Scan_1988 wave 1), which doubled edges and
+        # shifted SIRT in z against every other backend.
+        _psi_deg = None
         if self.detector_psi_deg is not None:
             # External calibration (half-scan consistency JSON) wins over the
             # inline conjugate fit — it is the validated, unbiased estimator.
             _psi_deg = self.detector_psi_deg
-            _cpa_raw = (self.N_a - 1) / 2.0
             print(f"\nGeometry: psi = {_psi_deg:+.4f} deg from external "
-                  f"calibration (CoR at the geometric centre)")
+                  f"calibration")
         elif self.geometry_autocal:
             try:
                 import torch as _torch
@@ -758,36 +806,29 @@ class TIGREReconstructor:
                     # (2026-08-12) shows the geometric centre round at the
                     # midplane and both z extremes. The intercept is still
                     # fitted — the joint fit needs it as a nuisance
-                    # parameter — but it is not APPLIED.
-                    _psi_deg, _cpa_raw = _r["psi_deg"], _g["central_pixel_a"]
+                    # parameter — but it is not APPLIED. The CoR applied is
+                    # the loader's central_pixel_a (see above).
+                    _psi_deg = _r["psi_deg"]
                     print(f"  psi = {_psi_deg:+.4f} deg  (fitted cpa0 "
                           f"{_r['cpa0']:.3f} NOT applied — known estimator "
-                          f"bias; CoR stays at the geometric centre "
-                          f"{_g['central_pixel_a']:.1f}), joint depth "
+                          f"bias), joint depth "
                           f"{_r.get('joint_depth', float('nan')):.2f}")
                 else:
                     print(f"  REJECTED (psi {_r['psi_deg']:+.3f}, depth "
-                          f"{_r.get('joint_depth', 0.0):.2f}) — using psi=0, "
-                          f"centred CoR")
+                          f"{_r.get('joint_depth', 0.0):.2f}) — using psi=0")
             except Exception as _e:
                 print(f"  geometry auto-calibration FAILED ({type(_e).__name__}: "
-                      f"{_e}) — using psi=0, centred CoR")
+                      f"{_e}) — using psi=0")
 
-        # MIRROR BOTH TERMS. The sinogram is column-flipped for TIGRE at Step 5
-        # (`sinogram[:, :, ::-1]`), AFTER this geometry is built, but psi and
-        # cpa0 were measured on the UNFLIPPED array. Under a column mirror
-        # c -> (N_a-1)-c:
-        #     psi_tigre = -psi           (a mirror reverses an in-plane rotation)
-        #     cpa_tigre = (N_a-1) - cpa  (the centre reflects about itself)
-        # Skipping this would apply both corrections BACKWARDS — i.e. double the
-        # error rather than remove it.
-        if _psi_deg is not None:
-            _psi_deg = -_psi_deg
-            _cpa_raw = (self.N_a - 1) - _cpa_raw
-            print(f"  mirrored for TIGRE's flipped detector: psi "
-                  f"{_psi_deg:+.4f} deg, cpa {_cpa_raw:.3f}")
+        _psi_t, _cpa_t, _cpb = tigre_detector_terms(
+            self.geometry, self.N_a, self.N_b, _psi_deg)
+        print(f"  Detector terms for TIGRE's column-flipped frame: psi "
+              f"{_psi_t:+.4f} deg, cpa {_cpa_t:.3f}, cpb {_cpb:.3f} "
+              f"(loader axis: column {self.geometry.get('central_pixel_a', float('nan')):.3f}, "
+              f"row {self.geometry.get('central_pixel_b', float('nan')):.3f})")
         geo = build_tigre_geometry(self.geometry, self.N_b, self.N_a,
-                                   detector_psi_deg=_psi_deg, cpa_raw=_cpa_raw)
+                                   detector_psi_deg=_psi_t, cpa_raw=_cpa_t,
+                                   cpb_raw=_cpb)
         print(f"  DSD={float(geo.DSD):.2f} mm, DSO={float(geo.DSO):.2f} mm")
         print(f"  Detector: {geo.nDetector} px, {geo.dDetector} mm/px")
         print(f"  Volume: {geo.nVoxel} voxels (z,y,x), {geo.dVoxel} mm/voxel")
