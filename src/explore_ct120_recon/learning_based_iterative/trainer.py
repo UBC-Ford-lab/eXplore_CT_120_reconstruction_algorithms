@@ -204,8 +204,19 @@ class LearnedReconstructor:
                  view_groups=None,
                  view_phase=None,
                  noise_calibration=None,
-                 warm_start=None):
+                 warm_start=None,
+                 snapshots=None,
+                 snapshot_test_views=None):
         self.projections = projections
+        # Opt-in iteration snapshots (`.snapshots.SnapshotConfig`): the field
+        # on the export grid at a schedule of iterations, with the held-out
+        # and (``snapshot_test_views`` = (sinogram, angles, labels)) test-view
+        # scores at each. None — the default — writes nothing and changes
+        # nothing.
+        self.snapshots = snapshots
+        self.snapshot_test_views = snapshot_test_views
+        #: What the snapshots did, for recon.json; None when off.
+        self.snapshot_report: dict | None = None
         # Opt-in FDK warm start (`.warm_start.WarmStart`): the representation
         # is fitted to an FDK volume of the TRAINING views, then handed over
         # to the projection objective through a short anchored phase. None —
@@ -1322,6 +1333,12 @@ class LearnedReconstructor:
 
         best_it = 0
         lcurve_snapshots: dict = {}
+        snap, snap_time = None, 0.0
+        if self.snapshots is not None:
+            snap = self._snapshot_writer(model, domain, device, spp, amp_dtype,
+                                         eval_fn=((lambda: scorer.score(
+                                             _render_eval().cpu().numpy()))
+                                             if holdout is not None else None))
         t0 = time.time()
         stop_reason = "max iterations"
 
@@ -1381,10 +1398,14 @@ class LearnedReconstructor:
             project_nonneg(model)
             if self._on_step is not None:
                 self._on_step(model, it, loss)
+            if snap is not None and snap[0].due(it + 1):
+                t_s = time.time()
+                snap[1](it + 1, loss, t_s - t0 - snap_time)
+                snap_time += time.time() - t_s
 
             if self.log_every and (it % self.log_every == 0 or it == self.iterations - 1):
                 report('train', it + 1, self.iterations)
-                rate = (it + 1) / max(1e-9, time.time() - t0)
+                rate = (it + 1) / max(1e-9, time.time() - t0 - snap_time)
                 seen = budget_after(it + 1)['visits']
                 _lr_now = float(optimizer.param_groups[0]["lr"])
                 print(f"  iter {it:6d}/{self.iterations}  loss {loss.item():.3e}  "
@@ -1500,6 +1521,10 @@ class LearnedReconstructor:
         self.data_coverage = final_budget['coverage']
         print(f"  Training finished after {self.iterations_run} iterations "
               f"({elapsed/60:.1f} min): {stop_reason}")
+        if snap is not None:
+            print(f"    of which {snap_time / 60:.1f} min writing "
+                  f"{len(snap[0].rows)} snapshots; training alone "
+                  f"{(elapsed - snap_time) / 60:.1f} min")
         print(f"  Data consumed: {self.data_visits:.2f} visits per measurement "
               f"({self.iterations_run} x {self.rays_per_batch} rays = "
               f"{self.iterations_run * self.rays_per_batch / 1e6:.1f} M of "
@@ -1577,6 +1602,15 @@ class LearnedReconstructor:
         self._final_export = True   # only this render moves the GUI's progress bar
         vol = self.export_volume(model, domain, device)
         self.reconstructed_volume = vol
+        if snap is not None:
+            try:
+                snap[0].write_delivered(
+                    vol, self.delivered_iter, self.stop_iter,
+                    restored=self.delivered_iter != self.stop_iter)
+            except Exception as e:                   # noqa: BLE001
+                print(f"  snapshot: delivered frame failed "
+                      f"({type(e).__name__}: {e})")
+            self.snapshot_report = snap[0].summary()
         return vol
 
     # ------------------------------------------------------- opt-in features
@@ -1638,6 +1672,63 @@ class LearnedReconstructor:
                                     f'{self.lr_warmup_iters}-iteration LR warmup')
         return report
 
+    def _snapshot_writer(self, model, domain, device, spp, amp_dtype, *,
+                         eval_fn):
+        """(writer, write(it1, loss, train_seconds)) for this run's snapshots.
+
+        A representation with the default ``export_volume`` is evaluated on
+        the snapshot grid directly; one that overrides it (its parameters are
+        the volume) is exported and cropped. Every render here is a read: no
+        gradients, no random numbers, the module's train/eval state restored.
+        """
+        from .snapshots import SnapshotWriter, save_checkpoint
+        cfg = self.snapshots
+        writer = SnapshotWriter(cfg, self.geometry, self.iterations,
+                                algorithm=type(self).__name__)
+        renders_points = (self._export_fn is None and type(self).export_volume
+                          is LearnedReconstructor.export_volume)
+        render_grid = ((lambda g: render_volume(model, g, domain, device=device))
+                       if renders_points else None)
+
+        def export_full():
+            return self.export_volume(model, domain, device)
+
+        def checkpoint(path, it1):
+            save_checkpoint(path, model, geometry=self.geometry, domain=domain,
+                            iteration=it1, meta=cfg.checkpoint_meta)
+
+        def write(it1, loss, train_seconds):
+            try:
+                test = None
+                if self.snapshot_test_views is not None:
+                    sino, ang, labels = self.snapshot_test_views
+                    test = self._score_views_with(
+                        model, domain, spp, amp_dtype, device, self.geometry,
+                        sino, ang, labels)
+                writer.write(it1, render_grid=render_grid,
+                             export_full=export_full,
+                             loss=float(loss.detach().float().item()),
+                             train_seconds=train_seconds,
+                             holdout=eval_fn() if eval_fn is not None else None,
+                             test=test, checkpoint_fn=checkpoint)
+            except Exception as e:                   # noqa: BLE001
+                # a frame is not worth ending a run over
+                print(f"  snapshot: iteration {it1} failed "
+                      f"({type(e).__name__}: {e}) — continuing")
+        return writer, write
+
+    def save_model_checkpoint(self, path, *, meta: dict | None = None) -> None:
+        """The DELIVERED iterate's weights, rebuildable by
+        ``run_render_checkpoint`` (no optimizer state: re-render, not
+        resume)."""
+        from .snapshots import save_checkpoint
+        ctx = getattr(self, '_eval_context', None)
+        if ctx is None:
+            raise RuntimeError("save_model_checkpoint needs a finished reconstruct()")
+        save_checkpoint(path, ctx['model'], geometry=self.geometry,
+                        domain=ctx['domain'], iteration=self.delivered_iter,
+                        meta=meta)
+
     @torch.no_grad()
     def score_views(self, sinogram_views, angles, labels) -> dict:
         """Score the trained model on views it never saw — the test views.
@@ -1653,9 +1744,19 @@ class LearnedReconstructor:
         ctx = getattr(self, '_eval_context', None)
         if ctx is None:
             raise RuntimeError("score_views needs a finished reconstruct()")
+        return self._score_views_with(ctx['model'], ctx['domain'], ctx['spp'],
+                                      ctx['amp_dtype'], ctx['device'],
+                                      ctx['geometry'], sinogram_views, angles,
+                                      labels)
+
+    @torch.no_grad()
+    def _score_views_with(self, model, domain, spp, amp_dtype, device,
+                          geometry, sinogram_views, angles, labels) -> dict:
+        """``score_views`` with the model and its rendering context explicit,
+        so a snapshot can score the test views mid-run. A read: no random
+        numbers (stratified=False), no gradients, nothing about the model or
+        the optimizer changes."""
         from ..ct_core.projection_diag import covered_detector_window
-        device = ctx['device']
-        geometry, domain = ctx['geometry'], ctx['domain']
         sino = torch.as_tensor(np.ascontiguousarray(sinogram_views),
                                dtype=torch.float32, device=device)
         ang = torch.as_tensor(np.asarray(angles), dtype=torch.float32,
@@ -1671,16 +1772,15 @@ class LearnedReconstructor:
         shape = bb.shape
         hb, ha = bb.reshape(-1), aa.reshape(-1)
         rows, chunk = [], max(1, int(self.rays_per_batch) or 16384)
-        model = ctx['model']
         for k, label in enumerate(labels):
             o, d, t = rays_from_indices(tscene, torch.full_like(hb, k), hb, ha)
             pred = torch.empty(o.shape[0], device=device)
-            with autocast_ctx(ctx['amp_dtype'], device.type):
+            with autocast_ctx(amp_dtype, device.type):
                 for i0 in range(0, o.shape[0], chunk):
                     i1 = min(i0 + chunk, o.shape[0])
                     pred[i0:i1] = self._render_fn(
                         o[i0:i1], d[i0:i1], model, tscene,
-                        num_samples=ctx['spp'], stratified=False,
+                        num_samples=spp, stratified=False,
                         generator=None, grad_scale_fn=None).float()
             m = HoldoutScorer(t.reshape(shape).cpu().numpy(),
                               label=f"test view {label}").score(

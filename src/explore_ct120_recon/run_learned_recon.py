@@ -401,6 +401,93 @@ def add_warm_start_args(parser) -> None:
                    '(default: %(default)s).')
 
 
+def add_snapshot_args(parser) -> None:
+    """Opt-in iteration snapshots and model checkpoints
+    (``learning_based_iterative.snapshots``)."""
+    g = parser.add_argument_group(
+        'snapshots and checkpoints (opt-in)',
+        'Write the field (mu, on the export grid, the delivered volume\'s '
+        'lattice and orientation) at a schedule of iterations, through to the '
+        'stopping iteration, with the held-out and test-view scores at each '
+        '(index.csv / manifest.json). Same code for every representation '
+        'trained by the shared loop (voxel, mlp); not for gaussian.')
+    g.add_argument('--snapshot-dir', default=None, metavar='DIR',
+                   help='Where the frames go; giving it turns snapshots on.')
+    g.add_argument('--snapshot-iters', type=int, nargs='+', default=None,
+                   metavar='N', help='Explicit iterations to capture.')
+    g.add_argument('--snapshot-every', type=int, default=0, metavar='N',
+                   help='Also every N iterations (default: 0 = off).')
+    g.add_argument('--snapshot-first', type=int, default=0, metavar='N',
+                   help='Also a geometric ladder from iteration N '
+                        '(default: 0 = off) ...')
+    g.add_argument('--snapshot-ratio', type=float, default=1.35, metavar='R',
+                   help='... with this ratio (default: %(default)s, as '
+                        'inr_pipeline.snapshot_voxel).')
+    g.add_argument('--snapshot-max', type=int, default=200, metavar='N',
+                   help='Cap on frames; the middle is thinned (default: '
+                        '%(default)s).')
+    g.add_argument('--snapshot-box', type=float, nargs=6, default=None,
+                   metavar=('X0', 'X1', 'Y0', 'Y1', 'Z0', 'Z1'),
+                   help='Cut each frame to these isocentre mm bounds (on the '
+                        'same lattice).')
+    g.add_argument('--snapshot-axial', type=int, nargs='+', default=None,
+                   metavar='K', help='Write only these axial slices (indices '
+                   'into the snapshot grid) instead of the volume.')
+    g.add_argument('--snapshot-coronal', type=int, nargs='+', default=None,
+                   metavar='J', help='... and/or these coronal slices.')
+    g.add_argument('--snapshot-sagittal', type=int, nargs='+', default=None,
+                   metavar='I', help='... and/or these sagittal slices.')
+    g.add_argument('--snapshot-dtype', choices=('float16', 'float32'),
+                   default='float16',
+                   help='Stored precision (default: %(default)s; ~0.5 HU '
+                        'steps at mu 0.02, below the noise).')
+    g.add_argument('--snapshot-checkpoints', action='store_true',
+                   help='Also save the model weights at every snapshot '
+                        '(a log2-25 hash table is ~1.9 GB each). Off by '
+                        'default.')
+    g.add_argument('--save-checkpoint', action='store_true',
+                   help='Save the DELIVERED iterate\'s weights as '
+                        '<output>_model.pt; ct120-render-checkpoint '
+                        're-exports a volume from it without retraining '
+                        '(re-render only, not resume).')
+
+
+def _snapshot_config(args, algorithm):
+    """The ``SnapshotConfig`` for this run, or None."""
+    from .learning_based_iterative.snapshots import SnapshotConfig
+    if not args.snapshot_dir:
+        if (args.snapshot_iters or args.snapshot_every or args.snapshot_first
+                or args.snapshot_checkpoints):
+            raise ConfigError("snapshot flags need --snapshot-dir")
+        return None
+    if not (args.snapshot_iters or args.snapshot_every or args.snapshot_first):
+        raise ConfigError("--snapshot-dir needs a schedule: --snapshot-iters, "
+                          "--snapshot-every and/or --snapshot-first")
+    slices = {k: v for k, v in (('axial', args.snapshot_axial),
+                                ('coronal', args.snapshot_coronal),
+                                ('sagittal', args.snapshot_sagittal)) if v}
+    return SnapshotConfig(
+        directory=args.snapshot_dir,
+        iterations=tuple(args.snapshot_iters or ()),
+        every=args.snapshot_every, first=args.snapshot_first,
+        ratio=args.snapshot_ratio, max_frames=args.snapshot_max,
+        box=tuple(args.snapshot_box) if args.snapshot_box else None,
+        slices=slices or None, dtype=args.snapshot_dtype,
+        checkpoints=args.snapshot_checkpoints,
+        checkpoint_meta=_checkpoint_meta(args, algorithm))
+
+
+def _checkpoint_meta(args, algorithm) -> dict:
+    """What a model checkpoint needs to be rebuilt: the algorithm and the
+    module that registers it, and its constructor options (scalars only)."""
+    opts = {k: (list(v) if isinstance(v, tuple) else v)
+            for k, v in algorithm.options(args).items()
+            if isinstance(v, (int, float, str, bool, tuple, list, type(None)))}
+    return {'algorithm': algorithm.name,
+            'algorithm_modules': list(args.algorithm_module),
+            'options': opts}
+
+
 def _warm_start_settings(args) -> dict:
     return {'warm_start': ('volume' if args.warm_start_volume
                            else args.warm_start),
@@ -886,6 +973,7 @@ detector), else a loud package default — and logged under wls/*.
     )
 
     add_warm_start_args(parser)
+    add_snapshot_args(parser)
 
     _apply_driver_defaults(parser, algorithm)
     args = parser.parse_args(argv)
@@ -1051,6 +1139,9 @@ def main(argv=None):
             'test_mode': split.mode} if split is not None else {}),
         **(_warm_start_settings(args)
            if (args.warm_start != 'off' or args.warm_start_volume) else {}),
+        **({'snapshot_dir_name': Path(args.snapshot_dir).name}
+           if args.snapshot_dir else {}),
+        **({'save_checkpoint': True} if args.save_checkpoint else {}),
     })
 
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
@@ -1110,6 +1201,11 @@ def main(argv=None):
                 f"--warm-start is not implemented for --algorithm "
                 f"{algorithm.name}: it runs its own training loop.")
         warm = _build_warm_start(args, ctx, full_ctx, split, holdout_trainer)
+    snap_cfg = _snapshot_config(args, algorithm)
+    if (snap_cfg is not None or args.save_checkpoint) and not shared_loop:
+        raise ConfigError(
+            f"--snapshot-dir / --save-checkpoint are not implemented for "
+            f"--algorithm {algorithm.name}: it runs its own training loop.")
 
     # `shared` is the LOOP's configuration — data, objective, schedule, the
     # stopping rules, the logging hooks — and every representation gets all of
@@ -1180,6 +1276,14 @@ def main(argv=None):
     )
     if warm is not None:
         shared['warm_start'] = warm
+    if snap_cfg is not None:
+        shared['snapshots'] = snap_cfg
+        if split is not None:
+            # Scored at every frame; preprocessed once here, read only.
+            from .ct_core.projection_diag import preprocess_frames
+            shared['snapshot_test_views'] = (
+                preprocess_frames(full_ctx.projections[split.test], full_ctx),
+                np.asarray(full_ctx.angles)[split.test], split.test)
 
     # An option named like one of the shared arguments would silently decide
     # which of the two the reconstructor sees (or raise a bare TypeError about
@@ -1261,6 +1365,11 @@ def main(argv=None):
             reconstructor, full_ctx, split, shared_loop, logger)
     if warm is not None:
         extra_meta['warm_start'] = reconstructor.warm_start_report
+    if snap_cfg is not None:
+        extra_meta['snapshots'] = reconstructor.snapshot_report
+    if args.save_checkpoint:
+        extra_meta['model_checkpoint'] = Path(
+            str(Path(output_path).with_suffix('')) + '_model.pt').name
 
     # Crop the reconstruction domain down to what is worth saving, THEN
     # calibrate and export. Everything downstream reports the delivered
@@ -1272,6 +1381,20 @@ def main(argv=None):
     _, anchors, volume_hu = save_outputs(vol_export, ctx, args, output_path,
                                          logger=logger, algorithm=algorithm.name,
                                          extra_metadata=extra_meta or None)
+
+    # The delivered iterate's weights, with the anchors the volume got, so a
+    # re-render reproduces the shipped calibration.
+    if args.save_checkpoint:
+        ck = Path(str(Path(output_path).with_suffix('')) + '_model.pt')
+        meta = _checkpoint_meta(args, algorithm)
+        meta['hu_anchors'] = {'value_air': float(anchors.value_air),
+                              'value_tissue': float(anchors.value_tissue),
+                              'air_hu': float(anchors.air_hu),
+                              'tissue_hu': float(anchors.tissue_hu)}
+        meta['scan'] = Path(full_ctx.scan_folder).name
+        reconstructor.save_model_checkpoint(ck, meta=meta)
+        print(f"  Model checkpoint (delivered iterate "
+              f"{reconstructor.delivered_iter}): {ck}")
 
     # The representation's own extras, in the calibration the volume got.
     # Off the critical path: the volume is on disk, a failure here is a note.

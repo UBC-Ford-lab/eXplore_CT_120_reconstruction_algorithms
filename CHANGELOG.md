@@ -13,6 +13,8 @@
 - Windows fixes.
 - Opt-in test views (`--test-indices`, `--test-count`) and FDK warm start
   (`--warm-start`).
+- Opt-in iteration snapshots (`--snapshot-dir`) and model checkpoints
+  (`--save-checkpoint`, `ct120-render-checkpoint`).
 
 ## 0.3.0 (2026-10-21)
 

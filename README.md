@@ -101,7 +101,8 @@ comparisons with the classical solvers.
 
 Opt-in: `--test-indices`/`--test-count` withhold test views from every
 step and score them at the end; `--warm-start fdk` starts from an FDK of the
-training views.
+training views; `--snapshot-dir` saves intermediate volumes and
+`ct120-render-checkpoint` re-exports a saved model.
 
 To add a representation, subclass `LearnedReconstructor` (`build_model`,
 `build_domain`, `export_volume`) and register a `LearnedAlgorithm`; `voxel/`
