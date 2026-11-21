@@ -182,6 +182,41 @@ def angular_coverage_deg(angles) -> float:
     return float(np.degrees(abs(steps.sum()) + abs(np.median(steps))))
 
 
+def view_slab_weights(angles, *, gap_ratio: float = 1.5):
+    """Per-view angular weights for a set with MISSING views, or None.
+
+    The backprojection sums views and multiplies by ONE ``delta_beta =
+    span / (N - 1)``, which is the quadrature weight of every view only
+    when the steps are uniform. With views withheld (test views, a holdout)
+    the views either side of a gap stand for a wider slab of angle than the
+    rest, and a uniform weight under-counts the gap's direction and
+    over-counts the others — a low-order angular modulation of the image.
+
+    Each view is weighted by the slab it represents, half the distance to
+    each neighbour (the trapezoid rule on the actual angles), expressed
+    RELATIVE to the uniform ``delta_beta`` so the existing normalisation stays
+    as it is: ``w_i = slab_i / delta_beta``. The end views keep their single
+    adjacent step. Returns None unless some step exceeds ``gap_ratio`` times
+    the median step — i.e. unless a view is actually MISSING (one missing
+    view doubles a step). A complete scan, including the ~0.1 % jitter of
+    real gantry angles (MEASURED on Scan_1510), therefore runs exactly as
+    before.
+    """
+    ang = np.unwrap(np.asarray(angles.cpu() if hasattr(angles, 'cpu')
+                               else angles, dtype=np.float64).ravel())
+    if ang.size < 3:
+        return None
+    steps = np.abs(np.diff(ang))
+    med = float(np.median(steps))
+    if med <= 0 or float(np.max(steps)) <= gap_ratio * med:
+        return None
+    slab = np.empty_like(ang)
+    slab[1:-1] = 0.5 * (steps[:-1] + steps[1:])
+    slab[0], slab[-1] = steps[0], steps[-1]
+    delta_beta = float(abs(ang[-1] - ang[0])) / (ang.size - 1)
+    return (slab / delta_beta).astype(np.float32)
+
+
 def parker_weights(angles, n_a: int, da: float, sdd: float, *,
                    full_scan_deg: float = 355.0, verbose: bool = True):
     """Parker short-scan redundancy weights, (N_angles, N_a), or None.
@@ -502,6 +537,17 @@ class FDKReconstructor:
                 parker_weight_gpu = parker_weight.to(device)  # (N_angles, N_a)
         self._parker_applied = parker_weight_gpu is not None
 
+        # Non-uniform angular steps (views withheld): per-view slab weights.
+        # None for a uniformly sampled scan, i.e. the normal path is untouched.
+        view_weight_gpu = None
+        _vw = view_slab_weights(self.angles)
+        if _vw is not None:
+            view_weight_gpu = torch.from_numpy(_vw).to(device)
+            print(f"  Non-uniform view spacing: per-view angular weights "
+                  f"(slab / uniform step) in [{float(_vw.min()):.3f}, "
+                  f"{float(_vw.max()):.3f}]")
+        self._view_weights_applied = view_weight_gpu is not None
+
         # Allocate output array
         if do_preprocess:
             try:
@@ -619,6 +665,8 @@ class FDKReconstructor:
             chunk = torch.fft.irfft(chunk, n=n_fft, dim=2, norm='forward')[..., :self.N_a]
             if parker_weight_gpu is not None:
                 chunk = chunk * parker_weight_gpu[start:end].unsqueeze(1)
+            if view_weight_gpu is not None:
+                chunk = chunk * view_weight_gpu[start:end].view(-1, 1, 1)
 
             sinogram_out[start:end] = chunk.cpu().numpy()
 

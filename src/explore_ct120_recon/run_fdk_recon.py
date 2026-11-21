@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
+from .ct_core.view_split import subset_context, view_split_from_args
 from .ct_core.data_budget import SWEEP, data_budget, measurement_count
 from .ct_core.errors import ConfigError, cli_main
 from .ct_core.pipeline import (
@@ -144,7 +145,19 @@ def main():
     print(f"HU mode: enabled (physical normalization, polynomial calibration)")
 
     # Shared front half: scan folder, projections, ROI, geometry, downsample.
-    ctx = prepare_scan(args)
+    # With test views the context is cut to the TRAINING views before the
+    # FDK sees it; `full_ctx` keeps every view for the diagnostics, which
+    # address views by their original index. The evaluation view (the
+    # middle one) is reserved, so a test view is never also the eval view.
+    _split_fn = None
+    if args.test_indices or args.test_count:
+        def _split_fn(n_views, view_groups):
+            return view_split_from_args(args, n_views, holdout=n_views // 2,
+                                        view_groups=view_groups)
+    ctx = prepare_scan(args, view_split_fn=_split_fn)
+    full_ctx, split = ctx, ctx.view_split
+    if split is not None:
+        ctx = subset_context(full_ctx, split)
     geometry = ctx.geometry
 
     output_path = args.output if args.output else ctx.default_output_path('_recon')
@@ -159,6 +172,8 @@ def main():
         'filter_type': args.filter_type,
         'parker_weighting': bool(args.parker_weighting),
         'withhold_eval': bool(args.withhold_eval),
+        **({'test_indices': ','.join(str(i) for i in split.test),
+            'test_mode': split.mode} if split is not None else {}),
     })
 
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
@@ -210,16 +225,17 @@ def main():
     # on the final volume; the ceiling (other acquisition phase if available,
     # else the neighbouring projection) is measured up front so it lands in
     # the logs even if the reconstruction later fails.
-    eval_idx = int(ctx.projections.shape[0]) // 2
+    eval_idx = int(full_ctx.projections.shape[0]) // 2
     logger.set_noise_ceiling(measure_noise_ceiling(
-        ctx, eval_idx, phase=args.phase))
+        full_ctx, eval_idx, phase=args.phase))
 
     fdk_proj, fdk_angles = ctx.projections, ctx.angles
     if args.withhold_eval:
         print(f"  Withholding evaluation projection {eval_idx} from the "
               f"reconstruction input (--withhold-eval).")
-        fdk_proj = np.delete(ctx.projections, eval_idx, axis=0)
-        fdk_angles = np.delete(ctx.angles, eval_idx, axis=0)
+        _w = eval_idx if split is None else split.to_train(eval_idx)
+        fdk_proj = np.delete(ctx.projections, _w, axis=0)
+        fdk_angles = np.delete(ctx.angles, _w, axis=0)
 
     # Initialize reconstructor with verified settings
     reconstructor = FDKReconstructor(
@@ -260,16 +276,19 @@ def main():
         note="single backprojection pass over every measurement")
 
     # Shared back half: HU calibration + VFF export.
-    _, anchors, volume_hu = save_outputs(reconstructor.reconstructed_volume,
-                                         ctx, args, output_path, logger=logger,
-                                         algorithm='fdk')
+    _, anchors, volume_hu = save_outputs(
+        reconstructor.reconstructed_volume, ctx, args, output_path,
+        logger=logger, algorithm='fdk',
+        extra_metadata=(None if split is None else {'views': {
+            **split.record(), 'holdout_index': int(eval_idx),
+            'holdout_withheld': bool(args.withhold_eval)}}))
 
     # Projection diagnostics on the final volume: forward-project at the
     # evaluation angle through the canonical ray tracer -> diag/ssim, psnr,
     # mse + SSIM-heatmap and power-spectrum figures. Best-effort.
     try:
         measured = preprocess_frames(
-            ctx.projections[eval_idx:eval_idx + 1], ctx)[0]
+            full_ctx.projections[eval_idx:eval_idx + 1], full_ctx)[0]
         # The volume is mu now, so it goes to the forward model as-is —
         # no round trip through an assumed mu_water, which used to convert
         # HU back to attenuation with a constant unrelated to this scan.
@@ -280,7 +299,8 @@ def main():
         mu_diag, _air = level_to_air(reconstructor.reconstructed_volume,
                                      anchors, verbose=True)
         pred, target = render_projection_from_volume(
-            mu_diag, ctx, eval_idx, measured, volume_is_hu=False)
+            mu_diag, full_ctx, eval_idx, measured, volume_is_hu=False,
+            geometry=None if split is None else ctx.geometry)
         logger.log_projection_diag(pred, target)
     except Exception as e:
         print(f"  Final projection diagnostics failed "

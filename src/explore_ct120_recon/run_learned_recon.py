@@ -59,6 +59,7 @@ from .ct_core.early_stop import resolve_holdout_index
 from .ct_core.projection_diag import measure_noise_ceiling
 from .ct_core.utils import query_gpu_memory
 from .ct_core.early_stop import STOP_METRICS
+from .ct_core.view_split import subset_context, view_split_from_args
 
 #: What ``--algorithm`` defaults to. The dense grid, because it is the
 #: like-for-like comparison against classical SIRT and therefore the
@@ -348,6 +349,166 @@ def _apply_driver_defaults(parser, algorithm) -> None:
             f"{unknown}, which no flag of this driver sets. Known dests are "
             f"the parser's; check LearnedAlgorithm.driver_defaults.")
     parser.set_defaults(**defaults)
+
+
+def add_warm_start_args(parser) -> None:
+    """The opt-in FDK warm start (``learning_based_iterative.warm_start``)."""
+    g = parser.add_argument_group(
+        'warm start (opt-in)',
+        'Fit the representation to an FDK volume of the TRAINING views, then '
+        'hand over to the projection objective through a short anchored '
+        'phase. A voxel grid is initialised by copying the volume in; a '
+        'network is fitted by point regression. Off by default.')
+    g.add_argument('--warm-start', choices=('off', 'fdk'), default='off',
+                   help="'fdk' computes the FDK in-process from exactly the "
+                        "views this run trains on (no test views; no holdout "
+                        "under --withhold-eval), air-levelled with the "
+                        "pipeline's HU anchors, nothing clipped. Default: "
+                        "%(default)s.")
+    g.add_argument('--warm-start-volume', default=None, metavar='VFF',
+                   help='Warm-start from a volume this package wrote instead '
+                        'of computing the FDK. Its sidecar must show it was '
+                        'reconstructed without this run\'s withheld views '
+                        '(a mismatch is refused); it is inverted through its '
+                        'own HU anchors and resampled onto this grid.')
+    g.add_argument('--warm-start-iters', type=int, default=100_000,
+                   metavar='N', help='Pretrain iteration cap (networks only; '
+                   'default: %(default)s).')
+    g.add_argument('--warm-start-batch', type=int, default=131_072,
+                   metavar='N', help='Points per pretrain step (default: '
+                   '%(default)s).')
+    g.add_argument('--warm-start-lr-scale', type=float, default=1.0,
+                   metavar='S', help='Pretrain LR = the main per-group LRs x S '
+                   '(default: %(default)s; for the hash MLP that is 1e-3 trunk '
+                   '/ 1e-2 tables, the old recipe).')
+    g.add_argument('--warm-start-eval-every', type=int, default=2000,
+                   metavar='K', help='Score the pretrain against the FDK every '
+                   'K iterations (default: %(default)s).')
+    g.add_argument('--warm-start-patience', type=int, default=3, metavar='P',
+                   help='Stop the pretrain after P scores without enough gain '
+                        '(default: %(default)s).')
+    g.add_argument('--warm-start-min-gain', type=float, default=0.01,
+                   metavar='R', help='Relative RMSE improvement a pretrain '
+                   'score must show to count (default: %(default)s).')
+    g.add_argument('--warm-start-handoff-iters', type=int, default=3000,
+                   metavar='N', help='Cap on the anchored projection-domain '
+                   'handoff (default: %(default)s; 0 skips it).')
+    g.add_argument('--warm-start-anchor-weight', type=float, default=1.0,
+                   metavar='W', help='Weight of the FDK anchor in the handoff '
+                   '(default: %(default)s).')
+    g.add_argument('--warm-start-anchor-points', type=int, default=65_536,
+                   metavar='N', help='Anchor points per handoff step '
+                   '(default: %(default)s).')
+
+
+def _warm_start_settings(args) -> dict:
+    return {'warm_start': ('volume' if args.warm_start_volume
+                           else args.warm_start),
+            'warm_start_volume': (Path(args.warm_start_volume).name
+                                  if args.warm_start_volume else None),
+            'warm_start_iters': args.warm_start_iters,
+            'warm_start_batch': args.warm_start_batch,
+            'warm_start_lr_scale': args.warm_start_lr_scale,
+            'warm_start_eval_every': args.warm_start_eval_every,
+            'warm_start_patience': args.warm_start_patience,
+            'warm_start_min_gain': args.warm_start_min_gain,
+            'warm_start_handoff_iters': args.warm_start_handoff_iters,
+            'warm_start_anchor_weight': args.warm_start_anchor_weight,
+            'warm_start_anchor_points': args.warm_start_anchor_points}
+
+
+def _view_split_fn(args):
+    """``prepare_scan``'s test-view hook, or None when no test views were
+    asked for (the default path, untouched). The holdout is resolved in the
+    LOADED list's numbering, exactly as the trainer would resolve it, so the
+    test set can avoid it."""
+    if not (getattr(args, 'test_indices', None) or getattr(args, 'test_count', None)):
+        return None
+
+    def fn(n_views, view_groups):
+        holdout = (None if args.no_crossval
+                   else resolve_holdout_index(args.holdout_index, n_views,
+                                              view_groups))
+        return view_split_from_args(args, n_views, holdout=holdout,
+                                    view_groups=view_groups)
+    return fn
+
+
+def _build_warm_start(args, ctx, full_ctx, split, holdout_trainer):
+    """The ``WarmStart`` for this run, or None.
+
+    ``ctx`` holds the TRAINING views (the test views are already gone);
+    ``holdout_trainer`` is the holdout in ctx's numbering. Under
+    --withhold-eval the holdout is dropped from the FDK too, so the warm
+    start sees exactly what the main loop trains on.
+    """
+    from .learning_based_iterative import warm_start as W
+
+    use_file = bool(args.warm_start_volume)
+    if not use_file and args.warm_start == 'off':
+        return None
+    if use_file and args.warm_start != 'off':
+        raise ConfigError("give --warm-start fdk OR --warm-start-volume, not both")
+    # The holdout in ctx's numbering, resolved as the trainer will resolve it
+    # (None = the middle view), and whether the run withholds it.
+    withheld_holdout = bool(args.withhold_eval and not args.no_crossval)
+    if withheld_holdout:
+        holdout_trainer = resolve_holdout_index(
+            holdout_trainer, int(ctx.projections.shape[0]), ctx.view_groups)
+    settings = dict(pretrain_iters=args.warm_start_iters,
+                    pretrain_batch=args.warm_start_batch,
+                    pretrain_lr_scale=args.warm_start_lr_scale,
+                    pretrain_eval_every=args.warm_start_eval_every,
+                    pretrain_patience=args.warm_start_patience,
+                    pretrain_min_gain=args.warm_start_min_gain,
+                    handoff_iters=args.warm_start_handoff_iters,
+                    handoff_anchor_weight=args.warm_start_anchor_weight,
+                    handoff_anchor_points=args.warm_start_anchor_points)
+    n_full = int(full_ctx.projections.shape[0])
+    if use_file:
+        forbidden = list(split.test) if split is not None else []
+        if withheld_holdout:
+            forbidden.append(int(split.train[holdout_trainer])
+                             if split is not None else int(holdout_trainer))
+        try:
+            mu, record = W.load_warm_start_volume(
+                args.warm_start_volume, ctx.geometry, forbidden=forbidden,
+                n_views=n_full,
+                hu_calibration=getattr(args, 'hu_calibration', 'auto'))
+        except ValueError as e:
+            raise ConfigError(str(e)) from None
+    else:
+        keep = np.arange(int(ctx.projections.shape[0]))
+        if withheld_holdout:
+            keep = np.delete(keep, int(holdout_trainer))
+        print(f"\n  Warm start: FDK of the {keep.size} training views "
+              f"(of {n_full} loaded"
+              + (f"; {split.test.size} test views" if split is not None else "")
+              + ("; holdout withheld" if withheld_holdout else "")
+              + ") on the reconstruction grid "
+              + "x".join(str(int(v)) for v in ctx.geometry['vol_shape']))
+        mu, fdk_settings = W.fdk_from_views(
+            ctx.projections[keep], np.asarray(ctx.angles)[keep], ctx.geometry,
+            bright_field=ctx.bright_field, dark_field=ctx.dark_field,
+            air_normalization=args.air_normalization,
+            soft_clip_sharpness=args.soft_clip_sharpness,
+            ring_correction=args.ring_correction,
+            ring_median_width=args.ring_median_width)
+        train_orig = (split.train[keep] if split is not None else keep)
+        record = {'source': 'fdk:training-views', 'fdk': fdk_settings,
+                  'fdk_n_views': int(keep.size),
+                  'fdk_views_excluded': sorted(
+                      set(range(n_full)) - set(int(i) for i in train_orig))}
+    mu, air = W.level_air(mu, ctx.geometry,
+                          hu_calibration=getattr(args, 'hu_calibration', 'auto'),
+                          mu_water=getattr(args, 'mu_water', None),
+                          tissue_hu=getattr(args, 'tissue_hu', None))
+    record['air_level_removed'] = air
+    print(f"  Warm start volume: air level {air:+.6f} mm^-1 removed (air -> "
+          f"mu = 0, the forward model's convention); range "
+          f"[{float(mu.min()):.4f}, {float(mu.max()):.4f}] mm^-1, not clipped")
+    return W.WarmStart(volume=mu, geometry=dict(ctx.geometry), record=record,
+                       **settings)
 
 
 def parse_args(argv=None):
@@ -724,6 +885,8 @@ detector), else a loud package default — and logged under wls/*.
              "logged and plotted."
     )
 
+    add_warm_start_args(parser)
+
     _apply_driver_defaults(parser, algorithm)
     args = parser.parse_args(argv)
     # What was actually imported, not what was asked for: the env var
@@ -756,7 +919,18 @@ def main(argv=None):
           f"lr: {args.lr}")
 
     # Shared front half: scan folder, projections, ROI, geometry, downsample.
-    ctx = prepare_scan(args, fit_domain=True)
+    # With test views (--test-indices/--test-count) the context is cut down
+    # to the TRAINING views here, before anything else reads it; `full_ctx`
+    # keeps every view for the end-of-run test scores and for the
+    # diagnostics that address views by their original index.
+    ctx = prepare_scan(args, fit_domain=True,
+                       view_split_fn=_view_split_fn(args))
+    full_ctx, split = ctx, ctx.view_split
+    holdout_trainer = args.holdout_index
+    if split is not None:
+        ctx = subset_context(full_ctx, split)
+        holdout_trainer = (None if split.holdout is None
+                           else split.to_train(split.holdout))
 
     if args.output:
         output_path = args.output
@@ -871,6 +1045,12 @@ def main(argv=None):
         # filesystem path), so a run using an out-of-tree model still says
         # which module defined it; empty for the ones this package ships.
         'algorithm_modules': ','.join(args.algorithm_module),
+        # Opt-in features record themselves only when on, so a default run's
+        # config is the config it always was.
+        **({'test_indices': ','.join(str(i) for i in split.test),
+            'test_mode': split.mode} if split is not None else {}),
+        **(_warm_start_settings(args)
+           if (args.warm_start != 'off' or args.warm_start_volume) else {}),
     })
 
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
@@ -913,9 +1093,23 @@ def main(argv=None):
     # own phase's counterpart: `measure_noise_ceiling` reads both off the
     # context, so the raw --phase string never reaches the file lookup.
     eval_idx = resolve_holdout_index(args.holdout_index,
-                                     int(ctx.projections.shape[0]),
-                                     ctx.view_groups)
-    logger.set_noise_ceiling(measure_noise_ceiling(ctx, eval_idx))
+                                     int(full_ctx.projections.shape[0]),
+                                     full_ctx.view_groups)
+    logger.set_noise_ceiling(measure_noise_ceiling(full_ctx, eval_idx))
+
+    # ---- opt-in: FDK warm start and test-view scoring ------------------
+    # Both live in the shared ray loop (LearnedReconstructor.reconstruct);
+    # a backend that runs its own loop (gaussian) declares it and is refused
+    # rather than silently ignoring the flag.
+    shared_loop = bool(getattr(algorithm.reconstructor,
+                               'shared_loop_features', True))
+    warm = None
+    if args.warm_start != 'off' or args.warm_start_volume:
+        if not shared_loop:
+            raise ConfigError(
+                f"--warm-start is not implemented for --algorithm "
+                f"{algorithm.name}: it runs its own training loop.")
+        warm = _build_warm_start(args, ctx, full_ctx, split, holdout_trainer)
 
     # `shared` is the LOOP's configuration — data, objective, schedule, the
     # stopping rules, the logging hooks — and every representation gets all of
@@ -954,7 +1148,7 @@ def main(argv=None):
         soft_clip_sharpness=args.soft_clip_sharpness,
         ring_median_width=args.ring_median_width,
         crossval=not args.no_crossval,
-        holdout_index=args.holdout_index,
+        holdout_index=holdout_trainer,
         withhold_eval=args.withhold_eval,
         eval_every=args.eval_every,
         patience=args.patience,
@@ -984,6 +1178,8 @@ def main(argv=None):
         # curve alone.
         on_lr_stage=_lr_stage_views_fn(ctx, args, logger),
     )
+    if warm is not None:
+        shared['warm_start'] = warm
 
     # An option named like one of the shared arguments would silently decide
     # which of the two the reconstructor sees (or raise a bare TypeError about
@@ -1053,6 +1249,19 @@ def main(argv=None):
             'quadrature/ray_hit_fraction': float(_q['ray_hit_fraction']),
         })
 
+    # Opt-in records for the sidecar: the split, the test scores and the warm
+    # start. Empty — and the sidecar unchanged — when none is on.
+    extra_meta = {}
+    if split is not None:
+        extra_meta['views'] = {
+            **split.record(),
+            'holdout_withheld': bool(args.withhold_eval
+                                     and not args.no_crossval)}
+        extra_meta['test_scores'] = _score_test_views(
+            reconstructor, full_ctx, split, shared_loop, logger)
+    if warm is not None:
+        extra_meta['warm_start'] = reconstructor.warm_start_report
+
     # Crop the reconstruction domain down to what is worth saving, THEN
     # calibrate and export. Everything downstream reports the delivered
     # volume, not the padded domain the optimizer needed.
@@ -1061,7 +1270,8 @@ def main(argv=None):
 
     # Shared back half: HU calibration + VFF export.
     _, anchors, volume_hu = save_outputs(vol_export, ctx, args, output_path,
-                                         logger=logger, algorithm=algorithm.name)
+                                         logger=logger, algorithm=algorithm.name,
+                                         extra_metadata=extra_meta or None)
 
     # The representation's own extras, in the calibration the volume got.
     # Off the critical path: the volume is on disk, a failure here is a note.
@@ -1081,6 +1291,40 @@ def main(argv=None):
 
     end = time.time()
     print(f"\nReconstruction finished in {(end - start)/60:.2f} minutes.")
+
+
+def _score_test_views(reconstructor, full_ctx, split, shared_loop, logger):
+    """Render and score the test views with the finished model — once.
+
+    The frames are preprocessed by ``projection_diag.preprocess_frames``, the
+    same single-frame convention every backend's final diagnostic and
+    ``run_projection_report`` use (flat field, log, per-frame air level; ring
+    correction skipped). Nothing here can reach training: it runs after
+    ``reconstruct()`` has returned.
+    """
+    from .ct_core.projection_diag import preprocess_frames
+    idx = split.test
+    if not shared_loop or not hasattr(reconstructor, 'score_views'):
+        print("\n  Test views: in-run scoring is not implemented for this "
+              "backend (own training loop); they were still withheld from "
+              "the data. Score the volume with ct120-projection-report "
+              "--test-views-from <its .json>.")
+        return {'scored': False, 'reason': 'backend runs its own loop'}
+    sino = preprocess_frames(full_ctx.projections[idx], full_ctx)
+    rep = reconstructor.score_views(sino, np.asarray(full_ctx.angles)[idx], idx)
+    print(f"\n  Test views ({len(idx)}, never seen by any step of the run), "
+          f"scored like the eval projection (window rows "
+          f"{rep['window'][0]}:{rep['window'][1]}, cols "
+          f"{rep['window'][2]}:{rep['window'][3]}, stride {rep['stride']}):")
+    for r in rep['views']:
+        print(f"    view {r['index']:4d}  ssim {r['ssim']:.4f}  psnr "
+              f"{r['psnr']:6.2f} dB  mse {r['mse']:.4e}")
+    m = rep['mean']
+    print(f"    mean       ssim {m['ssim']:.4f}  psnr {m['psnr']:6.2f} dB  "
+          f"mse {m['mse']:.4e}")
+    logger.set_summary({f'test/{k}_mean': float(v) for k, v in m.items()}
+                       | {'test/n_views': int(len(idx))})
+    return {'scored': True, **rep}
 
 
 def cli() -> None:

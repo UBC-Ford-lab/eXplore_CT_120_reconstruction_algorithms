@@ -61,6 +61,7 @@ from .preprocessing import downsample_projections
 from .vff_io import detector_serial_from_scan
 from .wandb_logging import ReconLogger, add_wandb_args  # noqa: F401 (ReconLogger re-exported for drivers)
 from .preflight import add_preflight_args, run_preflight  # noqa: F401 (run_preflight re-exported for drivers)
+from .view_split import add_view_split_args
 
 
 # --------------------------------------------------------------------------
@@ -313,6 +314,9 @@ def add_common_args(parser):
              'Default: %(default)s; when off the projection is reconstructed '
              'from AND evaluated against (diagnostic, not validation).'
     )
+    # Test views (--test-indices / --test-count): withheld from the data
+    # before any backend is built and only ever scored. See ct_core.view_split.
+    add_view_split_args(parser)
 
     # Experiment logging (local PNG plots + optional Weights & Biases)
     add_wandb_args(parser)
@@ -363,6 +367,9 @@ class ScanContext:
     # sinogram the backend trains on — an unlevelled ceiling would be
     # compared against a levelled reconstruction.
     air_normalization: bool = True
+    #: The test-view split (``ct_core.view_split.ViewSplit``) when the driver
+    #: asked for one, else None. Indices in the loaded list's numbering.
+    view_split: Optional[object] = None
 
     def default_output_path(self, suffix: str = '_recon') -> str:
         return self.data_folder.rstrip('/') + suffix
@@ -684,7 +691,8 @@ def build_scan_geometry(xml_header, *, raw_detector_shape, fov_xy, fov_z,
     return geometry
 
 
-def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
+def prepare_scan(args, fit_domain: bool = False,
+                 view_split_fn=None) -> ScanContext:
     """Run the algorithm-independent front half of every reconstruction.
 
     Resolves the scan folder, loads projections + flat fields, parses the
@@ -696,6 +704,13 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     reconstruction grid, demoting --roi to an export crop. FDK leaves it False:
     it filters the full-width projections and backprojects into whatever grid
     it is given, so its ROI never enters a forward model.
+
+    ``view_split_fn(n_views, view_groups) -> ViewSplit | None`` (test views,
+    see ``ct_core.view_split``) is called once the projections are loaded.
+    When it returns a split, the support and FOV measurements read only the
+    TRAINING views, and the split rides on ``ScanContext.view_split`` for the
+    driver to apply (``view_split.subset_context``). None — the default —
+    changes nothing.
     """
     data_folder = args.data_folder
 
@@ -737,6 +752,15 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     angles = scan_data['angles']
     bright_field = scan_data['bright_field']
     dark_field = scan_data['dark_field']
+    view_split = (None if view_split_fn is None else
+                  view_split_fn(int(projections.shape[0]),
+                                scan_data.get('view_groups')))
+
+    def _fit_views(stack):
+        """The views a data-dependent measurement may read: all of them, or
+        the training views when test views are withheld."""
+        return stack if view_split is None else stack[view_split.train]
+
     if not fast:
         raw_shape = (projections.shape[1], projections.shape[2])
 
@@ -751,7 +775,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     # domain both replace the grid outright, and measuring the support for a
     # grid that is about to be discarded would just cost time.
     fov_xy, fov_z = resolve_fov(
-        args, scan_data['xml_header'], projections,
+        args, scan_data['xml_header'], _fit_views(projections),
         bright_field=bright_field, dark_field=dark_field,
         measure=(roi_bounds is None and not use_domain and not fast),
         detector_shape=raw_shape)
@@ -826,7 +850,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         # owns the preprocessing of the array it trains on).
         from .preprocessing import preprocess_sinogram
         line_integrals = preprocess_sinogram(
-            projections, bright_field, dark_field,
+            _fit_views(projections), bright_field, dark_field,
             ring_correction=getattr(args, 'ring_correction', True),
             air_normalization=getattr(args, 'air_normalization', True),
             soft_clip_sharpness=getattr(args, 'soft_clip_sharpness', 200.0),
@@ -870,6 +894,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         view_phase=scan_data.get('view_phase'),
         air_normalization=bool(getattr(args, 'air_normalization', True)),
         detector_warp=warp_info,
+        view_split=view_split,
     )
 
 
@@ -1066,8 +1091,14 @@ def resolve_or_measure_detector_psi(ctx: ScanContext, verbose=True,
 # --------------------------------------------------------------------------
 
 def save_outputs(volume, ctx: ScanContext, args, output_path: str,
-                 logger=None, algorithm: str | None = None):
+                 logger=None, algorithm: str | None = None,
+                 extra_metadata: dict | None = None):
     """Crop to the export ROI, then HU-calibrate, filter and write the VFF.
+
+    ``extra_metadata`` is merged into the sidecar as-is (JSON-serialisable
+    values only): the opt-in features of a run — test views and their scores,
+    an FDK warm start — record themselves there. None writes exactly the
+    sidecar this function always wrote.
 
     This is the one place the HU scale is set, for every backend. The
     reconstructors all hand over raw attenuation now, so a volume's units are
@@ -1104,6 +1135,8 @@ def save_outputs(volume, ctx: ScanContext, args, output_path: str,
         metadata['detector_warp'] = {k: ctx.detector_warp[k] for k in
                                      ('mode', 'calibration', 'tag', 'mean_px', 'max_px')
                                      if k in ctx.detector_warp}
+    if extra_metadata:
+        metadata.update(extra_metadata)
     report('save', 0, 1)
     path, anchors, volume_hu = postprocess_and_save(
         volume_mu=volume,

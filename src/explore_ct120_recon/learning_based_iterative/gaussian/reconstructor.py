@@ -98,6 +98,11 @@ def _resolve_cap(max_gaussians, n_seed) -> int:
 class GaussianReconstructor(LearnedReconstructor):
     """A cloud of anisotropic Gaussians, fitted one view at a time."""
 
+    # `reconstruct` is replaced outright, so the shared loop's opt-in FDK
+    # warm start and test-view scoring are not available here (test views
+    # are still cut from the data by the driver).
+    shared_loop_features = False
+
     def __init__(self, projections, angles, geometry, *,
                  n_seed: int | str = 300_000,
                  max_gaussians: int = 2_000_000,

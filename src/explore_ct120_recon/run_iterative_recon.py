@@ -26,6 +26,7 @@ from .iterative.astra import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_A
 from .iterative.tigre import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
 from .ct_core.data_budget import classical_budget, measurement_count
 from .ct_core.early_stop import STOP_METRICS
+from .ct_core.view_split import subset_context, view_split_from_args
 from .ct_core.errors import ConfigError, cli_main
 from .ct_core.pipeline import (
     ReconLogger,
@@ -374,7 +375,21 @@ def main():
             print(f"PWLS: enabled")
 
     # Shared front half: scan folder, projections, ROI, geometry, downsample.
-    ctx = prepare_scan(args, fit_domain=True)
+    # With test views the context is cut to the TRAINING views before any
+    # backend (or the support measurement) sees it; `full_ctx` keeps every
+    # view for diagnostics that address views by their original index. The
+    # evaluation/holdout view is reserved, so it is never a test view.
+    _split_fn = None
+    if args.test_indices or args.test_count:
+        def _split_fn(n_views, view_groups):
+            h = (args.holdout_index if args.holdout_index is not None
+                 else n_views // 2)
+            return view_split_from_args(args, n_views, holdout=h,
+                                        view_groups=view_groups)
+    ctx = prepare_scan(args, fit_domain=True, view_split_fn=_split_fn)
+    full_ctx, split = ctx, ctx.view_split
+    if split is not None:
+        ctx = subset_context(full_ctx, split)
 
     # Determine output path
     if args.output:
@@ -403,6 +418,10 @@ def main():
                              'tv_lambda': args.tv_lambda,
                              'pwls': bool(args.pwls),
                              'withhold_eval': bool(args.withhold_eval),
+                             **({'test_indices': ','.join(
+                                     str(i) for i in split.test),
+                                 'test_mode': split.mode}
+                                if split is not None else {}),
                          })
 
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation
@@ -435,9 +454,13 @@ def main():
     # measurement — comes from the other acquisition phase when the scan has
     # one, else the neighbouring projection.
     eval_idx = (args.holdout_index if args.holdout_index is not None
-                else int(ctx.projections.shape[0]) // 2)
+                else int(full_ctx.projections.shape[0]) // 2)
     logger.set_noise_ceiling(measure_noise_ceiling(
-        ctx, eval_idx, phase=args.phase))
+        full_ctx, eval_idx, phase=args.phase))
+    # The same view in the training subset's numbering, which is what the
+    # backends index (unchanged without test views).
+    eval_sub = eval_idx if split is None else split.to_train(eval_idx)
+    holdout_arg = args.holdout_index if split is None else eval_sub
 
     # Initialize reconstructor based on backend
     if args.backend == 'astra':
@@ -448,8 +471,8 @@ def main():
         if args.withhold_eval:
             print(f"  Withholding evaluation projection {eval_idx} from the "
                   f"reconstruction input (--withhold-eval).")
-            astra_proj = np.delete(ctx.projections, eval_idx, axis=0)
-            astra_angles = np.delete(ctx.angles, eval_idx, axis=0)
+            astra_proj = np.delete(ctx.projections, eval_sub, axis=0)
+            astra_angles = np.delete(ctx.angles, eval_sub, axis=0)
         reconstructor = ASTRAReconstructor(
             projections=astra_proj,
             angles=astra_angles,
@@ -467,7 +490,7 @@ def main():
             soft_clip_sharpness=args.soft_clip_sharpness,
             ring_median_width=args.ring_median_width,
             crossval=not args.no_crossval,
-            holdout_index=args.holdout_index,
+            holdout_index=holdout_arg,
             eval_every=args.eval_every,
             patience=args.patience,
             min_stop_iter=args.min_stop_iter,
@@ -497,7 +520,7 @@ def main():
             ring_median_width=args.ring_median_width,
             geometry_autocal=args.geometry_autocal,
             crossval=not args.no_crossval,
-            holdout_index=args.holdout_index,
+            holdout_index=holdout_arg,
             withhold_eval=args.withhold_eval,
             eval_every=args.eval_every,
             patience=args.patience,
@@ -552,7 +575,7 @@ def main():
         # tracer. Best-effort — a diagnostics failure never voids the recon.
         try:
             measured = preprocess_frames(
-                ctx.projections[eval_idx:eval_idx + 1], ctx)[0]
+                full_ctx.projections[eval_idx:eval_idx + 1], full_ctx)[0]
             # The volume is mu now, so it goes to the forward model as-is
             # — no round trip through an assumed mu_water.
             # Air to zero first — see `level_to_air`. The anchors are
@@ -563,7 +586,8 @@ def main():
             mu_diag, _air = level_to_air(
                 reconstructor.reconstructed_volume, verbose=True)
             pred, target = render_projection_from_volume(
-                mu_diag, ctx, eval_idx, measured, volume_is_hu=False)
+                mu_diag, full_ctx, eval_idx, measured, volume_is_hu=False,
+                geometry=None if split is None else ctx.geometry)
             logger.log_projection_diag(pred, target)
         except Exception as e:
             print(f"  Final projection diagnostics failed "
@@ -577,9 +601,12 @@ def main():
         reconstructor.reconstructed_volume, ctx.geometry)
 
     # Shared back half: HU calibration + VFF export.
-    _, _, volume_hu = save_outputs(vol_export, ctx, args, output_path,
-                                   logger=logger,
-                                   algorithm=f'{args.backend}_{args.algorithm}')
+    _, _, volume_hu = save_outputs(
+        vol_export, ctx, args, output_path, logger=logger,
+        algorithm=f'{args.backend}_{args.algorithm}',
+        extra_metadata=(None if split is None else {'views': {
+            **split.record(), 'holdout_index': int(eval_idx),
+            'holdout_withheld': bool(args.withhold_eval)}}))
 
     logger.log_sinogram_preview(ctx.projections)
     logger.log_volume_summary(volume_hu, ctx)

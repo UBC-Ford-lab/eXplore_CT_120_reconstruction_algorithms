@@ -284,6 +284,73 @@ def affine_fit(pred: np.ndarray, target: np.ndarray) -> tuple:
     return float(slope), float(intercept)
 
 
+def _test_view_indices(args, ctx, n_angles: int):
+    """The views to score as TEST views, and where the list came from."""
+    from .ct_core.early_stop import resolve_holdout_index
+    from .ct_core.view_split import resolve_view_split
+    if args.angle_indices:
+        raise ConfigError("--angle-indices and test views are alternatives; "
+                          "give one")
+    if args.test_views_from:
+        if args.test_indices or args.test_count:
+            raise ConfigError("give --test-views-from OR --test-indices/"
+                              "--test-count")
+        rec = json.loads(Path(args.test_views_from).read_text())
+        views = rec.get('views') or {}
+        if not views.get('test_indices'):
+            raise ConfigError(
+                f"{args.test_views_from} records no test views (run the "
+                f"reconstruction with --test-indices or --test-count)")
+        if int(views.get('n_views', -1)) != n_angles:
+            raise ConfigError(
+                f"{args.test_views_from} numbers its views out of "
+                f"{views.get('n_views')}; this scan loaded {n_angles} — the "
+                f"indices do not refer to the same projections (check "
+                f"--phase / --projection-pattern)")
+        return ([int(i) for i in views['test_indices']],
+                Path(args.test_views_from).name)
+    # The same rule the learned driver uses, with its default holdout.
+    split = resolve_view_split(
+        n_angles, test_indices=args.test_indices, test_count=args.test_count,
+        holdout=(None if args.test_indices else
+                 resolve_holdout_index(None, n_angles, ctx.view_groups)),
+        view_groups=ctx.view_groups)
+    return [int(i) for i in split.test], ('--test-indices' if args.test_indices
+                                          else f'--test-count {args.test_count}')
+
+
+def scored_views_in_training(sidecar, indices, n_angles: int, label: str, *,
+                             strict: bool):
+    """Scored views this volume was reconstructed FROM, per its sidecar.
+
+    Returns the list (empty = clean), or None when the sidecar records no
+    views. Prints a loud warning for any overlap — those rows are fits to
+    data the reconstruction saw, not test scores — and, when test views are
+    being scored, a note for a volume that cannot show either way.
+    """
+    views = (sidecar or {}).get('views')
+    if not views:
+        if strict:
+            print(f"  NOTE [{label}]: its sidecar records no views, so "
+                  f"nothing shows the scored test views were withheld from "
+                  f"it; treat its row as unverified.")
+        return None
+    if int(views.get('n_views', -1)) != int(n_angles):
+        print(f"  WARNING [{label}]: reconstructed from a list of "
+              f"{views.get('n_views')} views, this scan has {n_angles}; its "
+              f"view indices cannot be checked against the scored ones.")
+        return None
+    used = set(int(i) for i in views.get('train_indices', []))
+    if views.get('holdout_withheld') and views.get('holdout_index') is not None:
+        used.discard(int(views['holdout_index']))
+    leaked = sorted(set(int(i) for i in indices) & used)
+    if leaked:
+        print(f"  WARNING [{label}]: this volume was reconstructed FROM "
+              f"scored view(s) {leaked} — its row scores a fit to data it "
+              f"saw, not a test.")
+    return leaked
+
+
 def score_volume(mu, geometry, ctx, indices, measured, window, *,
                  render_downsample: int, verbose: bool = True):
     """Per-angle metrics for one volume, as-rendered and after the gain fit."""
@@ -353,6 +420,16 @@ def parse_args():
         '--angle-indices', default=None, metavar='I,J,K',
         help='Score exactly these projection indices instead, comma '
              'separated. Overrides --angles.')
+    parser.add_argument(
+        '--test-views-from', default=None, metavar='JSON',
+        help='Score exactly the TEST views recorded in this sidecar (the '
+             '<volume>.json a driver writes when run with --test-indices/'
+             '--test-count), so every volume is scored on the views that run '
+             'withheld. --test-indices / --test-count given here mean the '
+             'same thing without a sidecar. Overrides --angles and '
+             '--angle-indices. Every volume whose own sidecar records its '
+             'views is checked, and a scored view it was reconstructed from '
+             'is reported loudly.')
     parser.add_argument(
         '--render-downsample', type=int, default=2, metavar='N',
         help='Detector stride for the rendered comparison (default: 2, what '
@@ -425,7 +502,10 @@ def main():
     ctx = prepare_scan(args, fit_domain=True)
     n_angles = int(ctx.projections.shape[0])
 
-    if args.angle_indices:
+    test_source = None
+    if args.test_views_from or args.test_indices or args.test_count:
+        indices, test_source = _test_view_indices(args, ctx, n_angles)
+    elif args.angle_indices:
         try:
             indices = [int(v) for v in args.angle_indices.split(',') if v.strip()]
         except ValueError as e:
@@ -436,7 +516,8 @@ def main():
                 f"--angle-indices {bad} outside the scan's 0..{n_angles - 1}")
     else:
         indices = choose_angles(n_angles, args.angles)
-    print(f"\nScoring {len(indices)} of {n_angles} projections: {indices}")
+    print(f"\nScoring {len(indices)} of {n_angles} projections: {indices}"
+          + (f"  (test views, from {test_source})" if test_source else ""))
 
     # ---- pre-flight: geometry only, no voxels -------------------------
     # Every volume's grid is read from its header first, so a bad path fails
@@ -451,15 +532,17 @@ def main():
                                        else ""))
         vol_geometry, sidecar = peek_geometry(path, args)
         geometry = scan_geometry_for(ctx, vol_geometry)
+        leaked = scored_views_in_training(sidecar, indices, n_angles, label,
+                                          strict=test_source is not None)
         if vendor or not sidecar:
             print("  NOTE: no sidecar — this volume is placed by its header "
                   "alone. If it is displaced from the scan frame, the "
                   "misalignment lands in these numbers.")
-        plan.append((label, Path(path), geometry, vendor))
+        plan.append((label, Path(path), geometry, vendor, leaked))
 
     # ---- the common detector window ----------------------------------
     n_b, n_a = int(ctx.projections.shape[1]), int(ctx.projections.shape[2])
-    windows = [covered_detector_window(g, n_b, n_a) for _, _, g, _ in plan]
+    windows = [covered_detector_window(g, n_b, n_a) for _, _, g, _, _ in plan]
     window = (max(w[0] for w in windows), min(w[1] for w in windows),
               max(w[2] for w in windows), min(w[3] for w in windows))
     if window[1] <= window[0] or window[3] <= window[2]:
@@ -487,12 +570,12 @@ def main():
     extents = [(float(g['vol_shape'][0]) * float(g['dx']),
                 float(g['vol_shape'][1]) * float(g['dx']),
                 float(g['vol_shape'][2]) * float(g['dz']))
-               for _, _, g, _ in plan]
+               for _, _, g, _, _ in plan]
     vols = [e[0] * e[1] * e[2] for e in extents]
     if vols and min(vols) > 0 and max(vols) / min(vols) > 1.10:
         print("\n  WARNING: these volumes do not cover the same region, so "
               "their rows are NOT comparable —")
-        for (label, _p, _g, _v), e in zip(plan, extents):
+        for (label, _p, _g, _v, _l), e in zip(plan, extents):
             print(f"    {label[:34]:34s} {e[0]:6.1f} x {e[1]:5.1f} x "
                   f"{e[2]:5.1f} mm")
         print("  A ray scored inside the common window still crosses matter "
@@ -514,7 +597,7 @@ def main():
 
     # ---- score, one volume in memory at a time ------------------------
     results = []
-    for label, path, geometry, vendor in plan:
+    for label, path, geometry, vendor, leaked in plan:
         print(f"\n[{label}] forward-projecting "
               f"{geometry['vol_shape']} @ {geometry['dx']:.4f} mm")
         mu, _vol_geometry, prov = load_volume_as_mu(path, args, vendor=vendor,
@@ -536,6 +619,9 @@ def main():
                         'vol_shape': list(geometry['vol_shape']),
                         'voxel_xy_mm': float(geometry['dx']),
                         'voxel_z_mm': float(geometry['dz']),
+                        # Which scored views this volume was reconstructed
+                        # FROM, per its sidecar (None = it records no views).
+                        'scored_views_in_training': leaked,
                         'per_angle': rows, **summary, '_pair': pair})
 
     # ---- report -------------------------------------------------------
@@ -571,6 +657,7 @@ def main():
         'scan': Path(ctx.scan_folder).name,
         'n_angles': n_angles,
         'scored_angles': indices,
+        'scored_angles_source': test_source,
         'detector_window': list(window),
         'render_downsample': int(args.render_downsample),
         'downsample': int(ctx.downsample),

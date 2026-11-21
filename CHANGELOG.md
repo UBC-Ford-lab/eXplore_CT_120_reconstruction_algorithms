@@ -11,6 +11,8 @@
 - GUI: Slurm fair-share info, re-run and resume buttons, run-time estimates,
   ROI drawing on a preview, editable job notes, and other small improvements.
 - Windows fixes.
+- Opt-in test views (`--test-indices`, `--test-count`) and FDK warm start
+  (`--warm-start`).
 
 ## 0.3.0 (2026-10-21)
 

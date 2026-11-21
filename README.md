@@ -99,6 +99,10 @@ when possible, else from the detector calibration (`--wls-slope`,
 `--wls-read-noise` pin either). `--loss mse` is SIRT's objective, for
 comparisons with the classical solvers.
 
+Opt-in: `--test-indices`/`--test-count` withhold test views from every
+step and score them at the end; `--warm-start fdk` starts from an FDK of the
+training views.
+
 To add a representation, subclass `LearnedReconstructor` (`build_model`,
 `build_domain`, `export_volume`) and register a `LearnedAlgorithm`; `voxel/`
 is the short example, `gaussian/` the full one. A descriptor can change the

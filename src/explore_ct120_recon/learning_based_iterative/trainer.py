@@ -126,12 +126,19 @@ class StoppedBySignal(RuntimeError):
 class LearnedReconstructor:
     """Differentiable-rendering reconstruction, following the backend contract.
 
+    ``shared_loop_features``: whether the opt-in features implemented in THIS
+    class's ``reconstruct`` (FDK warm start, ``score_views`` for test views)
+    are available. A subclass that replaces the loop outright sets it False,
+    and the driver refuses those flags instead of silently ignoring them.
+
     consume  raw-count projections (N_angles, N_b, N_a) + angles (radians, FDK
              convention) + a ct_core ``build_geometry`` dict
     return   float32 (Nx, Ny, Nz) volume of linear attenuation mu (mm^-1) via
              ``reconstructed_volume`` — NOT HU; calibration is a single
              downstream step shared by every backend (ct_core.hu_calibration)
     """
+
+    shared_loop_features = True
 
     def __init__(self, projections, angles, geometry,
                  iterations: int = 20000,
@@ -196,8 +203,16 @@ class LearnedReconstructor:
                  log_fn=None, diag_fn=None,
                  view_groups=None,
                  view_phase=None,
-                 noise_calibration=None):
+                 noise_calibration=None,
+                 warm_start=None):
         self.projections = projections
+        # Opt-in FDK warm start (`.warm_start.WarmStart`): the representation
+        # is fitted to an FDK volume of the TRAINING views, then handed over
+        # to the projection objective through a short anchored phase. None —
+        # the default — leaves the loop exactly as it was.
+        self.warm_start = warm_start
+        #: What the warm start did (pretrain / handoff scores), for recon.json.
+        self.warm_start_report: dict | None = None
         # Which DETECTOR (and scan) this data came from, for a data term that
         # weights by the measured noise: a ``ct_core.noise_model.
         # NoiseCalibrationKey`` (serial, scan tag, calibration directory) or
@@ -540,6 +555,17 @@ class LearnedReconstructor:
             return self._export_fn(model, self.geometry, domain, device)
         return render_volume(model, self.geometry, domain, device=device,
                              report_progress=getattr(self, "_final_export", False))
+
+    def _warm_start_direct(self, model, warm_start, domain, device) -> bool:
+        """Initialise ``model`` from the warm-start volume WITHOUT fitting,
+        if the representation can. Return whether it did.
+
+        DEFAULT: it cannot, and the volume is fitted by point regression
+        (``warm_start.pretrain_on_volume``). A representation whose
+        parameters ARE a volume on the trainer's grid overrides this and
+        copies it in (``voxel.VoxelReconstructor``).
+        """
+        return False
 
     def _lr_stage(self, model, domain, device, it, stage, lr) -> None:
         """Hand the CURRENT volume to ``on_lr_stage``, and never let it matter.
@@ -1192,6 +1218,22 @@ class LearnedReconstructor:
                       + (", to the objective classical SIRT descends)"
                          if self.loss == "mse" else ")"))
 
+        # ---- optional FDK warm start (opt-in; see .warm_start) -------------
+        # After the data term exists (the handoff descends it, with the same
+        # sampler and the same excluded holdout) and before the stopping
+        # rules and the main loop. Each phase has its own optimizer; the main
+        # optimizer above has taken no step yet, so its moments are EMPTY and
+        # the main loop starts fresh, LR warmup and all — the documented
+        # choice (see the module docstring of .warm_start).
+        if self.warm_start is not None:
+            self.warm_start_report = self._run_warm_start(
+                model, scene, domain, device, spp=spp, amp_dtype=amp_dtype,
+                loss_fn=loss_fn, sample_batch=sample_batch,
+                grad_scale_fn=grad_scale_fn,
+                exclude_angle=holdout if self.withhold_eval else None,
+                eval_fn=((lambda: scorer.score(_render_eval().cpu().numpy()))
+                         if holdout is not None else None))
+
         # ---- stopping rules --------------------------------------------------
         # The shared implementation, so this backend, TIGRE, ASTRA and muNeRF all
         # stop on the same definitions. Notably the best-on-holdout STATE is now
@@ -1522,6 +1564,12 @@ class LearnedReconstructor:
         # No HU conversion: the model holds mu (mm^-1) and it stays that way,
         # unclipped. HU is fitted once downstream (ct_core.hu_calibration).
         self.model = unwrap_model(model)
+        # What `score_views` needs to render more views through the SAME
+        # forward model after the run: no sinogram is kept, only the domain,
+        # the quadrature and the precision the evaluation projection used.
+        self._eval_context = {'model': model, 'domain': domain, 'spp': spp,
+                              'amp_dtype': amp_dtype, 'device': device,
+                              'geometry': scene.geometry}
         if not self.export:
             print("  Export skipped (export=False) — the trained module is on "
                   "`.model`.")
@@ -1530,3 +1578,117 @@ class LearnedReconstructor:
         vol = self.export_volume(model, domain, device)
         self.reconstructed_volume = vol
         return vol
+
+    # ------------------------------------------------------- opt-in features
+
+    def _run_warm_start(self, model, scene, domain, device, *, spp, amp_dtype,
+                        loss_fn, sample_batch, grad_scale_fn, exclude_angle,
+                        eval_fn) -> dict:
+        """Pretrain (or copy) onto the FDK, then the anchored handoff.
+
+        Returns the report recon.json records: the volume-domain fit against
+        the FDK after phase 1 and the held-out projection score after each
+        phase (diagnostic or validation, exactly as the eval projection is).
+        """
+        from . import warm_start as W
+        ws = self.warm_start
+        report = {'settings': ws.settings(), **dict(ws.record)}
+        print(f"\n  --- warm start ({ws.record.get('source', 'volume')}) ---")
+
+        def _holdout(tag):
+            if eval_fn is None:
+                return None
+            m = eval_fn()
+            print(f"  warm start: eval projection after {tag}: ssim "
+                  f"{m['ssim']:.4f}  psnr {m['psnr']:.2f} dB  mse {m['mse']:.4e}")
+            if self.log_fn is not None:
+                self.log_fn({f"warm_start/{tag}_eval_{k}": float(m[k])
+                             for k in ('ssim', 'psnr', 'mse')}, 0)
+            return {k: float(m[k]) for k in ('ssim', 'psnr', 'mse')}
+
+        report['eval_before'] = _holdout('init')
+        if self._warm_start_direct(model, ws, domain, device):
+            fit = W.direct_scores(model, ws, domain, device, self.seed)
+            print(f"  warm start / direct copy: the parameters ARE the volume — "
+                  f"rmse {fit['rmse']:.3e} mm^-1 (rel {fit['rel_rmse']:.3f}, "
+                  f"ncc {fit['ncc']:.4f}) against the FDK")
+            report['pretrain'] = {'mode': 'direct_copy', 'final': fit}
+        else:
+            report['pretrain'] = W.pretrain_on_volume(
+                model, ws, domain, device, lr=self.lr, group_lrs=self.lr_groups,
+                seed=self.seed, amp_dtype=amp_dtype, log_fn=self.log_fn)
+        if self.log_fn is not None:
+            fin = report['pretrain']['final']
+            self.log_fn({'warm_start/fit_rmse': fin['rmse'],
+                         'warm_start/fit_rel_rmse': fin['rel_rmse'],
+                         'warm_start/fit_ncc': fin['ncc']}, 0)
+        report['eval_after_pretrain'] = _holdout('pretrain')
+        report['handoff'] = W.handoff(
+            model, ws, domain, device, loss_fn=loss_fn,
+            sample_batch=sample_batch, render_fn=self._render_fn, scene=scene,
+            spp=spp, exclude_angle=exclude_angle, lr=self.lr,
+            group_lrs=self.lr_groups, optimizer_name=self.optimizer_name,
+            seed=self.seed, amp_dtype=amp_dtype, grad_scale_fn=grad_scale_fn,
+            grad_clip=((lambda m: clip_grad_norm(m, self.grad_clip_norm))
+                       if self.grad_clip_norm > 0 else None),
+            log_fn=self.log_fn)
+        if not report['handoff'].get('skipped'):
+            report['eval_after_handoff'] = _holdout('handoff')
+        report['main_optimizer'] = ('fresh (empty moments) with its own '
+                                    f'{self.lr_warmup_iters}-iteration LR warmup')
+        return report
+
+    @torch.no_grad()
+    def score_views(self, sinogram_views, angles, labels) -> dict:
+        """Score the trained model on views it never saw — the test views.
+
+        ``sinogram_views`` are PREPROCESSED line integrals (n, n_b, n_a) of
+        those views, ``angles`` their angles (radians) and ``labels`` their
+        original indices. Each is rendered and scored exactly as the
+        evaluation projection is — same covered detector window, same stride
+        (``diag_downsample``), same quadrature and precision, same
+        ``HoldoutScorer`` — so the numbers read on the holdout's scale.
+        Returns ``{'views': [{index, ssim, psnr, mse}], 'mean': {...}}``.
+        """
+        ctx = getattr(self, '_eval_context', None)
+        if ctx is None:
+            raise RuntimeError("score_views needs a finished reconstruct()")
+        from ..ct_core.projection_diag import covered_detector_window
+        device = ctx['device']
+        geometry, domain = ctx['geometry'], ctx['domain']
+        sino = torch.as_tensor(np.ascontiguousarray(sinogram_views),
+                               dtype=torch.float32, device=device)
+        ang = torch.as_tensor(np.asarray(angles), dtype=torch.float32,
+                              device=device)
+        tscene = Scene(sinogram=sino, angles=ang, geometry=geometry,
+                       scan_name="", model_domain=domain)
+        n_b, n_a = tscene.detector_shape
+        ds = self.diag_downsample
+        b0, b1, a0, a1 = covered_detector_window(geometry, n_b, n_a)
+        bb, aa = torch.meshgrid(torch.arange(b0, b1, ds, device=device),
+                                torch.arange(a0, a1, ds, device=device),
+                                indexing="ij")
+        shape = bb.shape
+        hb, ha = bb.reshape(-1), aa.reshape(-1)
+        rows, chunk = [], max(1, int(self.rays_per_batch) or 16384)
+        model = ctx['model']
+        for k, label in enumerate(labels):
+            o, d, t = rays_from_indices(tscene, torch.full_like(hb, k), hb, ha)
+            pred = torch.empty(o.shape[0], device=device)
+            with autocast_ctx(ctx['amp_dtype'], device.type):
+                for i0 in range(0, o.shape[0], chunk):
+                    i1 = min(i0 + chunk, o.shape[0])
+                    pred[i0:i1] = self._render_fn(
+                        o[i0:i1], d[i0:i1], model, tscene,
+                        num_samples=ctx['spp'], stratified=False,
+                        generator=None, grad_scale_fn=None).float()
+            m = HoldoutScorer(t.reshape(shape).cpu().numpy(),
+                              label=f"test view {label}").score(
+                                  pred.reshape(shape).cpu().numpy())
+            rows.append({'index': int(label), 'ssim': float(m['ssim']),
+                         'psnr': float(m['psnr']), 'mse': float(m['mse'])})
+        mean = {k: float(np.mean([r[k] for r in rows])) for k in
+                ('ssim', 'psnr', 'mse')} if rows else {}
+        return {'views': rows, 'mean': mean,
+                'window': [int(b0), int(b1), int(a0), int(a1)],
+                'stride': int(ds)}

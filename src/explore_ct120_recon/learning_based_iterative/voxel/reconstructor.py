@@ -80,6 +80,25 @@ class VoxelReconstructor(LearnedReconstructor):
               f"{self.init_density:g} mm^-1")
         return VoxelGrid((Nz, Ny, Nx), init_density=self.init_density)
 
+    def _warm_start_direct(self, model, warm_start, domain, device) -> bool:
+        """The parameters ARE a volume, so a warm start is an assignment.
+
+        ``warm_start.volume`` is on this run's grid (the driver resamples a
+        loaded volume onto it), which is the grid ``build_model`` tiles, so
+        ``VoxelGrid.load_volume`` copies it voxel for voxel. Nothing is
+        clipped here; the grid's own non-negativity projection applies after
+        the first optimizer step, as it always does.
+        """
+        import torch
+        from ..training import unwrap_model
+        vol = np.asarray(warm_start.volume, dtype=np.float32)
+        if tuple(vol.shape) != tuple(int(v) for v in self.geometry["vol_shape"]):
+            return False
+        grid = unwrap_model(model)
+        grid.load_volume(torch.from_numpy(
+            np.ascontiguousarray(vol.transpose(2, 1, 0))).to(grid.mu.device))
+        return True
+
     def export_volume(self, model, domain, device) -> np.ndarray:
         """The parameter grid IS the volume — no render, no resampling.
 
