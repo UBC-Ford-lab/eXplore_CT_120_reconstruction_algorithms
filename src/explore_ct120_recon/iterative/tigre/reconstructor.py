@@ -81,17 +81,27 @@ def fdk_angles_to_tigre(angles_fdk):
     return np.asarray(angles_fdk, dtype=np.float64) + np.pi
 
 
-def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None,
-                         cpa_raw=None, min_nxy=None, cpb_raw=None):
+def build_tigre_geometry(geometry, N_b, N_a, psi_deg=None, min_nxy=None):
     """
     Build a TIGRE Geometry object from the FDK geometry dict.
 
     TIGRE uses [z, y, x] ordering for volumes and [rows, cols] for detectors.
 
+    The centre of rotation is NOT a parameter: it is always the loader's
+    ``geometry['central_pixel_a' / 'central_pixel_b']`` (the axis every other
+    backend uses), mapped into TIGRE's column-flipped frame here by
+    ``tigre_detector_terms``. There is deliberately no way to build the
+    pre-2026-11-21 geometry (axis at the detector centre regardless of the
+    scan), which split edges and shifted SIRT in z on the vendor-CoR scans.
+
     Args:
-        geometry: dict with R_s, R_d, da, db, vol_shape, dx, dz
+        geometry: dict with R_s, R_d, da, db, vol_shape, dx, dz, and the
+            loader's central_pixel_a / central_pixel_b (missing = detector
+            centre)
         N_b: Number of detector rows (vertical)
         N_a: Number of detector columns (horizontal)
+        psi_deg: detector in-plane rotation measured on the UNFLIPPED
+            (ct_core) sinogram, None = 0; mirrored for TIGRE here
 
     Returns:
         tigre.utilities.geometry.Geometry
@@ -186,27 +196,27 @@ def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None,
     #    measured -5.61 px for +2 mm vs offDetector's -5.00 — so it is NOT the
     #    right knob for a detector-referenced column centre.)
     #
-    # detector_psi_deg / cpa_raw / cpb_raw of None reproduce the
-    # pre-2026-08-11 behaviour EXACTLY (all terms zero) — that is the revert
-    # path. cpa_raw is in TIGRE's column-flipped frame; cpb_raw is not.
-    psi = float(detector_psi_deg or 0.0)
+    # All three terms come from tigre_detector_terms, the single place the
+    # column flip is applied (psi and cpa mirrored, cpb not). The CoR always
+    # follows the loader; there is no revert path to the centred axis.
+    psi, cpa_raw, cpb_raw = tigre_detector_terms(geometry, N_a, N_b, psi_deg)
+    print(f"  Detector terms for TIGRE's column-flipped frame: psi "
+          f"{psi:+.4f} deg, cpa {cpa_raw:.3f}, cpb {cpb_raw:.3f} "
+          f"(loader axis: column {(N_a - 1) - cpa_raw:.3f}, row {cpb_raw:.3f})")
     geo.rotDetector = np.array([np.radians(psi), 0.0, 0.0])
     if psi:
         print(f"  Detector in-plane rotation: psi = {psi:+.4f} deg "
               f"(rotDetector[0])")
-    off_row_mm, off_col_mm = 0.0, 0.0
-    if cpa_raw is not None:
-        centre_raw = (N_a - 1) / 2.0
-        off_col_mm = (centre_raw - float(cpa_raw)) * float(geometry['da'])
-        print(f"  Column CoR: cpa {float(cpa_raw):.2f} raw "
-              f"({float(cpa_raw) - centre_raw:+.2f} from centre) -> "
-              f"offDetector[1] = {off_col_mm:+.5f} mm")
-    if cpb_raw is not None:
-        centre_b = (N_b - 1) / 2.0
-        off_row_mm = (centre_b - float(cpb_raw)) * float(geometry['db'])
-        print(f"  Central row: cpb {float(cpb_raw):.2f} raw "
-              f"({float(cpb_raw) - centre_b:+.2f} from centre) -> "
-              f"offDetector[0] = {off_row_mm:+.5f} mm")
+    centre_raw = (N_a - 1) / 2.0
+    off_col_mm = (centre_raw - float(cpa_raw)) * float(geometry['da'])
+    print(f"  Column CoR: cpa {float(cpa_raw):.2f} raw "
+          f"({float(cpa_raw) - centre_raw:+.2f} from centre) -> "
+          f"offDetector[1] = {off_col_mm:+.5f} mm")
+    centre_b = (N_b - 1) / 2.0
+    off_row_mm = (centre_b - float(cpb_raw)) * float(geometry['db'])
+    print(f"  Central row: cpb {float(cpb_raw):.2f} raw "
+          f"({float(cpb_raw) - centre_b:+.2f} from centre) -> "
+          f"offDetector[0] = {off_row_mm:+.5f} mm")
     geo.offDetector = np.array([off_row_mm, off_col_mm])
 
     # Accuracy for ray-tracing interpolation
@@ -820,15 +830,8 @@ class TIGREReconstructor:
                 print(f"  geometry auto-calibration FAILED ({type(_e).__name__}: "
                       f"{_e}) — using psi=0")
 
-        _psi_t, _cpa_t, _cpb = tigre_detector_terms(
-            self.geometry, self.N_a, self.N_b, _psi_deg)
-        print(f"  Detector terms for TIGRE's column-flipped frame: psi "
-              f"{_psi_t:+.4f} deg, cpa {_cpa_t:.3f}, cpb {_cpb:.3f} "
-              f"(loader axis: column {self.geometry.get('central_pixel_a', float('nan')):.3f}, "
-              f"row {self.geometry.get('central_pixel_b', float('nan')):.3f})")
         geo = build_tigre_geometry(self.geometry, self.N_b, self.N_a,
-                                   detector_psi_deg=_psi_t, cpa_raw=_cpa_t,
-                                   cpb_raw=_cpb)
+                                   psi_deg=_psi_deg)
         print(f"  DSD={float(geo.DSD):.2f} mm, DSO={float(geo.DSO):.2f} mm")
         print(f"  Detector: {geo.nDetector} px, {geo.dDetector} mm/px")
         print(f"  Volume: {geo.nVoxel} voxels (z,y,x), {geo.dVoxel} mm/voxel")

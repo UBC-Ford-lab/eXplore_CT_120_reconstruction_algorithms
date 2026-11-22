@@ -447,6 +447,20 @@ class HuberMSSSIM:
     exactly zero. Unweighted line-integral residuals averaged over 18432 rays
     put them near 1e-15 on Scan_1510 (2026-11-21), so at K = 1 the hash table
     receives NO gradient. Default 1 = the formula as written.
+
+    K is the CEILING of a dynamic backward scale s, the same mechanism as a
+    mixed-precision GradScaler. The trainer backpropagates at s, checks every
+    parameter gradient for inf/NaN, and on overflow halves s and redoes only
+    that step's backward (the step is not skipped). s doubles again after
+    ``scale_growth_every`` clean steps, up to K. The gradient handed to the
+    optimiser is always rescaled in fp32 to exactly K x the objective's, so
+    Adam sees one constant scale and s affects nothing but the range inside
+    the fp16 backward. On a calibration step the structural term is
+    backpropagated ALONE at s x w (w = the current weight) and divided by w
+    afterwards: alone and unweighted, its gradient is ~1/w (~300x on
+    Scan_1510) larger than its share of a normal step, and at K = 1e9 that
+    overflowed tiny-cuda-nn's coarse hash levels at the first recalibration
+    (step 100), which NaN'd fir jobs 5038098/5038099 (2026-11-22).
     """
 
     two_pass = True
@@ -454,7 +468,7 @@ class HuberMSSSIM:
     def __init__(self, *, data_range, huber_delta=None, huber_sigma_mult=0.30,
                  window_size=11, sigma=1.5, ms_weights=None, alpha=1.0,
                  recalibrate_every=100, ema=0.9, ssim_weight=None,
-                 loss_scale=1.0, **_):
+                 loss_scale=1.0, scale_growth_every=1000, **_):
         self.data_range = float(data_range)
         self.huber = make_huber_loss(delta=huber_delta,
                                      sigma_mult=float(huber_sigma_mult))
@@ -466,6 +480,13 @@ class HuberMSSSIM:
         self.ema = float(ema)
         self.fixed_weight = None if ssim_weight is None else float(ssim_weight)
         self.loss_scale = float(loss_scale)
+        # Dynamic BACKWARD scale (trainer state, see the class docstring):
+        # starts at K, halves on a non-finite gradient, doubles back after
+        # scale_growth_every clean steps, never above K.
+        self.backward_scale = self.loss_scale
+        self.scale_growth_every = max(1, int(scale_growth_every))
+        self.clean_steps = 0
+        self.overflow_events = 0
         self.weight = self.fixed_weight
         self.calibrated = self.fixed_weight is not None
         self.last = {}

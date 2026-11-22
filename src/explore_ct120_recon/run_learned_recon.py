@@ -1382,6 +1382,8 @@ def main(argv=None):
             'name': args.loss,
             'options': dict(getattr(reconstructor, 'loss_options', {})),
             **({'ssim_weight_final': _tp.weight,
+                'backward_scale_final': getattr(_tp, 'backward_scale', None),
+                'overflow_events': getattr(_tp, 'overflow_events', None),
                 'last_step': dict(_tp.last)} if _tp is not None else {})}
     if args.save_checkpoint:
         extra_meta['model_checkpoint'] = Path(

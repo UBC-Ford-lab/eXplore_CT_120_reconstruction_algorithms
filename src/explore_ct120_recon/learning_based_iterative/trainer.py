@@ -634,9 +634,11 @@ class LearnedReconstructor:
         measured; the total is then g_data + w g_struct (linear, no third pass).
         Cost: 2 renders + 1 backward per step, 3 + 2 on a calibration step.
 
-        ``term.loss_scale`` K multiplies every backpropagated gradient (the
-        parameter gradients are K x the objective's); the weight is a ratio
-        of RMS values and the returned loss is unscaled, so neither sees K.
+        ``term.loss_scale`` K: the parameter gradients handed to the optimiser
+        are exactly K x the objective's. The fp16-facing backward runs at a
+        dynamic scale <= K that halves on overflow (step redone) and regrows
+        (see ``HuberMSSSIM``); the weight is a ratio of RMS values and the
+        returned loss is unscaled, so neither sees K or the dynamic scale.
         """
         chunk = int(self.loss_options.get("render_chunk") or self.rays_per_batch)
         n = int(origins.shape[0])
@@ -656,11 +658,16 @@ class LearnedReconstructor:
         g_struct, = torch.autograd.grad(struct, pred)
         params = [p for p in model.parameters() if p.requires_grad]
 
-        scale = float(getattr(term, "loss_scale", 1.0))
+        if not (torch.isfinite(data) and torch.isfinite(struct)):
+            raise FloatingPointError(
+                f"huber_msssim: non-finite loss at iteration {it} (huber "
+                f"{float(data)}, 1-MS-SSIM {float(struct)}) — the model "
+                f"output itself is non-finite, which no rescaling can fix")
 
-        def backprop(g_out):
-            g_flat = (g_out * scale).reshape(-1) if scale != 1.0 \
-                else g_out.reshape(-1)
+        ceiling = float(getattr(term, "loss_scale", 1.0))
+
+        def backprop(g_out, s):
+            g_flat = (g_out * s).reshape(-1)
             for (a, b), st in zip(bounds, states):
                 gen.set_state(st)
                 with autocast_ctx(amp_dtype, device.type):
@@ -678,6 +685,33 @@ class LearnedReconstructor:
                 p.grad = None
             return out
 
+        def all_finite(gs):
+            flags = [torch.isfinite(g).all() for g in gs if g is not None]
+            return bool(torch.stack(flags).all()) if flags else True
+
+        def guarded(g_out, mult=1.0):
+            """Backprop g_out at the dynamic scale x mult; on a non-finite
+            gradient halve the scale and redo. Returns the grads rescaled in
+            fp32 to ``ceiling`` x the true gradient of g_out."""
+            for _ in range(64):
+                s = term.backward_scale * mult
+                backprop(g_out, s)
+                gs = take_grads()
+                if all_finite(gs):
+                    f = ceiling / s
+                    return [None if g is None else
+                            (g if f == 1.0 else g * f) for g in gs]
+                term.backward_scale *= 0.5
+                term.overflow_events += 1
+                term.clean_steps = 0
+                print(f"  loss scale: non-finite gradient at iteration "
+                      f"{it} — backward scale halved to "
+                      f"{term.backward_scale:.3g} (ceiling {ceiling:.3g}); "
+                      f"step redone, not skipped", flush=True)
+            raise FloatingPointError(
+                f"huber_msssim: gradient still non-finite after 64 halvings "
+                f"of the backward scale at iteration {it}")
+
         def rms(gs):
             tot, cnt = 0.0, 0
             for g, p in zip(gs, params):
@@ -687,10 +721,12 @@ class LearnedReconstructor:
             return (tot / max(cnt, 1)) ** 0.5
 
         if term.calibration_due(it):
-            backprop(g_data)
-            gd = take_grads()
-            backprop(g_struct)
-            gs = take_grads()
+            gd = guarded(g_data)
+            # The structural term alone is ~1/w larger than its share of a
+            # normal step: backprop it at s x w (guarded() divides the w back
+            # out in fp32), so the fp16 backward sees the normal-step size.
+            w_ref = float(term.weight) if term.calibrated and term.weight else 1.0
+            gs = guarded(g_struct, mult=w_ref)
             w = term.calibrate(rms(gd), rms(gs))
             for p, a, b in zip(params, gd, gs):
                 if a is None and b is None:
@@ -702,7 +738,15 @@ class LearnedReconstructor:
                 else:
                     p.grad = a + w * b
         else:
-            backprop(g_data + term.weight * g_struct)
+            for p, g in zip(params, guarded(g_data + term.weight * g_struct)):
+                p.grad = g
+        term.clean_steps += 1
+        if (term.backward_scale < ceiling
+                and term.clean_steps >= term.scale_growth_every):
+            term.backward_scale = min(ceiling, term.backward_scale * 2.0)
+            term.clean_steps = 0
+        term.last.update(backward_scale=term.backward_scale,
+                         overflow_events=term.overflow_events)
         return (data + term.weight * struct).detach()
 
     def _auto_samples_per_ray(self, domain) -> int:
@@ -1537,7 +1581,10 @@ class LearnedReconstructor:
                           f"{_tp['huber_delta']:.3e}, "
                           f"{100 * _tp['huber_frac_quadratic']:.0f}% quadratic)"
                           f"  1-MS-SSIM {_tp['one_minus_msssim']:.4f}  "
-                          f"w {two_pass_term.weight:.4g}", flush=True)
+                          f"w {two_pass_term.weight:.4g}  backward scale "
+                          f"{two_pass_term.backward_scale:.3g} "
+                          f"({two_pass_term.overflow_events} overflows)",
+                          flush=True)
                     if self.log_fn is not None:
                         self.log_fn({
                             "train/huber": _tp["huber"],
@@ -1546,6 +1593,10 @@ class LearnedReconstructor:
                                 _tp["huber_frac_quadratic"],
                             "train/one_minus_msssim": _tp["one_minus_msssim"],
                             "train/ssim_weight": float(two_pass_term.weight),
+                            "train/backward_scale":
+                                float(two_pass_term.backward_scale),
+                            "train/overflow_events":
+                                int(two_pass_term.overflow_events),
                         }, it + 1)
                 if self.log_fn is not None:
                     self.log_fn({"train/loss": float(loss.item()),

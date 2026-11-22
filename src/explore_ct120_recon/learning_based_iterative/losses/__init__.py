@@ -245,7 +245,7 @@ TERM_DEFAULTS = {
         "patch_size": 96, "num_patches": 2,
         "huber_sigma_mult": 0.30, "window_size": 11, "sigma": 1.5,
         "alpha": 1.0, "recalibrate_every": 100, "ema": 0.9,
-        "loss_scale": 1.0,
+        "loss_scale": 1.0, "scale_growth_every": 1000,
     },
 }
 
