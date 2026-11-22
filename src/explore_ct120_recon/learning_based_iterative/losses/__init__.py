@@ -38,6 +38,7 @@ from .data_terms import (
     _build_ramp_kernel,
     build_phase_wiener_gate,
     build_wiener_kernel,
+    HuberMSSSIM,
     filtered_mse,
     l1_dssim,
     make_huber_loss,
@@ -229,6 +230,26 @@ def _l1_dssim_factory(*, data_range, dssim_weight=0.2, window_size=11,
     return _fn
 
 
+def _huber_msssim_factory(*, data_range, **kw):
+    """The thesis objective (adaptive Huber + self-calibrated 1 - MS-SSIM on
+    2 x 96^2 patches); see ``data_terms.HuberMSSSIM``. Stateful: the weight
+    lives on the returned object."""
+    return HuberMSSSIM(data_range=data_range, **kw)
+
+
+#: Options a term brings with it when the run does not set them. Only terms
+#: that reproduce a fixed recipe carry any; merged UNDER --loss-option, and the
+#: resolved set is written to recon.json.
+TERM_DEFAULTS = {
+    "huber_msssim": {
+        "patch_size": 96, "num_patches": 2,
+        "huber_sigma_mult": 0.30, "window_size": 11, "sigma": 1.5,
+        "alpha": 1.0, "recalibrate_every": 100, "ema": 0.9,
+        "loss_scale": 1.0,
+    },
+}
+
+
 #: name -> factory. The factory takes keyword options and returns a callable
 #: ``(pred, target) -> scalar``. Unknown keywords are ignored, so one options
 #: dict can be passed whichever term is selected.
@@ -243,6 +264,7 @@ DATA_TERMS = {
     "ssim": _ssim_factory,
     "msssim": _msssim_factory,
     "l1_dssim": _l1_dssim_factory,
+    "huber_msssim": _huber_msssim_factory,
 }
 
 #: One line per term, for CLI help and for logging what a run actually used.
@@ -272,6 +294,10 @@ DATA_TERM_HELP = {
     "l1_dssim": "(1 - w) L1 + w (1 - SSIM) on a patch, the splatting "
                 "literature's objective (--loss-option dssim_weight=W, "
                 "default 0.2); kept for comparison",
+    "huber_msssim": "the thesis objective: adaptive Huber (delta 0.3 x MAD) + "
+                    "(1 - MS-SSIM) with a gradient-balanced weight, on 2 x "
+                    "96^2 detector patches; patch rays rendered in chunks of "
+                    "--rays-per-batch",
 }
 
 #: The DEFAULT since 2026-09-09: the likelihood for the measured noise. It was
@@ -291,6 +317,7 @@ BATCH_KIND = {
     "sart": "rays",
     "filtered": "rows", "wiener": "rows",
     "ssim": "patch", "msssim": "patch", "l1_dssim": "patch",
+    "huber_msssim": "patch",
 }
 
 #: Terms that need the RAYS' geometry, not just their values: ``sart`` weights

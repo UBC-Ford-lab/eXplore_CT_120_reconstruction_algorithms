@@ -90,7 +90,7 @@ from ..ct_core.noise_model import (NoiseModel, auto_or_float,
                                    resolve_noise_model)
 from ..ct_core.preprocessing import preprocess_sinogram
 from .losses import (BATCH_KIND, DATA_TERMS, DEFAULT_DATA_TERM,
-                     NEEDS_RAY_GEOMETRY, build_data_term)
+                     NEEDS_RAY_GEOMETRY, TERM_DEFAULTS, build_data_term)
 from .ray_sampler import (rays_from_indices, sample_projection_patch,
                           sample_random_rays, sample_random_rows)
 from .renderer import (fusion_supported, ray_domain_intersect,
@@ -338,7 +338,10 @@ class LearnedReconstructor:
         if self.loss not in DATA_TERMS:
             raise ValueError(f"loss must be one of {sorted(DATA_TERMS)}, got "
                              f"{loss!r}")
-        self.loss_options = dict(loss_options or {})
+        # A term that reproduces a fixed recipe (huber_msssim) brings its own
+        # option defaults; --loss-option still overrides each one.
+        self.loss_options = {**TERM_DEFAULTS.get(self.loss, {}),
+                             **dict(loss_options or {})}
         # The wls noise model's constants (ct_core.noise_model): 'auto' or a
         # number each. The Poisson slope is AT THIS RUN'S BINNING, the read
         # noise PER RAW PIXEL; both are resolved once the sinogram exists
@@ -606,6 +609,101 @@ class LearnedReconstructor:
         print("  WARNING: CUDA not available — differentiable-rendering "
               "reconstruction on CPU will be orders of magnitude slower.")
         return torch.device("cpu")
+
+    def _two_pass_step(self, term, origins, directions, target, model, scene,
+                       spp, gen, grad_scale_fn, amp_dtype, device, it):
+        """One exact gradient step for a self-calibrated composite term.
+
+        The batch (e.g. 2 x 96^2 = 18432 patch rays) is rendered in chunks of
+        ``render_chunk`` rays (default ``--rays-per-batch``), so the peak
+        activation memory is that of a ``rays_per_batch`` step whatever the
+        patch size — the quadrature is untouched. The gradient stays EXACT
+        although MS-SSIM couples every pixel of a patch:
+
+          1. render all chunks without a graph -> pred (the whole batch);
+          2. evaluate the loss parts on pred as a leaf and take dL/dpred
+             (Huber's MAD delta and the MS-SSIM windows see the full batch);
+          3. re-render each chunk WITH a graph, replaying the generator state
+             it was first rendered with (same stratified offsets, so the same
+             forward values), and backpropagate grad_outputs = its slice of
+             dL/dpred. Parameter gradients accumulate across chunks — the
+             chain rule, not an approximation.
+
+        On a calibration step (the first, then every ``recalibrate_every``),
+        step 3 runs once per part so each part's parameter-gradient RMS can be
+        measured; the total is then g_data + w g_struct (linear, no third pass).
+        Cost: 2 renders + 1 backward per step, 3 + 2 on a calibration step.
+
+        ``term.loss_scale`` K multiplies every backpropagated gradient (the
+        parameter gradients are K x the objective's); the weight is a ratio
+        of RMS values and the returned loss is unscaled, so neither sees K.
+        """
+        chunk = int(self.loss_options.get("render_chunk") or self.rays_per_batch)
+        n = int(origins.shape[0])
+        bounds = [(s0, min(n, s0 + chunk)) for s0 in range(0, n, chunk)]
+        states, preds = [], []
+        with torch.no_grad(), autocast_ctx(amp_dtype, device.type):
+            for a, b in bounds:
+                states.append(gen.get_state())
+                preds.append(self._render_fn(
+                    origins[a:b], directions[a:b], model, scene,
+                    num_samples=spp, stratified=True, generator=gen,
+                    grad_scale_fn=grad_scale_fn).float())
+        end_state = gen.get_state()
+        pred = torch.cat(preds).reshape(target.shape).requires_grad_(True)
+        data, struct = term.parts(pred, target.float())
+        g_data, = torch.autograd.grad(data, pred, retain_graph=True)
+        g_struct, = torch.autograd.grad(struct, pred)
+        params = [p for p in model.parameters() if p.requires_grad]
+
+        scale = float(getattr(term, "loss_scale", 1.0))
+
+        def backprop(g_out):
+            g_flat = (g_out * scale).reshape(-1) if scale != 1.0 \
+                else g_out.reshape(-1)
+            for (a, b), st in zip(bounds, states):
+                gen.set_state(st)
+                with autocast_ctx(amp_dtype, device.type):
+                    p = self._render_fn(
+                        origins[a:b], directions[a:b], model, scene,
+                        num_samples=spp, stratified=True, generator=gen,
+                        grad_scale_fn=grad_scale_fn)
+                (p.float() * g_flat[a:b]).sum().backward()
+            gen.set_state(end_state)
+
+        def take_grads():
+            out = [None if p.grad is None else p.grad.detach().clone()
+                   for p in params]
+            for p in params:
+                p.grad = None
+            return out
+
+        def rms(gs):
+            tot, cnt = 0.0, 0
+            for g, p in zip(gs, params):
+                if g is not None:
+                    tot += float((g.float() ** 2).sum())
+                cnt += p.numel() if g is not None else 0
+            return (tot / max(cnt, 1)) ** 0.5
+
+        if term.calibration_due(it):
+            backprop(g_data)
+            gd = take_grads()
+            backprop(g_struct)
+            gs = take_grads()
+            w = term.calibrate(rms(gd), rms(gs))
+            for p, a, b in zip(params, gd, gs):
+                if a is None and b is None:
+                    continue
+                if a is None:
+                    p.grad = w * b
+                elif b is None:
+                    p.grad = a
+                else:
+                    p.grad = a + w * b
+        else:
+            backprop(g_data + term.weight * g_struct)
+        return (data + term.weight * struct).detach()
 
     def _auto_samples_per_ray(self, domain) -> int:
         """~0.55-voxel quadrature step across the widest in-plane chord.
@@ -931,6 +1029,11 @@ class LearnedReconstructor:
                                                exclude_angle=exclude_angle,
                                                num_patches=n_patches)
             desc = f"{n_patches} x {side}x{side} projection patches per step"
+            if getattr(term, "two_pass", False):
+                chunk = int(self.loss_options.get("render_chunk")
+                            or self.rays_per_batch)
+                desc += (f" ({n_patches * side * side} rays, rendered in "
+                         f"chunks of {chunk}; exact two-pass gradient)")
 
         elif self.loss == "wls":
             w_map, w_state = self._wls_w, self._weight_state
@@ -1173,6 +1276,17 @@ class LearnedReconstructor:
             # (pred, target, it) so a self-calibrated weight can see the step.
             def loss_fn(pred, target, it, _f=_registry_loss):
                 return _f(pred, target)
+        # A self-calibrated composite term (huber_msssim) needs each part's
+        # PARAMETER gradient, and its patch batch can be larger than one
+        # render fits; it gets its own exact two-pass step (_two_pass_step).
+        two_pass_term = (_registry_loss if self._loss_fn is None
+                         and getattr(_registry_loss, "two_pass", False)
+                         else None)
+        self.two_pass_term = two_pass_term   # read by the driver's sidecar
+        if two_pass_term is not None and self._extra_loss_fn is not None:
+            raise NotImplementedError(
+                f"loss {self.loss!r} uses the two-pass step, which does not "
+                f"carry extra_loss_fn priors yet")
 
         # C = 1/coverage, applied to the BACKWARD pass only (the forward value is
         # untouched), which is what makes it a preconditioner rather than a term
@@ -1377,22 +1491,28 @@ class LearnedReconstructor:
 
             origins, directions, target = sample_batch(
                 exclude_angle=holdout if self.withhold_eval else None)
-            with autocast_ctx(amp_dtype, device.type):
-                pred = self._render_fn(origins, directions, model, scene,
-                                       num_samples=spp, stratified=True,
-                                       generator=gen,
-                                       grad_scale_fn=grad_scale_fn)
-                # `target` carries the batch's shape (rays, rows or a patch);
-                # the renderer returns a flat prediction, so restore it before
-                # scoring.
-                loss = loss_fn(pred.reshape(target.shape), target, it)
-                if self._extra_loss_fn is not None:
-                    extra = self._extra_loss_fn(model, it, loss)
-                    if extra is not None:
-                        loss = loss + extra
+            if two_pass_term is not None:
+                optimizer.zero_grad(set_to_none=True)
+                loss = self._two_pass_step(
+                    two_pass_term, origins, directions, target, model, scene,
+                    spp, gen, grad_scale_fn, amp_dtype, device, it)
+            else:
+                with autocast_ctx(amp_dtype, device.type):
+                    pred = self._render_fn(origins, directions, model, scene,
+                                           num_samples=spp, stratified=True,
+                                           generator=gen,
+                                           grad_scale_fn=grad_scale_fn)
+                    # `target` carries the batch's shape (rays, rows or a patch);
+                    # the renderer returns a flat prediction, so restore it before
+                    # scoring.
+                    loss = loss_fn(pred.reshape(target.shape), target, it)
+                    if self._extra_loss_fn is not None:
+                        extra = self._extra_loss_fn(model, it, loss)
+                        if extra is not None:
+                            loss = loss + extra
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
             clip_grad_norm(model, self.grad_clip_norm)
             optimizer.step()
             project_nonneg(model)
@@ -1411,6 +1531,22 @@ class LearnedReconstructor:
                 print(f"  iter {it:6d}/{self.iterations}  loss {loss.item():.3e}  "
                       f"lr {_lr_now:.2e}  {rate:.1f} it/s  "
                       f"{seen:.2f} visits/measurement", flush=True)
+                if two_pass_term is not None:
+                    _tp = two_pass_term.last
+                    print(f"    huber {_tp['huber']:.3e} (delta "
+                          f"{_tp['huber_delta']:.3e}, "
+                          f"{100 * _tp['huber_frac_quadratic']:.0f}% quadratic)"
+                          f"  1-MS-SSIM {_tp['one_minus_msssim']:.4f}  "
+                          f"w {two_pass_term.weight:.4g}", flush=True)
+                    if self.log_fn is not None:
+                        self.log_fn({
+                            "train/huber": _tp["huber"],
+                            "train/huber_delta": _tp["huber_delta"],
+                            "train/huber_frac_quadratic":
+                                _tp["huber_frac_quadratic"],
+                            "train/one_minus_msssim": _tp["one_minus_msssim"],
+                            "train/ssim_weight": float(two_pass_term.weight),
+                        }, it + 1)
                 if self.log_fn is not None:
                     self.log_fn({"train/loss": float(loss.item()),
                                  "train/lr": _lr_now,

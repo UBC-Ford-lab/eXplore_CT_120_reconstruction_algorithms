@@ -35,6 +35,7 @@ import numpy as np
 
 from .learning_based_iterative.trainer import StoppedBySignal
 from .learning_based_iterative.losses import (DATA_TERMS, DEFAULT_DATA_TERM,
+                                              TERM_DEFAULTS,
                                               describe_data_terms)
 from .learning_based_iterative import (algorithm_names, describe_algorithms,
                                        get_algorithm)
@@ -1102,6 +1103,12 @@ def main(argv=None):
         # trainer under wls/* once the noise model is resolved.
         'loss': 'sart' if args.emulate_sart else args.loss,
         'loss_options': ','.join(args.loss_option),
+        # A recipe term (huber_msssim) carries option defaults; record the
+        # set it actually ran with, not only what was typed.
+        **({'loss_options_resolved': {
+            **TERM_DEFAULTS[args.loss],
+            **_parse_loss_options(args.loss_option)}}
+           if args.loss in TERM_DEFAULTS and not args.emulate_sart else {}),
         'wls_slope': args.wls_slope,
         'wls_read_noise': args.wls_read_noise,
         'wls_min_counts': args.wls_min_counts,
@@ -1367,6 +1374,15 @@ def main(argv=None):
         extra_meta['warm_start'] = reconstructor.warm_start_report
     if snap_cfg is not None:
         extra_meta['snapshots'] = reconstructor.snapshot_report
+    if args.loss in TERM_DEFAULTS and not args.emulate_sart:
+        # Recipe terms record the options they ran with (defaults included)
+        # and, for a self-calibrated weight, where it ended.
+        _tp = getattr(reconstructor, 'two_pass_term', None)
+        extra_meta['loss'] = {
+            'name': args.loss,
+            'options': dict(getattr(reconstructor, 'loss_options', {})),
+            **({'ssim_weight_final': _tp.weight,
+                'last_step': dict(_tp.last)} if _tp is not None else {})}
     if args.save_checkpoint:
         extra_meta['model_checkpoint'] = Path(
             str(Path(output_path).with_suffix('')) + '_model.pt').name

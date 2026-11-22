@@ -406,3 +406,107 @@ def ssim_loss(pred2d, target2d, data_range: float,
                              weights=ms_weights).mean()
     return 1.0 - _ssim(pred2d, target2d, data_range=data_range,
                        window_size=window_size, sigma=sigma).mean()
+
+
+class HuberMSSSIM:
+    """The thesis INR objective: adaptive Huber + self-calibrated (1 - MS-SSIM).
+
+    Reproduces the August 2026 parent-trainer recipe ("legacy loss
+    'mse+msssim'" with ``training.huber.enabled``), configs
+    ``scan_1510_h100_msssim`` -> ``_msssim_l1`` at parent 2f833b8, the loop at
+    ``git show e03290b~1:inr_pipeline/train.py`` (the ``use_ssim_loss`` branch):
+
+    * the batch is ``num_patches`` contiguous ``patch_size``^2 detector
+      patches and NOTHING else — the old ``rays_per_batch`` was unused on this
+      branch. Both terms score the same patch rays;
+    * data term = ``make_huber_loss`` on the UNWEIGHTED line-integral residual,
+      delta = ``huber_sigma_mult`` x MAD(residual)/0.6745 over the whole batch,
+      detached (thesis 0.30);
+    * structural term = 1 - MS-SSIM (``ct_core.ssim.msssim``: window 11,
+      sigma 1.5, Wang weights truncated to the scales a 96 px patch can hold —
+      4 — and renormalised, the per-image product averaged over patches),
+      data_range = the measured sinogram's max - min;
+    * weight w = ``alpha`` x RMS(grad_theta data) / RMS(grad_theta struct),
+      over every trainable parameter. Set outright at the first step, then
+      re-estimated every ``recalibrate_every`` steps as an EMA
+      w <- ``ema`` w + (1 - ``ema``) w_new. The new weight applies to the step
+      it was estimated on. Loss = data + w x struct.
+
+    The weight needs PARAMETER gradients of each term separately, which a plain
+    ``(pred, target) -> scalar`` call cannot supply. The ray trainer therefore
+    drives this term through ``parts`` / ``calibrate`` (its two-pass step,
+    ``LearnedReconstructor._two_pass_step``). Calling the object directly works
+    only with a fixed ``ssim_weight``.
+
+    ``loss_scale`` K multiplies the whole objective in the trainer's backward
+    (the reported loss and the weight are unscaled). Under Adam without
+    gradient clipping or weight decay the update is invariant to K except
+    through eps, so K changes nothing but the gradient's floating-point range.
+    It exists because tiny-cuda-nn computes hash-table gradients in fp16 with
+    a fixed loss scale of 128: per-feature gradients below ~1e-8 become
+    exactly zero. Unweighted line-integral residuals averaged over 18432 rays
+    put them near 1e-15 on Scan_1510 (2026-11-21), so at K = 1 the hash table
+    receives NO gradient. Default 1 = the formula as written.
+    """
+
+    two_pass = True
+
+    def __init__(self, *, data_range, huber_delta=None, huber_sigma_mult=0.30,
+                 window_size=11, sigma=1.5, ms_weights=None, alpha=1.0,
+                 recalibrate_every=100, ema=0.9, ssim_weight=None,
+                 loss_scale=1.0, **_):
+        self.data_range = float(data_range)
+        self.huber = make_huber_loss(delta=huber_delta,
+                                     sigma_mult=float(huber_sigma_mult))
+        self.window_size = int(window_size)
+        self.sigma = float(sigma)
+        self.ms_weights = ms_weights
+        self.alpha = float(alpha)
+        self.recalibrate_every = max(1, int(recalibrate_every))
+        self.ema = float(ema)
+        self.fixed_weight = None if ssim_weight is None else float(ssim_weight)
+        self.loss_scale = float(loss_scale)
+        self.weight = self.fixed_weight
+        self.calibrated = self.fixed_weight is not None
+        self.last = {}
+
+    def parts(self, pred, target):
+        """(huber, 1 - MS-SSIM) for a (num_patches, H, W) batch."""
+        data = self.huber(pred.reshape(-1), target.reshape(-1))
+        struct = ssim_loss(pred, target, data_range=self.data_range,
+                           window_size=self.window_size, sigma=self.sigma,
+                           ms=True, ms_weights=self.ms_weights)
+        self.last = {"huber": float(data.detach()),
+                     "one_minus_msssim": float(struct.detach()),
+                     "huber_delta": self.huber.last_delta,
+                     "huber_frac_quadratic": self.huber.last_frac_quadratic}
+        return data, struct
+
+    def calibration_due(self, it: int) -> bool:
+        if self.fixed_weight is not None:
+            return False
+        return (not self.calibrated) or (it % self.recalibrate_every == 0)
+
+    def calibrate(self, g_data_rms: float, g_struct_rms: float) -> float:
+        """Fold one gradient-RMS measurement into the weight (thesis rule)."""
+        import math
+        if (g_struct_rms > 0 and math.isfinite(g_struct_rms)
+                and math.isfinite(g_data_rms)):
+            w_new = self.alpha * g_data_rms / g_struct_rms
+            if not self.calibrated:
+                self.weight = w_new
+                self.calibrated = True
+            else:
+                self.weight = self.ema * self.weight + (1.0 - self.ema) * w_new
+        self.last.update(g_data_rms=g_data_rms, g_struct_rms=g_struct_rms)
+        return self.weight
+
+    def __call__(self, pred, target):
+        if self.weight is None:
+            raise RuntimeError(
+                "huber_msssim self-calibrates its weight from parameter "
+                "gradients, which only the ray trainer's two-pass step "
+                "provides. Pass --loss-option ssim_weight=<w> to use it "
+                "elsewhere with a fixed weight.")
+        data, struct = self.parts(pred, target)
+        return data + self.weight * struct
